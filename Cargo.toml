@@ -1,0 +1,76 @@
+[workspace]
+resolver = "2"
+members = ["crates/sracha", "crates/sracha-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT"
+repository = "https://github.com/rnabioco/sracha-rs"
+
+[workspace.dependencies]
+# Async
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["stream", "rustls-tls", "json"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Parallelism + Compression
+rayon = "1"
+flate2 = "1"
+crossbeam-channel = "0.5"
+
+# Progress
+indicatif = "0.17"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Integrity
+md-5 = "0.10"
+crc32fast = "1"
+
+# Binary parsing
+byteorder = "1"
+memmap2 = "0.9"
+
+# Utils
+url = "2"
+tempfile = "3"
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+num_cpus = "1"
+
+# Internal
+sracha-core = { path = "crates/sracha-core" }
+
+# Optimized release build: LTO + single codegen unit for maximum performance
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+opt-level = 3
+
+# Debug-friendly release build with symbols
+[profile.release-with-debug]
+inherits = "release"
+strip = false
+debug = 2
+
+# Fast dev builds
+[profile.dev]
+opt-level = 0
+debug = 2
+
+# Optimized dev dependencies (tests run faster)
+[profile.dev.package."*"]
+opt-level = 2

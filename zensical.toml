@@ -1,0 +1,55 @@
+[project]
+site_name = "sracha"
+site_description = "Fast SRA downloader and FASTQ converter"
+site_author = "rnabioco"
+site_url = "https://rnabioco.github.io/sracha-rs/"
+repo_url = "https://github.com/rnabioco/sracha-rs"
+repo_name = "rnabioco/sracha-rs"
+language = "en"
+docs_dir = "docs"
+site_dir = "site"
+
+[project.theme]
+name = "material"
+
+[project.theme.palette]
+scheme = "default"
+primary = "deep purple"
+accent = "amber"
+
+[project.theme.features]
+values = [
+    "content.code.copy",
+    "content.code.annotate",
+    "navigation.instant",
+    "navigation.instant.prefetch",
+    "navigation.sections",
+    "navigation.footer",
+    "navigation.top",
+    "search.highlight",
+    "search.suggest",
+]
+
+[project.markdown_extensions]
+values = [
+    "admonition",
+    "attr_list",
+    "def_list",
+    "footnotes",
+    "tables",
+    "pymdownx.details",
+    "pymdownx.highlight",
+    "pymdownx.inlinehilite",
+    "pymdownx.superfences",
+    "pymdownx.tabbed",
+    "pymdownx.snippets",
+]
+
+[[project.nav]]
+Home = "index.md"
+
+[[project.nav]]
+"Getting Started" = "getting-started.md"
+
+[[project.nav]]
+"CLI Reference" = "cli.md"

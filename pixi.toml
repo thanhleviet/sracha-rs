@@ -1,0 +1,26 @@
+[project]
+name = "sracha-rs"
+version = "0.1.0"
+description = "Fast SRA downloader and FASTQ converter"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-64", "osx-arm64"]
+
+[dependencies]
+rust = ">=1.92"
+
+[pypi-dependencies]
+zensical = "*"
+
+[tasks]
+build = "cargo build"
+release = "cargo build --profile release"
+release-debug = "cargo build --profile release-with-debug"
+test = "cargo test"
+check = "cargo check"
+clippy = "cargo clippy --all-targets --all-features -- -D warnings"
+fmt = "cargo fmt --all"
+fmt-check = "cargo fmt --all -- --check"
+clean = "cargo clean"
+doc = "cargo doc --no-deps --open"
+docs-serve = "zensical serve"
+docs-build = "zensical build"
