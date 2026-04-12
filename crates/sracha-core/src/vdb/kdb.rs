@@ -233,9 +233,9 @@ fn parse_idx1(buf: &[u8]) -> Result<ColumnMeta> {
 
         Ok(ColumnMeta {
             version,
-            data_eof: 0,    // will be overridden from `idx` file
-            idx2_eof: 0,    // will be overridden from `idx` file
-            page_size: 1,   // will be overridden from `idx` file if available
+            data_eof: 0,  // will be overridden from `idx` file
+            idx2_eof: 0,  // will be overridden from `idx` file
+            page_size: 1, // will be overridden from `idx` file if available
             checksum_type: 0,
             num_blocks: num_blocks_in_idx1 as u32,
             block_locs: Vec::new(), // v2+ uses BlockLoc + idx2 instead
@@ -263,7 +263,12 @@ fn parse_v1_block_locs_from(buf: &[u8], start: usize, max_count: usize) -> Vec<B
         let id_range = LittleEndian::read_u32(&entry[12..16]);
         let start_id = LittleEndian::read_i64(&entry[16..24]);
         let size = gen_field & 0x7FFF_FFFF;
-        locs.push(BlobLoc { pg, size, id_range, start_id });
+        locs.push(BlobLoc {
+            pg,
+            size,
+            id_range,
+            start_id,
+        });
     }
     locs.sort_by_key(|b| b.start_id);
     locs
@@ -402,12 +407,8 @@ fn parse_idx2_block(idx2_slice: &[u8], block: &BlockLoc) -> Result<Vec<BlobLoc>>
     }
 
     // Helper closures to read arrays from the slice.
-    let read_u32_at = |off: usize| -> u32 {
-        LittleEndian::read_u32(&idx2_slice[off..off + 4])
-    };
-    let read_u64_at = |off: usize| -> u64 {
-        LittleEndian::read_u64(&idx2_slice[off..off + 8])
-    };
+    let read_u32_at = |off: usize| -> u32 { LittleEndian::read_u32(&idx2_slice[off..off + 4]) };
+    let read_u64_at = |off: usize| -> u64 { LittleEndian::read_u64(&idx2_slice[off..off + 8]) };
 
     // --- Decode row ID info for each blob ---
     let mut blob_start_ids: Vec<i64> = Vec::with_capacity(count);
@@ -556,7 +557,9 @@ fn update_meta_from_idx_file(meta: &mut ColumnMeta, buf: &[u8]) {
                 meta.idx2_eof = read_u64(16);
                 meta.num_blocks = read_u32(24);
                 meta.page_size = read_u32(28);
-                if meta.page_size == 0 { meta.page_size = 1; }
+                if meta.page_size == 0 {
+                    meta.page_size = 1;
+                }
                 meta.checksum_type = buf[32];
             }
         }
@@ -567,7 +570,9 @@ fn update_meta_from_idx_file(meta: &mut ColumnMeta, buf: &[u8]) {
                 // idx0_count at 24
                 meta.num_blocks = read_u32(28);
                 meta.page_size = read_u32(32);
-                if meta.page_size == 0 { meta.page_size = 1; }
+                if meta.page_size == 0 {
+                    meta.page_size = 1;
+                }
                 meta.checksum_type = buf[36];
             }
         }
@@ -576,7 +581,7 @@ fn update_meta_from_idx_file(meta: &mut ColumnMeta, buf: &[u8]) {
 }
 
 fn parse_idx0(buf: &[u8]) -> Result<Vec<BlobLoc>> {
-    if buf.len() % BLOB_LOC_SIZE != 0 {
+    if !buf.len().is_multiple_of(BLOB_LOC_SIZE) {
         return Err(Error::Vdb(format!(
             "idx0 size {} is not a multiple of {BLOB_LOC_SIZE}",
             buf.len()
@@ -674,11 +679,7 @@ impl ColumnReader {
         // decode idx2 to get individual blob locations.
         if blobs.is_empty() && meta.version >= 2 && !idx2_bytes.is_empty() {
             let header_end = 8usize; // KDBHdr size
-            let block_locs = parse_block_locs_v2(
-                idx1_bytes,
-                header_end,
-                meta.num_blocks as usize,
-            )?;
+            let block_locs = parse_block_locs_v2(idx1_bytes, header_end, meta.num_blocks as usize)?;
 
             tracing::debug!(
                 "v{}: parsed {} block locators from idx1, decoding idx2 ({} bytes)",
@@ -775,9 +776,9 @@ impl ColumnReader {
         let data_path = format!("{col_path}/data");
 
         // Parse idx1 (required).
-        let idx1_buf = archive.read_file(&idx1_path).map_err(|_| {
-            Error::Vdb(format!("column header (idx1) not found at {idx1_path}"))
-        })?;
+        let idx1_buf = archive
+            .read_file(&idx1_path)
+            .map_err(|_| Error::Vdb(format!("column header (idx1) not found at {idx1_path}")))?;
 
         // Parse idx0 (may be empty or missing — legacy format).
         let idx0_buf = archive.read_file(&idx0_path).unwrap_or_default();
@@ -801,9 +802,9 @@ impl ColumnReader {
     /// For multi-row blobs this returns the entire blob's data; the caller is
     /// responsible for splitting it by row within the blob.
     pub fn read_blob_for_row(&self, row_id: i64) -> Result<Vec<u8>> {
-        let blob = self.find_blob(row_id).ok_or_else(|| {
-            Error::Vdb(format!("no blob found for row_id {row_id}"))
-        })?;
+        let blob = self
+            .find_blob(row_id)
+            .ok_or_else(|| Error::Vdb(format!("no blob found for row_id {row_id}")))?;
 
         let offset = self.blob_data_offset(blob);
         let size = blob.size as usize;
@@ -827,9 +828,9 @@ impl ColumnReader {
     /// The caller should use [`crate::vdb::blob::decode_blob`] for proper
     /// envelope parsing, CRC validation, and decompression.
     pub fn read_raw_blob_for_row(&self, row_id: i64) -> Result<Vec<u8>> {
-        let blob = self.find_blob(row_id).ok_or_else(|| {
-            Error::Vdb(format!("no blob found for row_id {row_id}"))
-        })?;
+        let blob = self
+            .find_blob(row_id)
+            .ok_or_else(|| Error::Vdb(format!("no blob found for row_id {row_id}")))?;
 
         let offset = self.blob_data_offset(blob);
         let size = blob.size as usize;
@@ -960,8 +961,8 @@ pub(crate) mod test_helpers {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::test_helpers::*;
+    use super::*;
 
     // -----------------------------------------------------------------------
     // idx0 parsing
@@ -1095,11 +1096,29 @@ mod tests {
     #[test]
     fn find_blob_exact_start() {
         let blobs = vec![
-            BlobLoc { pg: 0, size: 50, id_range: 5, start_id: 1 },
-            BlobLoc { pg: 50, size: 60, id_range: 5, start_id: 6 },
+            BlobLoc {
+                pg: 0,
+                size: 50,
+                id_range: 5,
+                start_id: 1,
+            },
+            BlobLoc {
+                pg: 50,
+                size: 60,
+                id_range: 5,
+                start_id: 6,
+            },
         ];
         let reader = ColumnReader {
-            meta: ColumnMeta { version: 1, data_eof: 110, idx2_eof: 0, page_size: 1, checksum_type: 0, num_blocks: 0, block_locs: vec![] },
+            meta: ColumnMeta {
+                version: 1,
+                data_eof: 110,
+                idx2_eof: 0,
+                page_size: 1,
+                checksum_type: 0,
+                num_blocks: 0,
+                block_locs: vec![],
+            },
             blobs,
             data: vec![0u8; 110],
         };
@@ -1114,11 +1133,29 @@ mod tests {
     #[test]
     fn find_blob_within_range() {
         let blobs = vec![
-            BlobLoc { pg: 0, size: 50, id_range: 5, start_id: 1 },
-            BlobLoc { pg: 50, size: 60, id_range: 5, start_id: 6 },
+            BlobLoc {
+                pg: 0,
+                size: 50,
+                id_range: 5,
+                start_id: 1,
+            },
+            BlobLoc {
+                pg: 50,
+                size: 60,
+                id_range: 5,
+                start_id: 6,
+            },
         ];
         let reader = ColumnReader {
-            meta: ColumnMeta { version: 1, data_eof: 110, idx2_eof: 0, page_size: 1, checksum_type: 0, num_blocks: 0, block_locs: vec![] },
+            meta: ColumnMeta {
+                version: 1,
+                data_eof: 110,
+                idx2_eof: 0,
+                page_size: 1,
+                checksum_type: 0,
+                num_blocks: 0,
+                block_locs: vec![],
+            },
             blobs,
             data: vec![0u8; 110],
         };
@@ -1132,11 +1169,22 @@ mod tests {
 
     #[test]
     fn find_blob_out_of_range() {
-        let blobs = vec![
-            BlobLoc { pg: 0, size: 50, id_range: 5, start_id: 1 },
-        ];
+        let blobs = vec![BlobLoc {
+            pg: 0,
+            size: 50,
+            id_range: 5,
+            start_id: 1,
+        }];
         let reader = ColumnReader {
-            meta: ColumnMeta { version: 1, data_eof: 50, idx2_eof: 0, page_size: 1, checksum_type: 0, num_blocks: 0, block_locs: vec![] },
+            meta: ColumnMeta {
+                version: 1,
+                data_eof: 50,
+                idx2_eof: 0,
+                page_size: 1,
+                checksum_type: 0,
+                num_blocks: 0,
+                block_locs: vec![],
+            },
             blobs,
             data: vec![0u8; 50],
         };
@@ -1150,7 +1198,15 @@ mod tests {
     #[test]
     fn find_blob_empty() {
         let reader = ColumnReader {
-            meta: ColumnMeta { version: 1, data_eof: 0, idx2_eof: 0, page_size: 1, checksum_type: 0, num_blocks: 0, block_locs: vec![] },
+            meta: ColumnMeta {
+                version: 1,
+                data_eof: 0,
+                idx2_eof: 0,
+                page_size: 1,
+                checksum_type: 0,
+                num_blocks: 0,
+                block_locs: vec![],
+            },
             blobs: Vec::new(),
             data: Vec::new(),
         };
@@ -1164,11 +1220,29 @@ mod tests {
     #[test]
     fn row_count_sums_id_ranges() {
         let blobs = vec![
-            BlobLoc { pg: 0, size: 10, id_range: 5, start_id: 1 },
-            BlobLoc { pg: 10, size: 20, id_range: 8, start_id: 6 },
+            BlobLoc {
+                pg: 0,
+                size: 10,
+                id_range: 5,
+                start_id: 1,
+            },
+            BlobLoc {
+                pg: 10,
+                size: 20,
+                id_range: 8,
+                start_id: 6,
+            },
         ];
         let reader = ColumnReader {
-            meta: ColumnMeta { version: 1, data_eof: 30, idx2_eof: 0, page_size: 1, checksum_type: 0, num_blocks: 0, block_locs: vec![] },
+            meta: ColumnMeta {
+                version: 1,
+                data_eof: 30,
+                idx2_eof: 0,
+                page_size: 1,
+                checksum_type: 0,
+                num_blocks: 0,
+                block_locs: vec![],
+            },
             blobs,
             data: vec![0u8; 30],
         };
@@ -1178,11 +1252,29 @@ mod tests {
     #[test]
     fn first_row_id_returns_min() {
         let blobs = vec![
-            BlobLoc { pg: 0, size: 10, id_range: 5, start_id: 1 },
-            BlobLoc { pg: 10, size: 20, id_range: 8, start_id: 6 },
+            BlobLoc {
+                pg: 0,
+                size: 10,
+                id_range: 5,
+                start_id: 1,
+            },
+            BlobLoc {
+                pg: 10,
+                size: 20,
+                id_range: 8,
+                start_id: 6,
+            },
         ];
         let reader = ColumnReader {
-            meta: ColumnMeta { version: 1, data_eof: 30, idx2_eof: 0, page_size: 1, checksum_type: 0, num_blocks: 0, block_locs: vec![] },
+            meta: ColumnMeta {
+                version: 1,
+                data_eof: 30,
+                idx2_eof: 0,
+                page_size: 1,
+                checksum_type: 0,
+                num_blocks: 0,
+                block_locs: vec![],
+            },
             blobs,
             data: vec![0u8; 30],
         };
@@ -1192,7 +1284,15 @@ mod tests {
     #[test]
     fn first_row_id_none_for_empty() {
         let reader = ColumnReader {
-            meta: ColumnMeta { version: 1, data_eof: 0, idx2_eof: 0, page_size: 1, checksum_type: 0, num_blocks: 0, block_locs: vec![] },
+            meta: ColumnMeta {
+                version: 1,
+                data_eof: 0,
+                idx2_eof: 0,
+                page_size: 1,
+                checksum_type: 0,
+                num_blocks: 0,
+                block_locs: vec![],
+            },
             blobs: Vec::new(),
             data: Vec::new(),
         };
@@ -1202,12 +1302,35 @@ mod tests {
     #[test]
     fn blob_count_is_correct() {
         let blobs = vec![
-            BlobLoc { pg: 0, size: 10, id_range: 5, start_id: 1 },
-            BlobLoc { pg: 10, size: 20, id_range: 8, start_id: 6 },
-            BlobLoc { pg: 30, size: 15, id_range: 3, start_id: 14 },
+            BlobLoc {
+                pg: 0,
+                size: 10,
+                id_range: 5,
+                start_id: 1,
+            },
+            BlobLoc {
+                pg: 10,
+                size: 20,
+                id_range: 8,
+                start_id: 6,
+            },
+            BlobLoc {
+                pg: 30,
+                size: 15,
+                id_range: 3,
+                start_id: 14,
+            },
         ];
         let reader = ColumnReader {
-            meta: ColumnMeta { version: 1, data_eof: 45, idx2_eof: 0, page_size: 1, checksum_type: 0, num_blocks: 0, block_locs: vec![] },
+            meta: ColumnMeta {
+                version: 1,
+                data_eof: 45,
+                idx2_eof: 0,
+                page_size: 1,
+                checksum_type: 0,
+                num_blocks: 0,
+                block_locs: vec![],
+            },
             blobs,
             data: vec![0u8; 45],
         };
@@ -1221,22 +1344,48 @@ mod tests {
     #[test]
     fn blob_data_offset_page_size_one() {
         let reader = ColumnReader {
-            meta: ColumnMeta { version: 1, data_eof: 200, idx2_eof: 0, page_size: 1, checksum_type: 0, num_blocks: 0, block_locs: vec![] },
+            meta: ColumnMeta {
+                version: 1,
+                data_eof: 200,
+                idx2_eof: 0,
+                page_size: 1,
+                checksum_type: 0,
+                num_blocks: 0,
+                block_locs: vec![],
+            },
             blobs: Vec::new(),
             data: vec![0u8; 200],
         };
-        let blob = BlobLoc { pg: 42, size: 10, id_range: 1, start_id: 1 };
+        let blob = BlobLoc {
+            pg: 42,
+            size: 10,
+            id_range: 1,
+            start_id: 1,
+        };
         assert_eq!(reader.blob_data_offset(&blob), 42);
     }
 
     #[test]
     fn blob_data_offset_page_size_4096() {
         let reader = ColumnReader {
-            meta: ColumnMeta { version: 1, data_eof: 200, idx2_eof: 0, page_size: 4096, checksum_type: 0, num_blocks: 0, block_locs: vec![] },
+            meta: ColumnMeta {
+                version: 1,
+                data_eof: 200,
+                idx2_eof: 0,
+                page_size: 4096,
+                checksum_type: 0,
+                num_blocks: 0,
+                block_locs: vec![],
+            },
             blobs: Vec::new(),
             data: vec![0u8; 200],
         };
-        let blob = BlobLoc { pg: 3, size: 10, id_range: 1, start_id: 1 };
+        let blob = BlobLoc {
+            pg: 3,
+            size: 10,
+            id_range: 1,
+            start_id: 1,
+        };
         assert_eq!(reader.blob_data_offset(&blob), 3 * 4096);
     }
 
@@ -1254,7 +1403,15 @@ mod tests {
             start_id: 1,
         }];
         let reader = ColumnReader {
-            meta: ColumnMeta { version: 1, data_eof: data.len() as u64, idx2_eof: 0, page_size: 1, checksum_type: 0, num_blocks: 0, block_locs: vec![] },
+            meta: ColumnMeta {
+                version: 1,
+                data_eof: data.len() as u64,
+                idx2_eof: 0,
+                page_size: 1,
+                checksum_type: 0,
+                num_blocks: 0,
+                block_locs: vec![],
+            },
             blobs,
             data: data.to_vec(),
         };
@@ -1265,8 +1422,8 @@ mod tests {
 
     #[test]
     fn read_blob_for_row_zlib_compressed() {
-        use flate2::write::ZlibEncoder;
         use flate2::Compression;
+        use flate2::write::ZlibEncoder;
         use std::io::Write;
 
         let original = b"ACGTACGTACGTACGTACGTACGT";
@@ -1301,7 +1458,15 @@ mod tests {
     #[test]
     fn read_blob_for_row_missing_row() {
         let reader = ColumnReader {
-            meta: ColumnMeta { version: 1, data_eof: 0, idx2_eof: 0, page_size: 1, checksum_type: 0, num_blocks: 0, block_locs: vec![] },
+            meta: ColumnMeta {
+                version: 1,
+                data_eof: 0,
+                idx2_eof: 0,
+                page_size: 1,
+                checksum_type: 0,
+                num_blocks: 0,
+                block_locs: vec![],
+            },
             blobs: Vec::new(),
             data: Vec::new(),
         };
@@ -1317,7 +1482,15 @@ mod tests {
             start_id: 1,
         }];
         let reader = ColumnReader {
-            meta: ColumnMeta { version: 1, data_eof: 100, idx2_eof: 0, page_size: 1, checksum_type: 0, num_blocks: 0, block_locs: vec![] },
+            meta: ColumnMeta {
+                version: 1,
+                data_eof: 100,
+                idx2_eof: 0,
+                page_size: 1,
+                checksum_type: 0,
+                num_blocks: 0,
+                block_locs: vec![],
+            },
             blobs,
             data: vec![0u8; 10], // data is too small
         };
@@ -1465,9 +1638,13 @@ mod tests {
     fn block_entry_count_predictable_predictable() {
         // Both predictable: size IS the count.
         let bloc = BlockLoc {
-            pg: 0, size: 229, id_type: BlockType::Predictable,
-            pg_type: BlockType::Predictable, compressed: false,
-            id_range: 468992, start_id: 1,
+            pg: 0,
+            size: 229,
+            id_type: BlockType::Predictable,
+            pg_type: BlockType::Predictable,
+            compressed: false,
+            id_range: 468992,
+            start_id: 1,
         };
         assert_eq!(block_entry_count(&bloc), 229);
     }
@@ -1478,9 +1655,13 @@ mod tests {
         // id: hsz=0, dsz=0, ssz=0; pg: hsz=8, dsz=0, ssz=4.
         // count = (924 - 0 - 8) / (0 + 0 + 0 + 4) = 916 / 4 = 229.
         let bloc = BlockLoc {
-            pg: 0, size: 924, id_type: BlockType::Predictable,
-            pg_type: BlockType::Magnitude, compressed: false,
-            id_range: 468992, start_id: 1,
+            pg: 0,
+            size: 924,
+            id_type: BlockType::Predictable,
+            pg_type: BlockType::Magnitude,
+            compressed: false,
+            id_range: 468992,
+            start_id: 1,
         };
         assert_eq!(block_entry_count(&bloc), 229);
     }
@@ -1491,9 +1672,13 @@ mod tests {
         // per_entry = 8+4+8+4 = 24. header = 0.
         // count = 240 / 24 = 10.
         let bloc = BlockLoc {
-            pg: 0, size: 240, id_type: BlockType::Random,
-            pg_type: BlockType::Random, compressed: false,
-            id_range: 100, start_id: 1,
+            pg: 0,
+            size: 240,
+            id_type: BlockType::Random,
+            pg_type: BlockType::Random,
+            compressed: false,
+            id_range: 100,
+            start_id: 1,
         };
         assert_eq!(block_entry_count(&bloc), 10);
     }
@@ -1504,9 +1689,13 @@ mod tests {
         // per_entry = 8+0+8+0 = 16. header = 4+4 = 8.
         // count = (168 - 8) / 16 = 160 / 16 = 10.
         let bloc = BlockLoc {
-            pg: 0, size: 168, id_type: BlockType::Uniform,
-            pg_type: BlockType::Uniform, compressed: false,
-            id_range: 100, start_id: 1,
+            pg: 0,
+            size: 168,
+            id_type: BlockType::Uniform,
+            pg_type: BlockType::Uniform,
+            compressed: false,
+            id_range: 100,
+            start_id: 1,
         };
         assert_eq!(block_entry_count(&bloc), 10);
     }
@@ -1528,16 +1717,17 @@ mod tests {
     /// Layout: [id_header][pg_header][id_d][pg_d][id_s][pg_s]
     ///
     /// This helper handles the correct interleaving for all type combinations.
+    #[allow(clippy::too_many_arguments)]
     fn build_idx2_data(
         id_type: BlockType,
         pg_type: BlockType,
         count: usize,
-        id_header: &[u8],   // id_hsz bytes
-        pg_header: &[u8],   // pg_hsz bytes
-        id_d: &[u8],        // id_dsz * count bytes (u64 array)
-        pg_d: &[u8],        // pg_dsz * count bytes (u64 array)
-        id_s: &[u8],        // id_ssz * count bytes (u32 array)
-        pg_s: &[u8],        // pg_ssz * count bytes (u32 array)
+        id_header: &[u8], // id_hsz bytes
+        pg_header: &[u8], // pg_hsz bytes
+        id_d: &[u8],      // id_dsz * count bytes (u64 array)
+        pg_d: &[u8],      // pg_dsz * count bytes (u64 array)
+        id_s: &[u8],      // id_ssz * count bytes (u32 array)
+        pg_s: &[u8],      // pg_ssz * count bytes (u32 array)
     ) -> Vec<u8> {
         let _ = (id_type, pg_type, count); // used only for documentation
         let mut buf = Vec::new();
@@ -1574,12 +1764,15 @@ mod tests {
             BlockType::Predictable,
             BlockType::Magnitude,
             count,
-            &[],                                        // id_header (0 bytes)
-            &first_pg.to_le_bytes(),                    // pg_header (8 bytes)
-            &[],                                        // id_d (0)
-            &[],                                        // pg_d (0)
-            &[],                                        // id_s (0)
-            &sizes.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<_>>(), // pg_s
+            &[],                     // id_header (0 bytes)
+            &first_pg.to_le_bytes(), // pg_header (8 bytes)
+            &[],                     // id_d (0)
+            &[],                     // pg_d (0)
+            &[],                     // id_s (0)
+            &sizes
+                .iter()
+                .flat_map(|s| s.to_le_bytes())
+                .collect::<Vec<_>>(), // pg_s
         );
 
         assert_eq!(idx2.len(), 8 + 229 * 4); // = 924 bytes
@@ -1636,19 +1829,35 @@ mod tests {
         let pg_sizes: Vec<u32> = vec![500, 1000, 800];
 
         let idx2 = build_idx2_data(
-            BlockType::Random, BlockType::Random, 3,
-            &[], &[],
-            &start_ids.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+            BlockType::Random,
+            BlockType::Random,
+            3,
+            &[],
+            &[],
+            &start_ids
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
             &pgs.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
-            &id_ranges.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
-            &pg_sizes.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+            &id_ranges
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+            &pg_sizes
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
         );
 
         // size = (8+4+8+4)*3 = 72
         let bloc = BlockLoc {
-            pg: 0, size: idx2.len() as u32,
-            id_type: BlockType::Random, pg_type: BlockType::Random,
-            compressed: false, id_range: 250, start_id: 1,
+            pg: 0,
+            size: idx2.len() as u32,
+            id_type: BlockType::Random,
+            pg_type: BlockType::Random,
+            compressed: false,
+            id_range: 250,
+            start_id: 1,
         };
 
         assert_eq!(block_entry_count(&bloc), 3);
@@ -1682,19 +1891,29 @@ mod tests {
         let pgs: Vec<u64> = vec![0, 256, 512];
 
         let idx2 = build_idx2_data(
-            BlockType::Uniform, BlockType::Uniform, 3,
-            &uniform_range.to_le_bytes(),     // id header
-            &uniform_size.to_le_bytes(),      // pg header
-            &start_ids.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+            BlockType::Uniform,
+            BlockType::Uniform,
+            3,
+            &uniform_range.to_le_bytes(), // id header
+            &uniform_size.to_le_bytes(),  // pg header
+            &start_ids
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
             &pgs.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
-            &[], &[],
+            &[],
+            &[],
         );
 
         // size = 4+4 + 3*8 + 3*8 = 56
         let bloc = BlockLoc {
-            pg: 0, size: idx2.len() as u32,
-            id_type: BlockType::Uniform, pg_type: BlockType::Uniform,
-            compressed: false, id_range: 30, start_id: 1,
+            pg: 0,
+            size: idx2.len() as u32,
+            id_type: BlockType::Uniform,
+            pg_type: BlockType::Uniform,
+            compressed: false,
+            id_range: 30,
+            start_id: 1,
         };
 
         assert_eq!(block_entry_count(&bloc), 3);
@@ -1720,19 +1939,32 @@ mod tests {
         let pg_sizes: Vec<u32> = vec![100, 200, 300];
 
         let idx2 = build_idx2_data(
-            BlockType::Magnitude, BlockType::Magnitude, 3,
-            &first_id.to_le_bytes(),      // id header (8 bytes)
-            &first_pg.to_le_bytes(),      // pg header (8 bytes)
-            &[], &[],
-            &id_ranges.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
-            &pg_sizes.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+            BlockType::Magnitude,
+            BlockType::Magnitude,
+            3,
+            &first_id.to_le_bytes(), // id header (8 bytes)
+            &first_pg.to_le_bytes(), // pg header (8 bytes)
+            &[],
+            &[],
+            &id_ranges
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+            &pg_sizes
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
         );
 
         // size = 8+8 + 3*4 + 3*4 = 40
         let bloc = BlockLoc {
-            pg: 0, size: idx2.len() as u32,
-            id_type: BlockType::Magnitude, pg_type: BlockType::Magnitude,
-            compressed: false, id_range: 30, start_id: 1,
+            pg: 0,
+            size: idx2.len() as u32,
+            id_type: BlockType::Magnitude,
+            pg_type: BlockType::Magnitude,
+            compressed: false,
+            id_range: 30,
+            start_id: 1,
         };
 
         assert_eq!(block_entry_count(&bloc), 3);
@@ -1768,9 +2000,13 @@ mod tests {
         assert_eq!(idx2.len(), 12);
 
         let bloc = BlockLoc {
-            pg: 0, size: count, // size = count for pred+pred
-            id_type: BlockType::Predictable, pg_type: BlockType::Predictable,
-            compressed: false, id_range: 100, start_id: 1,
+            pg: 0,
+            size: count, // size = count for pred+pred
+            id_type: BlockType::Predictable,
+            pg_type: BlockType::Predictable,
+            compressed: false,
+            id_range: 100,
+            start_id: 1,
         };
 
         assert_eq!(block_entry_count(&bloc), 5);
@@ -1801,20 +2037,32 @@ mod tests {
         pg_header.extend_from_slice(&pred_sz.to_le_bytes());
 
         let idx2 = build_idx2_data(
-            BlockType::Random, BlockType::Predictable, 3,
-            &[],          // id header (0)
-            &pg_header,   // pg header (12)
-            &start_ids.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
-            &[],          // pg_d (0)
-            &id_ranges.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
-            &[],          // pg_s (0)
+            BlockType::Random,
+            BlockType::Predictable,
+            3,
+            &[],        // id header (0)
+            &pg_header, // pg header (12)
+            &start_ids
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+            &[], // pg_d (0)
+            &id_ranges
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+            &[], // pg_s (0)
         );
 
         // size = 0+12 + 3*8 + 3*4 = 48
         let bloc = BlockLoc {
-            pg: 0, size: idx2.len() as u32,
-            id_type: BlockType::Random, pg_type: BlockType::Predictable,
-            compressed: false, id_range: 260, start_id: 1,
+            pg: 0,
+            size: idx2.len() as u32,
+            id_type: BlockType::Random,
+            pg_type: BlockType::Predictable,
+            compressed: false,
+            id_range: 260,
+            start_id: 1,
         };
 
         // count = (48 - 0 - 12) / (8 + 4) = 36 / 12 = 3
@@ -1852,22 +2100,30 @@ mod tests {
 
         // Build idx2 data.
         let idx2 = build_idx2_data(
-            BlockType::Predictable, BlockType::Magnitude, count,
-            &[], &first_pg.to_le_bytes(),
-            &[], &[], &[],
-            &blob_sizes.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+            BlockType::Predictable,
+            BlockType::Magnitude,
+            count,
+            &[],
+            &first_pg.to_le_bytes(),
+            &[],
+            &[],
+            &[],
+            &blob_sizes
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
         );
         // idx2 size = 8 + 3*4 = 20
 
         // Build idx1: v3 header + 1 block locator.
         let bloc_entry = build_block_loc_entry(
-            0,              // pg in idx2
-            idx2.len() as u32,  // size of idx2 data
-            3,              // id_type = predictable
-            2,              // pg_type = magnitude
+            0,                 // pg in idx2
+            idx2.len() as u32, // size of idx2 data
+            3,                 // id_type = predictable
+            2,                 // pg_type = magnitude
             false,
             id_range,
-            1,              // start_id
+            1, // start_id
         );
         let idx1 = build_idx1_v2(&[bloc_entry]);
 
@@ -1886,9 +2142,7 @@ mod tests {
         // Build fake data.
         let data = vec![0xABu8; total_data as usize];
 
-        let reader = ColumnReader::from_parts(
-            &idx1, &[], &idx, &idx2, data,
-        ).unwrap();
+        let reader = ColumnReader::from_parts(&idx1, &[], &idx, &idx2, data).unwrap();
 
         assert_eq!(reader.blob_count(), 3);
         assert_eq!(reader.row_count(), id_range as u64);

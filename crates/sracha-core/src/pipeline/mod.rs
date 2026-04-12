@@ -13,12 +13,10 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 
-use crate::compress::{ParGzWriter, DEFAULT_BLOCK_SIZE};
+use crate::compress::{DEFAULT_BLOCK_SIZE, ParGzWriter};
 use crate::download::{DownloadConfig, download_file};
 use crate::error::{Error, Result};
-use crate::fastq::{
-    FastqConfig, OutputSlot, SpotRecord, SplitMode, format_spot, output_filename,
-};
+use crate::fastq::{FastqConfig, OutputSlot, SplitMode, SpotRecord, format_spot, output_filename};
 use crate::sdl::ResolvedAccession;
 use crate::vdb::blob;
 use crate::vdb::cursor::VdbCursor;
@@ -149,8 +147,8 @@ fn decode_and_write(
     let mut archive = KarArchive::open(std::io::BufReader::new(file))?;
     let cursor = VdbCursor::open(&mut archive)?;
 
-    let first_row = cursor.first_row();
-    let has_quality = cursor.has_quality();
+    let _first_row = cursor.first_row();
+    let _has_quality = cursor.has_quality();
 
     // ------------------------------------------------------------------
     // Decode blobs and produce FASTQ output.
@@ -175,7 +173,11 @@ fn decode_and_write(
             2 => 16, // MD5
             _ => 0,
         };
-        let effective = if raw.len() > cs_size { &raw[..raw.len() - cs_size] } else { raw };
+        let effective = if raw.len() > cs_size {
+            &raw[..raw.len() - cs_size]
+        } else {
+            raw
+        };
         blob::decode_blob(effective, 0, row_count, 8)
     }
 
@@ -189,8 +191,12 @@ fn decode_and_write(
     for blob_loc in cursor.read_col().blobs() {
         let raw = cursor.read_col().read_raw_blob_for_row(blob_loc.start_id)?;
         let decoded = decode_raw(&raw, read_cs, blob_loc.id_range as u64)?;
-        // READ is 2na packed: unpack to ASCII bases.
-        let bases = crate::vdb::encoding::unpack_2na(&decoded.data, decoded.data.len() * 4);
+        // READ is 2na packed: compute actual base count from data bits minus
+        // the adjust (unused trailing bits). For 2na, each base is 2 bits.
+        let total_bits = decoded.data.len() * 8;
+        let adjust = decoded.adjust as usize;
+        let actual_bases = (total_bits.saturating_sub(adjust)) / 2;
+        let bases = crate::vdb::encoding::unpack_2na(&decoded.data, actual_bases);
         all_read_data.extend_from_slice(&bases);
     }
 
@@ -202,7 +208,7 @@ fn decode_and_write(
             let raw = qcol.read_raw_blob_for_row(blob_loc.start_id)?;
             let decoded = decode_raw(&raw, qcs, blob_loc.id_range as u64)?;
 
-            let hdr_version = decoded.headers.first().map(|h| h.version).unwrap_or(0);
+            let _hdr_version = decoded.headers.first().map(|h| h.version).unwrap_or(0);
 
             // QUALITY uses zip_encoding (plain zlib), not izip.
             // Try raw deflate decompression first; fall back to raw bytes.
@@ -219,6 +225,7 @@ fn decode_and_write(
     }
 
     // Decode all READ_LEN blobs → izip/irzip → u32 lengths.
+    // After decoding, expand data_recs → actual rows using page map data_runs.
     if let Some(rlcol) = cursor.read_len_col() {
         let rlcs = rlcol.meta().checksum_type;
         for blob_loc in rlcol.blobs() {
@@ -238,19 +245,34 @@ fn decode_and_write(
 
                 tracing::debug!(
                     "READ_LEN irzip: {} bytes data, hdr_ver={}, planes=0x{:02x}, min={}, slope={}, num_elems={}",
-                    decoded.data.len(), hdr_version, planes, min, slope, num_elems,
+                    decoded.data.len(),
+                    hdr_version,
+                    planes,
+                    min,
+                    slope,
+                    num_elems,
                 );
 
                 blob::irzip_decode(&decoded.data, 32, num_elems, min, slope, planes)?
             } else {
                 // izip v0: traditional format
-                let num_elems = decoded.row_length
+                let num_elems = decoded
+                    .row_length
                     .unwrap_or_else(|| (decoded.data.len() as u64 * 8) / 32)
                     as u32;
                 blob::izip_decode(&decoded.data, 32, num_elems)?
             };
 
-            all_read_len_data.extend_from_slice(&decoded_ints);
+            // Expand data_recs → actual rows using page map data_runs.
+            // irzip/izip produces one value per data_rec (unique entry), but
+            // the page map's data_runs tell us how many rows share each entry.
+            let expanded = if let Some(ref pm) = decoded.page_map {
+                pm.expand_data_runs_bytes(&decoded_ints, 4)
+            } else {
+                decoded_ints
+            };
+
+            all_read_len_data.extend_from_slice(&expanded);
         }
     }
 
@@ -349,7 +371,7 @@ fn decode_and_write(
     // ------------------------------------------------------------------
     let mut seq_offset: usize = 0;
     let mut qual_offset: usize = 0;
-    let mut name_offset: usize = 0;
+    let _name_offset: usize = 0;
 
     for (read_idx, &rlen) in read_lengths.iter().enumerate() {
         let rlen = rlen as usize;
@@ -399,27 +421,20 @@ fn decode_and_write(
         let records = format_spot(&spot, accession, &fastq_config);
 
         for (slot, record) in &records {
-            let writer = writers
-                .entry(*slot)
-                .or_insert_with(|| {
-                    let filename = output_filename(accession, *slot, config.gzip);
-                    let path = config.output_dir.join(&filename);
-                    output_files.push(path.clone());
+            let writer = writers.entry(*slot).or_insert_with(|| {
+                let filename = output_filename(accession, *slot, config.gzip);
+                let path = config.output_dir.join(&filename);
+                output_files.push(path.clone());
 
-                    let file =
-                        std::fs::File::create(&path).expect("failed to create output file");
-                    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+                let file = std::fs::File::create(&path).expect("failed to create output file");
+                let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
 
-                    if config.gzip {
-                        OutputWriter::Gz(ParGzWriter::new(
-                            buf,
-                            config.gzip_level,
-                            DEFAULT_BLOCK_SIZE,
-                        ))
-                    } else {
-                        OutputWriter::Plain(buf)
-                    }
-                });
+                if config.gzip {
+                    OutputWriter::Gz(ParGzWriter::new(buf, config.gzip_level, DEFAULT_BLOCK_SIZE))
+                } else {
+                    OutputWriter::Plain(buf)
+                }
+            });
 
             writer.write_all(&record.data).map_err(Error::Io)?;
             reads_written += 1;
@@ -439,6 +454,52 @@ fn decode_and_write(
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/// Statistics from a completed fastq conversion (no download).
+pub struct FastqStats {
+    /// The accession/label used in FASTQ deflines.
+    pub accession: String,
+    /// Number of spots (rows) read from the SRA file.
+    pub spots_read: u64,
+    /// Number of FASTQ reads written (after filtering).
+    pub reads_written: u64,
+    /// Paths of all output files created.
+    pub output_files: Vec<PathBuf>,
+}
+
+/// Convert a local SRA file to FASTQ without downloading.
+///
+/// Opens the SRA file as a KAR archive, creates a VdbCursor, decodes VDB
+/// blobs, and writes FASTQ output. The `accession` is used for FASTQ
+/// defline naming; if `None`, the filename stem is used.
+pub fn run_fastq(
+    sra_path: &std::path::Path,
+    accession: Option<&str>,
+    config: &PipelineConfig,
+) -> Result<FastqStats> {
+    let acc = accession.map(String::from).unwrap_or_else(|| {
+        sra_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string()
+    });
+
+    // Detect SRA-lite by checking if the quality column is absent.
+    // We pass `false` initially; decode_and_write will handle quality
+    // absence gracefully via sra_lite_quality fallback.
+    let is_lite = false;
+
+    let (spots_read, reads_written, output_files) =
+        decode_and_write(sra_path, &acc, config, is_lite)?;
+
+    Ok(FastqStats {
+        accession: acc,
+        spots_read,
+        reads_written,
+        output_files,
+    })
+}
 
 /// Run the full get pipeline for a single accession.
 ///
@@ -513,17 +574,16 @@ pub async fn run_get(
         progress: config.progress,
     };
 
-    let (spots_read, reads_written, output_files) =
-        tokio::task::spawn_blocking(move || {
-            decode_and_write(
-                &temp_path_for_blocking,
-                &accession_owned,
-                &config_for_blocking,
-                is_lite,
-            )
-        })
-        .await
-        .map_err(|e| Error::Vdb(format!("decode task panicked: {e}")))??;
+    let (spots_read, reads_written, output_files) = tokio::task::spawn_blocking(move || {
+        decode_and_write(
+            &temp_path_for_blocking,
+            &accession_owned,
+            &config_for_blocking,
+            is_lite,
+        )
+    })
+    .await
+    .map_err(|e| Error::Vdb(format!("decode task panicked: {e}")))??;
 
     // --- Phase 3: Cleanup ---
     if let Err(e) = tokio::fs::remove_file(&temp_path).await {

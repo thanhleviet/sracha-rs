@@ -103,16 +103,12 @@ pub enum OutputSlot {
 /// Format a single read segment into a [`FastqRecord`].
 ///
 /// The defline follows the format: `@{run_name}.{spot_name} length={len}`
-fn format_read(
-    run_name: &str,
-    spot_name: &[u8],
-    sequence: &[u8],
-    quality: &[u8],
-) -> FastqRecord {
+fn format_read(run_name: &str, spot_name: &[u8], sequence: &[u8], quality: &[u8]) -> FastqRecord {
     let len = sequence.len();
     // Pre-allocate: @defline\nseq\n+\nqual\n
     // defline: @ + run_name + . + spot_name + " length=" + digits + \n
-    let mut data = Vec::with_capacity(1 + run_name.len() + 1 + spot_name.len() + 8 + 10 + 1 + len + 3 + len);
+    let mut data =
+        Vec::with_capacity(1 + run_name.len() + 1 + spot_name.len() + 8 + 10 + 1 + len + 3 + len);
 
     data.push(b'@');
     data.extend_from_slice(run_name.as_bytes());
@@ -179,19 +175,18 @@ pub fn format_spot(
         offset = end;
 
         // Filter: skip technical reads if configured.
-        if config.skip_technical {
-            if let Some(&rtype) = spot.read_types.get(i) {
-                if rtype != 0 {
-                    continue;
-                }
-            }
+        if config.skip_technical
+            && let Some(&rtype) = spot.read_types.get(i)
+            && rtype != 0
+        {
+            continue;
         }
 
         // Filter: skip reads shorter than the minimum length.
-        if let Some(min_len) = config.min_read_len {
-            if (rlen as u32) < min_len {
-                continue;
-            }
+        if let Some(min_len) = config.min_read_len
+            && (rlen as u32) < min_len
+        {
+            continue;
         }
 
         segments.push(ReadSegment {
@@ -211,8 +206,18 @@ pub fn format_spot(
         SplitMode::Split3 | SplitMode::Interleaved => {
             if segments.len() == 2 {
                 // Two biological reads -> paired.
-                let r1 = format_read(run_name, &spot.name, segments[0].sequence, segments[0].quality);
-                let r2 = format_read(run_name, &spot.name, segments[1].sequence, segments[1].quality);
+                let r1 = format_read(
+                    run_name,
+                    &spot.name,
+                    segments[0].sequence,
+                    segments[0].quality,
+                );
+                let r2 = format_read(
+                    run_name,
+                    &spot.name,
+                    segments[1].sequence,
+                    segments[1].quality,
+                );
                 results.push((OutputSlot::Read1, r1));
                 results.push((OutputSlot::Read2, r2));
             } else {
@@ -285,7 +290,7 @@ mod tests {
             sequence: seq.to_vec(),
             quality: qual.to_vec(),
             read_lengths: vec![len],
-            read_types: vec![0], // biological
+            read_types: vec![0],  // biological
             read_filter: vec![0], // pass
             spot_group: Vec::new(),
         }
@@ -532,10 +537,9 @@ mod tests {
     #[test]
     fn technical_read_is_filtered_by_default() {
         let spot = spot_with_technical(
-            b"1",
-            b"NNNN", b"!!!!",  // technical
-            b"AACC", b"IIII",  // bio 1
-            b"GGTT", b"????",  // bio 2
+            b"1", b"NNNN", b"!!!!", // technical
+            b"AACC", b"IIII", // bio 1
+            b"GGTT", b"????", // bio 2
         );
         let config = default_config();
         let results = format_spot(&spot, "SRR1", &config);
@@ -550,12 +554,7 @@ mod tests {
 
     #[test]
     fn technical_read_included_when_skip_technical_false() {
-        let spot = spot_with_technical(
-            b"1",
-            b"NNNN", b"!!!!",
-            b"AACC", b"IIII",
-            b"GGTT", b"????",
-        );
+        let spot = spot_with_technical(b"1", b"NNNN", b"!!!!", b"AACC", b"IIII", b"GGTT", b"????");
         let config = FastqConfig {
             skip_technical: false,
             ..default_config()
@@ -565,17 +564,16 @@ mod tests {
         // All three reads should be present. With 3 reads in Split3 mode, all
         // go to Unpaired because there are not exactly 2.
         assert_eq!(results.len(), 3);
-        assert!(results.iter().all(|(slot, _)| *slot == OutputSlot::Unpaired));
+        assert!(
+            results
+                .iter()
+                .all(|(slot, _)| *slot == OutputSlot::Unpaired)
+        );
     }
 
     #[test]
     fn technical_read_filtered_leaves_paired_in_split3() {
-        let spot = spot_with_technical(
-            b"5",
-            b"TTTT", b"$$$$",
-            b"AAAA", b"????",
-            b"CCCC", b"????",
-        );
+        let spot = spot_with_technical(b"5", b"TTTT", b"$$$$", b"AAAA", b"????", b"CCCC", b"????");
         let config = FastqConfig {
             split_mode: SplitMode::Split3,
             ..default_config()
@@ -651,12 +649,7 @@ mod tests {
     #[test]
     fn technical_and_min_len_filter_combined() {
         // Spot: tech(4bp) + bio(2bp) + bio(6bp)
-        let spot = spot_with_technical(
-            b"1",
-            b"NNNN", b"!!!!",
-            b"AC",   b"??",
-            b"GGTTAA", b"??????",
-        );
+        let spot = spot_with_technical(b"1", b"NNNN", b"!!!!", b"AC", b"??", b"GGTTAA", b"??????");
         let config = FastqConfig {
             skip_technical: true,
             min_read_len: Some(3),
@@ -717,7 +710,11 @@ mod tests {
         let results = format_spot(&spot, "SRR1", &config);
 
         assert_eq!(results.len(), 3);
-        assert!(results.iter().all(|(slot, _)| *slot == OutputSlot::Unpaired));
+        assert!(
+            results
+                .iter()
+                .all(|(slot, _)| *slot == OutputSlot::Unpaired)
+        );
     }
 
     #[test]

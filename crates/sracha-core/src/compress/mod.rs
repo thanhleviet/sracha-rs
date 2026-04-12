@@ -174,14 +174,14 @@ impl<W: Write + Send> ParGzWriter<W> {
 
     /// Flush consecutive blocks from the reorder buffer.
     fn flush_reorder_buf(&mut self) {
-        loop {
-            if let Some(pos) = self.reorder_buf.iter().position(|(s, _)| *s == self.drain_seq) {
-                let (_, data) = self.reorder_buf.swap_remove(pos);
-                self.write_compressed(&data);
-                self.drain_seq += 1;
-            } else {
-                break;
-            }
+        while let Some(pos) = self
+            .reorder_buf
+            .iter()
+            .position(|(s, _)| *s == self.drain_seq)
+        {
+            let (_, data) = self.reorder_buf.swap_remove(pos);
+            self.write_compressed(&data);
+            self.drain_seq += 1;
         }
     }
 
@@ -190,10 +190,10 @@ impl<W: Write + Send> ParGzWriter<W> {
         if self.drain_error.is_some() {
             return; // Already have an error; skip further writes.
         }
-        if let Some(ref mut w) = self.inner {
-            if let Err(e) = w.write_all(data) {
-                self.drain_error = Some(e);
-            }
+        if let Some(ref mut w) = self.inner
+            && let Err(e) = w.write_all(data)
+        {
+            self.drain_error = Some(e);
         }
     }
 }
@@ -247,8 +247,12 @@ impl<W: Write + Send> Write for ParGzWriter<W> {
 
 fn compress_block(data: &[u8], level: u32) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::new(level));
-    encoder.write_all(data).expect("in-memory write should not fail");
-    encoder.finish().expect("in-memory gzip finish should not fail")
+    encoder
+        .write_all(data)
+        .expect("in-memory write should not fail");
+    encoder
+        .finish()
+        .expect("in-memory gzip finish should not fail")
 }
 
 // --------------------------------------------------------------------------

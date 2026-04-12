@@ -109,9 +109,7 @@ struct PbsNode<'a> {
 /// `data[idx[i]]` to `data[idx[i+1]]` (or `data[data_size]` for the last).
 fn parse_pbstree(buf: &[u8]) -> Result<Vec<PbsNode<'_>>> {
     if buf.len() < 4 {
-        return Err(Error::InvalidKar(
-            "PBSTree too short for header".into(),
-        ));
+        return Err(Error::InvalidKar("PBSTree too short for header".into()));
     }
 
     let num_nodes = LittleEndian::read_u32(&buf[..4]) as usize;
@@ -253,7 +251,13 @@ fn inflate_node(data: &[u8], prefix: &str) -> Result<Vec<(String, KarEntry)>> {
             toc_read(&mut buf8, data, offset)?;
             let byte_size = LittleEndian::read_u64(&buf8);
 
-            results.push((full_path, KarEntry::File { byte_offset, byte_size }));
+            results.push((
+                full_path,
+                KarEntry::File {
+                    byte_offset,
+                    byte_size,
+                },
+            ));
         }
 
         TOC_TYPE_EMPTYFILE => {
@@ -458,9 +462,7 @@ impl<R: Read + Seek> KarArchive<R> {
             return Err(Error::InvalidKar("version 0 is invalid".into()));
         }
         if version > 1 {
-            return Err(Error::InvalidKar(format!(
-                "unsupported version: {version}"
-            )));
+            return Err(Error::InvalidKar(format!("unsupported version: {version}")));
         }
 
         // Read file_offset (u64) — start of data section
@@ -481,15 +483,12 @@ impl<R: Read + Seek> KarArchive<R> {
     /// Read and parse the entire TOC (from end of header to file_offset).
     fn read_toc(reader: &mut R, header: &KarHeader) -> Result<BTreeMap<String, KarEntry>> {
         let toc_start = HEADER_SIZE;
-        let toc_size = header
-            .file_offset
-            .checked_sub(toc_start)
-            .ok_or_else(|| {
-                Error::InvalidKar(format!(
-                    "file_offset ({}) is less than header size ({HEADER_SIZE})",
-                    header.file_offset
-                ))
-            })? as usize;
+        let toc_size = header.file_offset.checked_sub(toc_start).ok_or_else(|| {
+            Error::InvalidKar(format!(
+                "file_offset ({}) is less than header size ({HEADER_SIZE})",
+                header.file_offset
+            ))
+        })? as usize;
 
         // Read the entire TOC into memory
         reader.seek(SeekFrom::Start(toc_start))?;
@@ -593,8 +592,7 @@ pub(crate) mod test_helpers {
     /// Build a softlink TOC node.
     pub fn build_softlink_node(name: &str, target: &str) -> Vec<u8> {
         let mut buf = build_toc_entry(name, TOC_TYPE_SOFTLINK);
-        buf.write_u16::<LittleEndian>(target.len() as u16)
-            .unwrap();
+        buf.write_u16::<LittleEndian>(target.len() as u16).unwrap();
         buf.write_all(target.as_bytes()).unwrap();
         buf
     }
@@ -621,9 +619,7 @@ pub(crate) mod test_helpers {
         // Header
         archive.extend_from_slice(&MAGIC_NCBI);
         archive.extend_from_slice(&MAGIC_SRA);
-        archive
-            .write_u32::<LittleEndian>(BYTE_ORDER_TAG)
-            .unwrap();
+        archive.write_u32::<LittleEndian>(BYTE_ORDER_TAG).unwrap();
         archive.write_u32::<LittleEndian>(1).unwrap(); // version
         archive
             .write_u64::<LittleEndian>(file_offset as u64)
@@ -693,10 +689,7 @@ mod tests {
         let result = KarArchive::open(Cursor::new(archive));
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("byte order"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("byte order"), "unexpected error: {err}");
     }
 
     #[test]
@@ -757,11 +750,7 @@ mod tests {
         let file2_data = b"file2 data here";
 
         let child1 = build_file_node("a.txt", 0, file1_data.len() as u64);
-        let child2 = build_file_node(
-            "b.txt",
-            file1_data.len() as u64,
-            file2_data.len() as u64,
-        );
+        let child2 = build_file_node("b.txt", file1_data.len() as u64, file2_data.len() as u64);
 
         let dir_node = build_dir_node("mydir", &[&child1, &child2]);
         let mut data = Vec::new();
@@ -877,10 +866,7 @@ mod tests {
         let result = kar.read_file("mydir");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("directory"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("directory"), "unexpected error: {err}");
     }
 
     #[test]
@@ -890,10 +876,7 @@ mod tests {
         let empty_node = build_empty_file_node("placeholder");
         let link_node = build_softlink_node("shortcut", "data.bin");
 
-        let archive = build_kar_archive(
-            &[&file_node, &empty_node, &link_node],
-            file_data,
-        );
+        let archive = build_kar_archive(&[&file_node, &empty_node, &link_node], file_data);
 
         let mut kar = KarArchive::open(Cursor::new(archive)).unwrap();
 

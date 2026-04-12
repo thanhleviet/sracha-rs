@@ -50,7 +50,9 @@ pub fn vlen_decode_u64(data: &[u8]) -> Result<(u64, usize)> {
 
     loop {
         if i >= limit {
-            return Err(Error::Vdb("vlen_decode_u64: too many continuation bytes".into()));
+            return Err(Error::Vdb(
+                "vlen_decode_u64: too many continuation bytes".into(),
+            ));
         }
         let byte = data[i];
         value = (value << 7) | u64::from(byte & 0x7F);
@@ -131,6 +133,72 @@ pub struct PageMap {
     /// Data runs (how many rows share the same physical data position).
     /// Empty for variants where data_run is always 1.
     pub data_runs: Vec<u32>,
+}
+
+impl PageMap {
+    /// Total number of logical rows described by this page map.
+    ///
+    /// This is the sum of `leng_runs` (each entry tells how many consecutive
+    /// rows share the same length).
+    pub fn total_rows(&self) -> u64 {
+        self.leng_runs.iter().map(|&r| u64::from(r)).sum()
+    }
+
+    /// Expand run-length-encoded data to full row data.
+    ///
+    /// Takes decoded values (one per `data_rec`) and returns expanded values
+    /// (one per logical row). Each data entry `i` covers `data_runs[i]`
+    /// consecutive rows. If `data_runs` is empty, each data entry covers
+    /// exactly one row (no expansion needed).
+    ///
+    /// This is used for columns like READ_LEN where `irzip_decode` produces
+    /// `data_recs` unique values, but the actual row count is larger because
+    /// some values repeat via `data_runs`.
+    pub fn expand_data_runs<T: Clone>(&self, data: &[T]) -> Vec<T> {
+        if self.data_runs.is_empty() {
+            // No run-length encoding — each data entry = one row.
+            return data.to_vec();
+        }
+
+        let total = self.total_rows() as usize;
+        let mut expanded = Vec::with_capacity(total);
+
+        for (i, item) in data.iter().enumerate() {
+            let repeat = self.data_runs.get(i).copied().unwrap_or(1) as usize;
+            for _ in 0..repeat {
+                expanded.push(item.clone());
+            }
+        }
+
+        expanded
+    }
+
+    /// Expand run-length-encoded byte data to full row data.
+    ///
+    /// Like [`expand_data_runs`](Self::expand_data_runs), but operates on
+    /// fixed-size elements packed into a byte slice. Each element is
+    /// `elem_bytes` wide. Returns an expanded byte vector.
+    pub fn expand_data_runs_bytes(&self, data: &[u8], elem_bytes: usize) -> Vec<u8> {
+        if self.data_runs.is_empty() || elem_bytes == 0 {
+            return data.to_vec();
+        }
+
+        let total = self.total_rows() as usize;
+        let mut expanded = Vec::with_capacity(total * elem_bytes);
+
+        let n = data.len() / elem_bytes;
+        for i in 0..n {
+            let repeat = self.data_runs.get(i).copied().unwrap_or(1) as usize;
+            let start = i * elem_bytes;
+            let end = start + elem_bytes;
+            let chunk = &data[start..end];
+            for _ in 0..repeat {
+                expanded.extend_from_slice(chunk);
+            }
+        }
+
+        expanded
+    }
 }
 
 /// Deserialize a page map from its serialized form.
@@ -253,7 +321,6 @@ fn page_map_deserialize_v0(data: &[u8], row_count: u64) -> Result<PageMap> {
 }
 
 fn page_map_deserialize_v1(data: &[u8], row_count: u64) -> Result<PageMap> {
-    use flate2::read::ZlibDecoder;
     use std::io::Read as _;
 
     if data.is_empty() {
@@ -322,7 +389,9 @@ fn page_map_deserialize_v1(data: &[u8], row_count: u64) -> Result<PageMap> {
         let mut decoder = flate2::read::DeflateDecoder::new(compressed);
         let mut body = vec![0u8; bsize];
         let n = decoder.read(&mut body).map_err(|e| {
-            Error::Vdb(format!("page_map_v1: raw deflate decompression failed: {e}"))
+            Error::Vdb(format!(
+                "page_map_v1: raw deflate decompression failed: {e}"
+            ))
         })?;
         decompressed.extend_from_slice(&body[..n]);
     }
@@ -615,9 +684,7 @@ pub fn decode_blob(
         1 => 4,  // CRC32
         2 => 16, // MD5
         _ => {
-            return Err(Error::Vdb(format!(
-                "unknown checksum type {checksum_type}"
-            )));
+            return Err(Error::Vdb(format!("unknown checksum type {checksum_type}")));
         }
     };
 
@@ -665,7 +732,9 @@ pub fn decode_blob(
         let ms = envelope.map_size as usize;
 
         if blob_data.len() < es + hs + ms {
-            return Err(Error::Vdb("blob v2: data too short for headers + page map".into()));
+            return Err(Error::Vdb(
+                "blob v2: data too short for headers + page map".into(),
+            ));
         }
 
         // Parse blob headers.
@@ -979,17 +1048,16 @@ fn deserialize_izip_encoded(src: &[u8]) -> Result<IzipEncoded<'_>> {
             };
 
             let flag_length = flag_extract(data_flags, 2 * FLAG_BITS);
-            let length_data =
-                if flag_length != DATA_ABSENT && flag_length != DATA_CONSTANT {
-                    if src.len() < i + length_size as usize {
-                        return Err(Error::Vdb("izip: length_data too short".into()));
-                    }
-                    let d = &src[i..i + length_size as usize];
-                    i += length_size as usize;
-                    d
-                } else {
-                    &[]
-                };
+            let length_data = if flag_length != DATA_ABSENT && flag_length != DATA_CONSTANT {
+                if src.len() < i + length_size as usize {
+                    return Err(Error::Vdb("izip: length_data too short".into()));
+                }
+                let d = &src[i..i + length_size as usize];
+                i += length_size as usize;
+                d
+            } else {
+                &[]
+            };
 
             let flag_dy = flag_extract(data_flags, 3 * FLAG_BITS);
             let dy_data = if flag_dy != DATA_ABSENT && flag_dy != DATA_CONSTANT {
@@ -1028,17 +1096,16 @@ fn deserialize_izip_encoded(src: &[u8]) -> Result<IzipEncoded<'_>> {
             };
 
             let flag_outlier = flag_extract(data_flags, 6 * FLAG_BITS);
-            let outlier_data =
-                if flag_outlier != DATA_ABSENT && flag_outlier != DATA_CONSTANT {
-                    if src.len() < i + outlier_size as usize {
-                        return Err(Error::Vdb("izip: outlier_data too short".into()));
-                    }
-                    let d = &src[i..i + outlier_size as usize];
-                    // i += outlier_size as usize; (last field)
-                    d
-                } else {
-                    &[]
-                };
+            let outlier_data = if flag_outlier != DATA_ABSENT && flag_outlier != DATA_CONSTANT {
+                if src.len() < i + outlier_size as usize {
+                    return Err(Error::Vdb("izip: outlier_data too short".into()));
+                }
+
+                // i += outlier_size as usize; (last field)
+                &src[i..i + outlier_size as usize]
+            } else {
+                &[]
+            };
 
             Ok(IzipEncoded {
                 flags,
@@ -1072,16 +1139,14 @@ fn deserialize_izip_encoded(src: &[u8]) -> Result<IzipEncoded<'_>> {
                 }),
             })
         }
-        _ => Err(Error::Vdb(format!("izip: unknown encoding type {enc_type}"))),
+        _ => Err(Error::Vdb(format!(
+            "izip: unknown encoding type {enc_type}"
+        ))),
     }
 }
 
 /// Helper to decompress or copy a sub-array buffer.
-fn izip_decompress_buf(
-    data: &[u8],
-    flag: u32,
-    max_out: usize,
-) -> Result<Vec<u8>> {
+fn izip_decompress_buf(data: &[u8], flag: u32, max_out: usize) -> Result<Vec<u8>> {
     if flag == DATA_ZIPPED {
         zlib_raw_decompress(data, max_out)
     } else {
@@ -1098,9 +1163,9 @@ fn zlib_raw_decompress(data: &[u8], max_out: usize) -> Result<Vec<u8>> {
     let mut out = vec![0u8; max_out];
     let mut total = 0;
     loop {
-        let n = decoder.read(&mut out[total..]).map_err(|e| {
-            Error::Vdb(format!("izip: zlib decompression failed: {e}"))
-        })?;
+        let n = decoder
+            .read(&mut out[total..])
+            .map_err(|e| Error::Vdb(format!("izip: zlib decompression failed: {e}")))?;
         if n == 0 {
             break;
         }
@@ -1117,9 +1182,7 @@ fn variant_from_elem_bits(elem_bits: u32) -> Result<u32> {
         16 => Ok(3),
         32 => Ok(2),
         64 => Ok(1),
-        _ => Err(Error::Vdb(format!(
-            "izip: invalid elem_bits {elem_bits}"
-        ))),
+        _ => Err(Error::Vdb(format!("izip: invalid elem_bits {elem_bits}"))),
     }
 }
 
@@ -1208,16 +1271,11 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
         // Type 1: zlib-compressed, no min offset.
         // Type 3: zlib-compressed with min offset.
         1 | 3 => {
-            let decompressed =
-                zlib_raw_decompress(encoded.simple_data, n * 8)?;
+            let decompressed = zlib_raw_decompress(encoded.simple_data, n * 8)?;
             let elem_size_bits = (decompressed.len() * 8) / n;
             let var = variant_from_elem_bits(elem_size_bits as u32)?;
 
-            let min = if enc_type == 3 {
-                encoded.simple_min
-            } else {
-                0
-            };
+            let min = if enc_type == 3 { encoded.simple_min } else { 0 };
 
             for i in 0..n {
                 let raw = nbuf_read(&decompressed, i, var);
@@ -1238,20 +1296,17 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
         }
         // Type 0: full izip with line segments.
         0 => {
-            let iz = encoded.izipped.as_ref().ok_or_else(|| {
-                Error::Vdb("izip type 0: missing izip fields".into())
-            })?;
+            let iz = encoded
+                .izipped
+                .as_ref()
+                .ok_or_else(|| Error::Vdb("izip type 0: missing izip fields".into()))?;
 
             // Decode diff buffer.
             let flag_diff = flag_extract(iz.data_flags, FLAG_BITS);
             let diff_raw = if flag_diff == DATA_CONSTANT {
                 vec![0u8; iz.diff_size as usize]
             } else {
-                izip_decompress_buf(
-                    iz.diff_data,
-                    flag_diff,
-                    n * 8,
-                )?
+                izip_decompress_buf(iz.diff_data, flag_diff, n * 8)?
             };
 
             let diff_elem_bits = if diff_raw.is_empty() {
@@ -1343,11 +1398,7 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
                 let outlier_raw = if flag_outlier == DATA_CONSTANT {
                     vec![0u8; outlier_count * 8]
                 } else {
-                    izip_decompress_buf(
-                        iz.outlier_data,
-                        flag_outlier,
-                        outlier_count * 8,
-                    )?
+                    izip_decompress_buf(iz.outlier_data, flag_outlier, outlier_count * 8)?
                 };
                 let outlier_elem_bits = if outlier_raw.is_empty() {
                     8
@@ -1355,12 +1406,7 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
                     (outlier_raw.len() * 8 / outlier_count) as u32
                 };
                 let outlier_var = variant_from_elem_bits(outlier_elem_bits)?;
-                unpack_nbuf(
-                    &outlier_raw,
-                    outlier_count,
-                    outlier_var,
-                    iz.min_outlier,
-                )
+                unpack_nbuf(&outlier_raw, outlier_count, outlier_var, iz.min_outlier)
             } else {
                 vec![]
             };
@@ -1482,13 +1528,13 @@ pub fn irzip_decode(
         let mut plane_bytes = vec![0u8; n];
         use std::io::Read;
         let bytes_read = decoder.read(&mut plane_bytes).map_err(|e| {
-            Error::Vdb(format!("irzip: deflate decompression of plane {bit} failed: {e}"))
+            Error::Vdb(format!(
+                "irzip: deflate decompression of plane {bit} failed: {e}"
+            ))
         })?;
         if bytes_read < n {
             // Partial decompress — pad with zeros.
-            tracing::warn!(
-                "irzip plane {bit}: decompressed {bytes_read} of {n} expected bytes"
-            );
+            tracing::warn!("irzip plane {bit}: decompressed {bytes_read} of {n} expected bytes");
         }
 
         // How many compressed bytes were consumed?
@@ -1511,8 +1557,8 @@ pub fn irzip_decode(
 
     // Apply min and slope: Y[i] = decoded[i] + min + i * slope
     let mut output = vec![0u8; n * out_bytes];
-    for i in 0..n {
-        let val = values[i] + min + (i as i64) * slope;
+    for (i, &v) in values.iter().enumerate().take(n) {
+        let val = v + min + (i as i64) * slope;
         write_element(&mut output, i, val, elem_bits);
     }
 
@@ -1767,7 +1813,9 @@ mod tests {
         // = 0b10_00_0_000 = 0x80
         let hdr_byte: u8 = 0x80;
         // variant 0: offset=3, hdr_size=src[1], map_size=src[2]
-        let data = [hdr_byte, 5, 10, /* then 5 bytes header, 10 bytes map, then data... */];
+        let data = [
+            hdr_byte, 5, 10, /* then 5 bytes header, 10 bytes map, then data... */
+        ];
         let env = decode_blob_v2(&data).unwrap();
         assert_eq!(env.adjust, 0);
         assert!(!env.big_endian);
@@ -1870,8 +1918,8 @@ mod tests {
     #[test]
     fn izip_decode_type1_simple() {
         // Type 1: zipped. We create a minimal test with deflate-compressed data.
-        use flate2::write::DeflateEncoder;
         use flate2::Compression;
+        use flate2::write::DeflateEncoder;
         use std::io::Write as _;
 
         // Encode 4 u8 values: [10, 20, 30, 40]
@@ -1893,8 +1941,8 @@ mod tests {
     #[test]
     fn izip_decode_type3_packed_zipped() {
         // Type 3: packed + zipped. Compressed u8 values with min offset.
-        use flate2::write::DeflateEncoder;
         use flate2::Compression;
+        use flate2::write::DeflateEncoder;
         use std::io::Write as _;
 
         // We want values [100, 101, 102, 103], stored as offsets from min=100.
@@ -1984,5 +2032,96 @@ mod tests {
     fn decode_blob_empty() {
         let decoded = decode_blob(&[], 0, 0, 8).unwrap();
         assert!(decoded.data.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // PageMap expand_data_runs tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn page_map_total_rows_single_run() {
+        let pm = PageMap {
+            data_recs: 100,
+            lengths: vec![10],
+            leng_runs: vec![100],
+            data_runs: vec![],
+        };
+        assert_eq!(pm.total_rows(), 100);
+    }
+
+    #[test]
+    fn page_map_total_rows_multiple_runs() {
+        let pm = PageMap {
+            data_recs: 3,
+            lengths: vec![5],
+            leng_runs: vec![2048],
+            data_runs: vec![1000, 500, 548],
+        };
+        assert_eq!(pm.total_rows(), 2048);
+    }
+
+    #[test]
+    fn page_map_expand_data_runs_empty_runs() {
+        // No data_runs means each entry covers 1 row (no expansion).
+        let pm = PageMap {
+            data_recs: 3,
+            lengths: vec![10],
+            leng_runs: vec![3],
+            data_runs: vec![],
+        };
+        let data = vec![10u32, 20, 30];
+        let expanded = pm.expand_data_runs(&data);
+        assert_eq!(expanded, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn page_map_expand_data_runs_with_repeats() {
+        // data_runs = [2, 3, 1] means:
+        //   entry 0 covers 2 rows, entry 1 covers 3 rows, entry 2 covers 1 row
+        let pm = PageMap {
+            data_recs: 3,
+            lengths: vec![5],
+            leng_runs: vec![6],
+            data_runs: vec![2, 3, 1],
+        };
+        let data = vec![100u32, 200, 300];
+        let expanded = pm.expand_data_runs(&data);
+        assert_eq!(expanded, vec![100, 100, 200, 200, 200, 300]);
+    }
+
+    #[test]
+    fn page_map_expand_data_runs_bytes_u32() {
+        let pm = PageMap {
+            data_recs: 2,
+            lengths: vec![4],
+            leng_runs: vec![5],
+            data_runs: vec![3, 2],
+        };
+        // Two u32 LE values: 42 and 99
+        let mut data = Vec::new();
+        data.extend_from_slice(&42u32.to_le_bytes());
+        data.extend_from_slice(&99u32.to_le_bytes());
+
+        let expanded = pm.expand_data_runs_bytes(&data, 4);
+        assert_eq!(expanded.len(), 5 * 4); // 5 rows * 4 bytes each
+
+        let vals: Vec<u32> = expanded
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(vals, vec![42, 42, 42, 99, 99]);
+    }
+
+    #[test]
+    fn page_map_expand_data_runs_bytes_empty_runs() {
+        let pm = PageMap {
+            data_recs: 2,
+            lengths: vec![4],
+            leng_runs: vec![2],
+            data_runs: vec![],
+        };
+        let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let expanded = pm.expand_data_runs_bytes(&data, 4);
+        assert_eq!(expanded, data);
     }
 }

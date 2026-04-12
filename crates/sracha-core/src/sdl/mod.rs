@@ -70,14 +70,9 @@ impl SdlClient {
 
         tracing::debug!("SDL request: {url}");
 
-        let resp = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| Error::Sdl {
-                message: e.to_string(),
-            })?;
+        let resp = self.http.get(url).send().await.map_err(|e| Error::Sdl {
+            message: e.to_string(),
+        })?;
 
         if !resp.status().is_success() {
             return Err(Error::Sdl {
@@ -102,13 +97,13 @@ impl SdlClient {
             .find_result(accession)
             .ok_or_else(|| Error::NotFound(accession.to_string()))?;
 
-        if let Some(status) = result.status {
-            if status != 200 {
-                let msg = result.message.as_deref().unwrap_or("unknown error");
-                return Err(Error::Sdl {
-                    message: format!("{accession}: SDL status {status} — {msg}"),
-                });
-            }
+        if let Some(status) = result.status
+            && status != 200
+        {
+            let msg = result.message.as_deref().unwrap_or("unknown error");
+            return Err(Error::Sdl {
+                message: format!("{accession}: SDL status {status} — {msg}"),
+            });
         }
 
         let sra_sdl = result.find_sra_file().ok_or_else(|| Error::Sdl {

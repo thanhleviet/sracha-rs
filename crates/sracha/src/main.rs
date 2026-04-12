@@ -37,13 +37,49 @@ async fn main() -> Result<()> {
         }
         Command::Fastq(args) => {
             tracing::info!("converting {} input(s) to FASTQ", args.inputs.len());
-            anyhow::bail!("fastq not yet implemented")
+
+            let split_mode = match args.split {
+                cli::SplitMode::Split3 => sracha_core::fastq::SplitMode::Split3,
+                cli::SplitMode::SplitFiles => sracha_core::fastq::SplitMode::SplitFiles,
+                cli::SplitMode::SplitSpot => sracha_core::fastq::SplitMode::SplitSpot,
+                cli::SplitMode::Interleaved => sracha_core::fastq::SplitMode::Interleaved,
+            };
+
+            for input in &args.inputs {
+                let sra_path = std::path::Path::new(input);
+                if !sra_path.exists() {
+                    eprintln!("error: file not found: {input}");
+                    continue;
+                }
+
+                let pipeline_config = sracha_core::pipeline::PipelineConfig {
+                    output_dir: args.output_dir.clone(),
+                    split_mode,
+                    gzip: !args.no_gzip,
+                    gzip_level: args.gzip_level,
+                    threads: args.threads,
+                    connections: 1,
+                    skip_technical: !args.include_technical,
+                    min_read_len: args.min_read_len,
+                    force: args.force,
+                    progress: args.progress,
+                };
+
+                let stats = sracha_core::pipeline::run_fastq(sra_path, None, &pipeline_config)?;
+
+                eprintln!(
+                    "{}: {} spots, {} reads written",
+                    stats.accession, stats.spots_read, stats.reads_written,
+                );
+                for path in &stats.output_files {
+                    eprintln!("  -> {}", path.display());
+                }
+            }
+
+            Ok(())
         }
         Command::Get(args) => {
-            tracing::info!(
-                "get {} accession(s) -> FASTQ",
-                args.accessions.len()
-            );
+            tracing::info!("get {} accession(s) -> FASTQ", args.accessions.len());
 
             let split_mode = match args.split {
                 cli::SplitMode::Split3 => sracha_core::fastq::SplitMode::Split3,
@@ -122,10 +158,7 @@ fn print_resolved(resolved: &ResolvedAccession) {
 
     println!("{}", resolved.accession);
     println!("  Size:    {}", format_size(f.size));
-    println!(
-        "  MD5:     {}",
-        f.md5.as_deref().unwrap_or("not provided")
-    );
+    println!("  MD5:     {}", f.md5.as_deref().unwrap_or("not provided"));
     println!("  Lite:    {}", if f.is_lite { "yes" } else { "no" });
     println!("  Mirrors: {}", f.mirrors.len());
     for m in &f.mirrors {

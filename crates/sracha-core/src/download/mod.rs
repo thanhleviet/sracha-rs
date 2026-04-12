@@ -92,10 +92,7 @@ fn plan_chunks(file_size: u64, chunk_size: u64) -> Vec<ChunkRange> {
     let mut offset = 0u64;
     while offset < file_size {
         let end = std::cmp::min(offset + chunk_size - 1, file_size - 1);
-        chunks.push(ChunkRange {
-            start: offset,
-            end,
-        });
+        chunks.push(ChunkRange { start: offset, end });
         offset = end + 1;
     }
     chunks
@@ -268,9 +265,7 @@ async fn download_single_stream(
     if expected_size > 0 && bytes_written != expected_size {
         return Err(Error::Download {
             accession: String::new(),
-            message: format!(
-                "size mismatch: expected {expected_size} bytes, got {bytes_written}"
-            ),
+            message: format!("size mismatch: expected {expected_size} bytes, got {bytes_written}"),
         });
     }
 
@@ -353,7 +348,11 @@ pub async fn download_file(
     let url = &urls[0];
     tracing::debug!("probing URL: {url}");
     let probe = probe_url(&client, url).await?;
-    tracing::debug!("probe result: range={}, content_length={:?}", probe.supports_range, probe.content_length);
+    tracing::debug!(
+        "probe result: range={}, content_length={:?}",
+        probe.supports_range,
+        probe.content_length
+    );
 
     let file_size = probe.content_length.unwrap_or(expected_size);
     if file_size == 0 {
@@ -406,22 +405,12 @@ pub async fn download_file(
             let pb_clone = pb.clone();
 
             let handle = tokio::spawn(async move {
-                let _permit = sem
-                    .acquire()
-                    .await
-                    .map_err(|e| Error::Download {
-                        accession: String::new(),
-                        message: format!("semaphore acquire failed: {e}"),
-                    })?;
+                let _permit = sem.acquire().await.map_err(|e| Error::Download {
+                    accession: String::new(),
+                    message: format!("semaphore acquire failed: {e}"),
+                })?;
 
-                download_chunk(
-                    &cli,
-                    &u,
-                    chunk,
-                    &p,
-                    pb_clone.as_ref().map(|arc| &**arc),
-                )
-                .await
+                download_chunk(&cli, &u, chunk, &p, pb_clone.as_deref()).await
             });
 
             handles.push(handle);
@@ -462,7 +451,7 @@ pub async fn download_file(
             file_size < SMALL_FILE,
         );
 
-        download_single_stream(&client, url, output_path, file_size, pb.as_ref().map(|arc| &**arc)).await?;
+        download_single_stream(&client, url, output_path, file_size, pb.as_deref()).await?;
     }
 
     if let Some(pb) = &pb {
@@ -470,9 +459,8 @@ pub async fn download_file(
     }
 
     // Verify MD5 if requested.
-    let md5_hex = if config.validate && expected_md5.is_some() {
+    let md5_hex = if let (true, Some(expected)) = (config.validate, expected_md5) {
         let computed = compute_md5(output_path).await?;
-        let expected = expected_md5.unwrap(); // safe: checked is_some above
         if computed != expected {
             // Clean up the bad file.
             let _ = tokio::fs::remove_file(output_path).await;
@@ -535,7 +523,10 @@ mod tests {
     fn test_effective_chunk_size_adaptive() {
         let config = DownloadConfig::default();
         // < 256 MiB => 8 MiB chunks
-        assert_eq!(effective_chunk_size(100 * 1024 * 1024, &config), 8 * 1024 * 1024);
+        assert_eq!(
+            effective_chunk_size(100 * 1024 * 1024, &config),
+            8 * 1024 * 1024
+        );
         // < 2 GiB => 16 MiB chunks
         assert_eq!(
             effective_chunk_size(512 * 1024 * 1024, &config),

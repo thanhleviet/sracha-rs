@@ -51,10 +51,12 @@ impl VdbCursor {
         let seq_col_base = find_sequence_col_base(archive)?;
 
         // READ is required.
-        let read_col = ColumnReader::open(archive, &format!("{seq_col_base}/{COL_READ}"))
-            .map_err(|_| Error::ColumnNotFound {
-                table: "SEQUENCE".into(),
-                column: COL_READ.into(),
+        let read_col =
+            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_READ}")).map_err(|_| {
+                Error::ColumnNotFound {
+                    table: "SEQUENCE".into(),
+                    column: COL_READ.into(),
+                }
             })?;
 
         // Optional columns — open each, swallowing errors.
@@ -66,8 +68,7 @@ impl VdbCursor {
             ColumnReader::open(archive, &format!("{seq_col_base}/{COL_READ_TYPE}")).ok();
         let read_filter_col =
             ColumnReader::open(archive, &format!("{seq_col_base}/{COL_READ_FILTER}")).ok();
-        let name_col =
-            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_NAME}")).ok();
+        let name_col = ColumnReader::open(archive, &format!("{seq_col_base}/{COL_NAME}")).ok();
         let spot_group_col =
             ColumnReader::open(archive, &format!("{seq_col_base}/{COL_SPOT_GROUP}")).ok();
 
@@ -157,13 +158,13 @@ impl VdbCursor {
 fn find_sequence_col_base<R: Read + Seek>(archive: &KarArchive<R>) -> Result<String> {
     // Strategy 1: look for database-style `*/tbl/SEQUENCE/col` directory.
     for path in archive.entries().keys() {
-        if path.ends_with("/tbl/SEQUENCE/col") {
-            if matches!(
+        if path.ends_with("/tbl/SEQUENCE/col")
+            && matches!(
                 archive.entries().get(path.as_str()),
                 Some(crate::vdb::kar::KarEntry::Directory)
-            ) {
-                return Ok(path.clone());
-            }
+            )
+        {
+            return Ok(path.clone());
         }
     }
 
