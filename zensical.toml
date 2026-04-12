@@ -31,19 +31,26 @@ values = [
 ]
 
 [project.markdown_extensions]
-values = [
-    "admonition",
-    "attr_list",
-    "def_list",
-    "footnotes",
-    "tables",
-    "pymdownx.details",
-    "pymdownx.highlight",
-    "pymdownx.inlinehilite",
-    "pymdownx.superfences",
-    "pymdownx.tabbed",
-    "pymdownx.snippets",
+admonition = {}
+attr_list = {}
+def_list = {}
+footnotes = {}
+tables = {}
+
+[project.markdown_extensions.pymdownx.details]
+
+[project.markdown_extensions.pymdownx.highlight]
+
+[project.markdown_extensions.pymdownx.inlinehilite]
+
+[project.markdown_extensions.pymdownx.superfences]
+custom_fences = [
+  { name = "mermaid", class = "mermaid" }
 ]
+
+[project.markdown_extensions.pymdownx.tabbed]
+
+[project.markdown_extensions.pymdownx.snippets]
 
 [[project.nav]]
 Home = "index.md"

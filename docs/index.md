@@ -11,6 +11,19 @@ Fast SRA downloader and FASTQ converter, written in pure Rust.
 - **SRA and SRA-lite** -- full quality or simplified quality scores
 - **Split modes** -- split-3, split-files, split-spot, interleaved
 
+## Architecture
+
+``` mermaid
+graph LR
+  A["sracha get SRR..."] --> B["SDL Resolve"]
+  B --> C["Parallel Download"]
+  C --> D["KAR Archive Parse"]
+  D --> E["VDB Column Decode"]
+  E --> F["FASTQ Format"]
+  F --> G["Parallel Gzip"]
+  G --> H["*.fastq.gz"]
+```
+
 ## Quick start
 
 ```bash
