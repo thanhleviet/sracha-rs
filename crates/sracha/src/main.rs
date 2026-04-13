@@ -35,25 +35,41 @@ async fn main() -> Result<()> {
             for acc_str in &args.accessions {
                 let acc = sracha_core::accession::parse(acc_str)?;
                 let resolved = client.resolve_one(&acc.to_string()).await?;
-                let url = resolved.sra_file.mirrors.first()
-                    .ok_or_else(|| anyhow::anyhow!("no mirrors for {acc}"))?
-                    .url.clone();
+                let mirror = resolved
+                    .sra_file
+                    .mirrors
+                    .iter()
+                    .min_by_key(|m| match m.service.as_str() {
+                        "s3" => 0u8,
+                        "gs" => 1,
+                        _ if m.service.contains("sra-ncbi") => 2,
+                        "ncbi" => 3,
+                        _ => 4,
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("no mirrors for {acc}"))?;
+                let url = mirror.url.clone();
                 let output_path = args.output_dir.join(format!("{acc}.sra"));
                 let dl_config = sracha_core::download::DownloadConfig {
                     connections: args.connections,
                     force: args.force,
                     validate: args.validate,
-                    progress: args.progress,
+                    progress: !args.no_progress,
                     ..Default::default()
                 };
-                tracing::info!("{acc}: downloading {} to {}", format_size(resolved.sra_file.size), output_path.display());
+                tracing::info!(
+                    "{acc}: downloading {} from [{}] to {}",
+                    format_size(resolved.sra_file.size),
+                    mirror.service,
+                    output_path.display()
+                );
                 sracha_core::download::download_file(
                     &[url],
                     resolved.sra_file.size,
                     resolved.sra_file.md5.as_deref(),
                     &output_path,
                     &dl_config,
-                ).await?;
+                )
+                .await?;
                 tracing::info!("{acc}: saved to {}", output_path.display());
             }
             Ok(())
@@ -71,7 +87,11 @@ async fn main() -> Result<()> {
             for input in &args.inputs {
                 let sra_path = std::path::Path::new(input);
                 if !sra_path.exists() {
-                    eprintln!("{} file not found: {}", style::error_label("error:"), style::path(input));
+                    eprintln!(
+                        "{} file not found: {}",
+                        style::error_label("error:"),
+                        style::path(input)
+                    );
                     continue;
                 }
 
@@ -85,7 +105,7 @@ async fn main() -> Result<()> {
                     skip_technical: !args.include_technical,
                     min_read_len: args.min_read_len,
                     force: args.force,
-                    progress: args.progress,
+                    progress: !args.no_progress,
                 };
 
                 let stats = sracha_core::pipeline::run_fastq(sra_path, None, &pipeline_config)?;
@@ -129,7 +149,7 @@ async fn main() -> Result<()> {
                     skip_technical: !args.include_technical,
                     min_read_len: args.min_read_len,
                     force: args.force,
-                    progress: args.progress,
+                    progress: !args.no_progress,
                 };
 
                 let stats = sracha_core::pipeline::run_get(&resolved, &pipeline_config).await?;
@@ -182,7 +202,11 @@ fn print_resolved(resolved: &ResolvedAccession) {
     let f = &resolved.sra_file;
 
     println!("{}", style::header(&resolved.accession));
-    println!("  {}    {}", style::label("Size:"), style::value(format_size(f.size)));
+    println!(
+        "  {}    {}",
+        style::label("Size:"),
+        style::value(format_size(f.size))
+    );
     println!(
         "  {}     {}",
         style::label("MD5:"),
@@ -193,7 +217,11 @@ fn print_resolved(resolved: &ResolvedAccession) {
         style::label("Lite:"),
         style::value(if f.is_lite { "yes" } else { "no" })
     );
-    println!("  {} {}", style::label("Mirrors:"), style::count(f.mirrors.len()));
+    println!(
+        "  {} {}",
+        style::label("Mirrors:"),
+        style::count(f.mirrors.len())
+    );
     for m in &f.mirrors {
         println!("    [{}] {}", style::value(&m.service), style::path(&m.url));
     }
@@ -207,4 +235,3 @@ fn print_resolved(resolved: &ResolvedAccession) {
         );
     }
 }
-

@@ -59,12 +59,11 @@ impl VdbCursor {
         let seq_col_base = find_sequence_col_base(archive)?;
 
         // READ is required.
-        let read_col =
-            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_READ}"), sra_path)
-                .map_err(|_| Error::ColumnNotFound {
-                    table: "SEQUENCE".into(),
-                    column: COL_READ.into(),
-                })?;
+        let read_col = ColumnReader::open(archive, &format!("{seq_col_base}/{COL_READ}"), sra_path)
+            .map_err(|_| Error::ColumnNotFound {
+                table: "SEQUENCE".into(),
+                column: COL_READ.into(),
+            })?;
 
         // Optional columns — open each, swallowing errors.
         // Try QUALITY first, then ORIGINAL_QUALITY as fallback.
@@ -80,16 +79,26 @@ impl VdbCursor {
                 .ok();
         let read_len_col =
             ColumnReader::open(archive, &format!("{seq_col_base}/{COL_READ_LEN}"), sra_path).ok();
-        let read_type_col =
-            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_READ_TYPE}"), sra_path).ok();
-        let read_filter_col =
-            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_READ_FILTER}"), sra_path)
-                .ok();
+        let read_type_col = ColumnReader::open(
+            archive,
+            &format!("{seq_col_base}/{COL_READ_TYPE}"),
+            sra_path,
+        )
+        .ok();
+        let read_filter_col = ColumnReader::open(
+            archive,
+            &format!("{seq_col_base}/{COL_READ_FILTER}"),
+            sra_path,
+        )
+        .ok();
         let name_col =
             ColumnReader::open(archive, &format!("{seq_col_base}/{COL_NAME}"), sra_path).ok();
-        let spot_group_col =
-            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_SPOT_GROUP}"), sra_path)
-                .ok();
+        let spot_group_col = ColumnReader::open(
+            archive,
+            &format!("{seq_col_base}/{COL_SPOT_GROUP}"),
+            sra_path,
+        )
+        .ok();
 
         let first_row = read_col.first_row_id().unwrap_or(1);
         let row_count = read_col.row_count();

@@ -20,8 +20,8 @@ Examples:
   Download and convert to FASTQ in one shot:
     sracha get SRR1234567
 
-  Download multiple accessions with progress:
-    sracha get SRR1234567 SRR7654321 -p
+  Download multiple accessions:
+    sracha get SRR1234567 SRR7654321
 
   Fetch SRA file, then convert separately:
     sracha fetch SRR1234567
@@ -86,9 +86,9 @@ pub struct FetchArgs {
     #[arg(short, long)]
     pub force: bool,
 
-    /// Show progress bar
-    #[arg(short, long)]
-    pub progress: bool,
+    /// Disable progress bar
+    #[arg(long)]
+    pub no_progress: bool,
 
     /// Verify MD5 after download
     #[arg(long)]
@@ -137,9 +137,9 @@ pub struct FastqArgs {
     #[arg(short, long)]
     pub force: bool,
 
-    /// Show progress bar
-    #[arg(short, long)]
-    pub progress: bool,
+    /// Disable progress bar
+    #[arg(long)]
+    pub no_progress: bool,
 }
 
 #[derive(Args)]
@@ -188,9 +188,9 @@ pub struct GetArgs {
     #[arg(short, long)]
     pub force: bool,
 
-    /// Show progress bar
-    #[arg(short, long)]
-    pub progress: bool,
+    /// Disable progress bar
+    #[arg(long)]
+    pub no_progress: bool,
 }
 
 #[derive(Args)]

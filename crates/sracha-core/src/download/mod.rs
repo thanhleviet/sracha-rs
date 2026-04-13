@@ -292,12 +292,21 @@ async fn compute_md5(path: &Path) -> Result<String> {
 
 /// Create a progress bar for the download.
 fn make_progress_bar(total_size: u64) -> indicatif::ProgressBar {
-    let pb = indicatif::ProgressBar::new(total_size);
+    use std::io::IsTerminal;
+
+    let pb = if std::io::stderr().is_terminal() {
+        indicatif::ProgressBar::new(total_size)
+    } else {
+        let target = indicatif::ProgressDrawTarget::term_like_with_hz(
+            Box::new(crate::pipeline::LogTarget),
+            1,
+        );
+        indicatif::ProgressBar::with_draw_target(Some(total_size), target)
+    };
     pb.set_style(
         indicatif::ProgressStyle::default_bar()
             .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] \
-                 {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+                "[{elapsed_precise}] [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
             )
             .expect("valid progress bar template")
             .progress_chars("=>-"),
@@ -376,7 +385,7 @@ pub async fn download_file(
         let chunk_size = effective_chunk_size(file_size, config);
         let chunks = plan_chunks(file_size, chunk_size);
 
-        tracing::info!(
+        tracing::debug!(
             "Downloading {} in {} chunks ({} each) with {} connections",
             crate::util::format_size(file_size),
             chunks.len(),

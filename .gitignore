@@ -4,3 +4,5 @@
 *.lock
 ext/
 .sracha-tmp-*
+sracha-big-*.out
+test-big.sh

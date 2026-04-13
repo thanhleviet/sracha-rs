@@ -10,18 +10,21 @@
 //! 3. **Phase 3 -- Cleanup + Report**: Delete the temp file and print stats.
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use flate2::write::GzEncoder;
-use rayon::prelude::*;
+use crate::compress::{DEFAULT_BLOCK_SIZE, ParGzWriter};
 use crate::download::{DownloadConfig, download_file};
 use crate::error::{Error, Result};
-use crate::fastq::{FastqConfig, OutputSlot, SplitMode, SpotRecord, format_spot, output_filename};
+use crate::fastq::{
+    FastqConfig, FastqRecord, OutputSlot, SplitMode, SpotRecord, format_spot, output_filename,
+};
 use crate::sdl::ResolvedAccession;
 use crate::vdb::blob;
 use crate::vdb::cursor::VdbCursor;
 use crate::vdb::kar::KarArchive;
+use rayon::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -72,12 +75,60 @@ pub struct PipelineStats {
 }
 
 // ---------------------------------------------------------------------------
+// Log-friendly progress target for non-TTY output (e.g. SLURM logs).
+// ---------------------------------------------------------------------------
+
+/// A [`TermLike`](indicatif::TermLike) adapter that prints each progress update
+/// as a new line to stderr. Cursor movement and clearing are no-ops.
+#[derive(Debug)]
+pub(crate) struct LogTarget;
+
+impl indicatif::TermLike for LogTarget {
+    fn width(&self) -> u16 {
+        80
+    }
+
+    fn move_cursor_up(&self, _n: usize) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn move_cursor_down(&self, _n: usize) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn move_cursor_right(&self, _n: usize) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn move_cursor_left(&self, _n: usize) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn write_line(&self, s: &str) -> std::io::Result<()> {
+        eprintln!("{s}");
+        Ok(())
+    }
+
+    fn write_str(&self, _s: &str) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn clear_line(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn flush(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Output writer
 // ---------------------------------------------------------------------------
 
 /// An output writer that handles both gzip-compressed and plain FASTQ output.
 enum OutputWriter {
-    Gz(GzEncoder<std::io::BufWriter<std::fs::File>>),
+    Gz(ParGzWriter<std::io::BufWriter<std::fs::File>>),
     Plain(std::io::BufWriter<std::fs::File>),
 }
 
@@ -172,38 +223,42 @@ fn decode_raw(raw: &[u8], checksum_type: u8, row_count: u64) -> Result<blob::Dec
 ///
 /// Returns decompressed bytes, or falls back to raw bytes on failure.
 fn decode_zip_encoding(decoded: &blob::DecodedBlob) -> Vec<u8> {
-    use std::io::Read as _;
-
     let hdr_version = decoded.headers.first().map(|h| h.version).unwrap_or(0);
 
-    // For zip_encoding, the data section is always raw-deflate
-    // compressed (windowBits = -15). The header version only affects
-    // whether trailing bits need adjustment (version 2).
     if decoded.data.is_empty() {
         return Vec::new();
     }
 
-    // Try raw deflate decompression.
-    let mut dec = flate2::read::DeflateDecoder::new(decoded.data.as_slice());
-    let mut out = Vec::new();
-    if dec.read_to_end(&mut out).is_ok() && !out.is_empty() {
-        // Version 2: trim trailing bits if specified in header args.
-        if hdr_version == 2 {
-            if let Some(trailing_bits) = decoded.headers.first().and_then(|h| h.args.first()) {
+    // Estimate output size from header osize, or 4x input as heuristic.
+    let estimated = decoded
+        .headers
+        .first()
+        .map(|h| h.osize as usize)
+        .filter(|&s| s > 0)
+        .unwrap_or(decoded.data.len() * 4);
+
+    // Try raw deflate via libdeflate.
+    if let Ok(mut out) = blob::deflate_decompress(decoded.data.as_slice(), estimated) {
+        if !out.is_empty() {
+            // Version 2: trim trailing bits if specified in header args.
+            if hdr_version == 2
+                && let Some(trailing_bits) =
+                    decoded.headers.first().and_then(|h| h.args.first())
+            {
                 let total_bits = out.len() as i64 * 8;
                 let actual_bits = total_bits - (8 - trailing_bits);
                 let actual_bytes = ((actual_bits + 7) / 8) as usize;
                 out.truncate(actual_bytes);
             }
+            return out;
         }
-        return out;
     }
 
-    // Fallback: try zlib (with header) in case some columns use it.
-    let mut dec2 = flate2::read::ZlibDecoder::new(decoded.data.as_slice());
-    let mut out2 = Vec::new();
-    if dec2.read_to_end(&mut out2).is_ok() && !out2.is_empty() {
-        return out2;
+    // Fallback: try zlib (with header).
+    if let Ok(out2) = blob::zlib_decompress(decoded.data.as_slice(), estimated) {
+        if !out2.is_empty() {
+            return out2;
+        }
     }
 
     // Last resort: return raw bytes (might already be uncompressed).
@@ -214,27 +269,28 @@ fn decode_zip_encoding(decoded: &blob::DecodedBlob) -> Vec<u8> {
 // Batch-parallel blob decode types and helpers
 // ---------------------------------------------------------------------------
 
-/// Raw bytes read from disk for a single blob across all columns.
-/// All fields are owned `Vec<u8>` (Send) so this can be sent to rayon.
-struct RawBlobData {
+/// Raw bytes for a single blob across all columns.
+/// Holds borrowed slices into the mmap (zero-copy) so this is Send
+/// as long as the mmap outlives the parallel closure.
+struct RawBlobData<'a> {
     /// READ column raw bytes.
-    read_raw: Vec<u8>,
+    read_raw: &'a [u8],
     /// Row count (id_range) for the READ blob.
     read_id_range: u64,
     /// QUALITY column raw bytes (empty if column absent or blob out of range).
-    quality_raw: Vec<u8>,
+    quality_raw: &'a [u8],
     /// Row count for the QUALITY blob (0 if absent).
     quality_id_range: u64,
     /// Checksum type for the QUALITY column.
     quality_cs: u8,
     /// READ_LEN column raw bytes (empty if column absent).
-    read_len_raw: Vec<u8>,
+    read_len_raw: &'a [u8],
     /// Row count for the READ_LEN blob (0 if absent).
     read_len_id_range: u64,
     /// Checksum type for the READ_LEN column.
     read_len_cs: u8,
     /// NAME column raw bytes (empty if column absent).
-    name_raw: Vec<u8>,
+    name_raw: &'a [u8],
     /// Row count for the NAME blob (0 if absent).
     name_id_range: u64,
     /// Checksum type for the NAME column.
@@ -247,10 +303,10 @@ struct RawBlobData {
 
 /// Decode a single blob's raw bytes into `Vec<SpotRecord>`.
 ///
-/// This is a pure function that operates only on owned data -- no references
+/// This is a pure function that operates only on borrowed data -- no references
 /// to `ColumnReader` -- so it is `Send` and safe to call from rayon threads.
 fn decode_blob_to_spots(
-    raw: &RawBlobData,
+    raw: &RawBlobData<'_>,
     read_cs: u8,
     is_lite: bool,
     blob_idx: usize,
@@ -259,7 +315,7 @@ fn decode_blob_to_spots(
     // ------------------------------------------------------------------
     // Decode READ blob -> 2na -> ASCII bases.
     // ------------------------------------------------------------------
-    let read_decoded = decode_raw(&raw.read_raw, read_cs, raw.read_id_range)?;
+    let read_decoded = decode_raw(raw.read_raw, read_cs, raw.read_id_range)?;
     let total_bits = read_decoded.data.len() * 8;
     let adjust = read_decoded.adjust as usize;
     let actual_bases = (total_bits.saturating_sub(adjust)) / 2;
@@ -270,14 +326,14 @@ fn decode_blob_to_spots(
     // Decode QUALITY blob.
     // ------------------------------------------------------------------
     let quality_data: Vec<u8> = if !raw.quality_raw.is_empty() {
-        let qdecoded = decode_raw(&raw.quality_raw, raw.quality_cs, raw.quality_id_range)?;
+        let qdecoded = decode_raw(raw.quality_raw, raw.quality_cs, raw.quality_id_range)?;
         decode_zip_encoding(&qdecoded)
     } else {
         Vec::new()
     };
 
-    let quality_is_empty = quality_data.is_empty()
-        || quality_data.iter().take(1000).all(|&b| b == 0);
+    let quality_is_empty =
+        quality_data.is_empty() || quality_data.iter().take(1000).all(|&b| b == 0);
     let quality_all: Vec<u8> = if !quality_is_empty {
         let looks_like_ascii = quality_data.iter().take(100).all(|&b| b >= 33);
         if looks_like_ascii && quality_data.len() == read_data.len() {
@@ -292,94 +348,99 @@ fn decode_blob_to_spots(
     // ------------------------------------------------------------------
     // Decode READ_LEN blob -> irzip/izip -> u32 lengths.
     // ------------------------------------------------------------------
-    let (read_lengths, reads_per_spot): (Vec<u32>, usize) = if raw.has_read_len && !raw.read_len_raw.is_empty() {
-        let rldecoded = decode_raw(&raw.read_len_raw, raw.read_len_cs, raw.read_len_id_range)?;
+    let (read_lengths, reads_per_spot): (Vec<u32>, usize) =
+        if raw.has_read_len && !raw.read_len_raw.is_empty() {
+            let rldecoded = decode_raw(raw.read_len_raw, raw.read_len_cs, raw.read_len_id_range)?;
 
-        let rps = rldecoded.page_map.as_ref()
-            .and_then(|pm| pm.lengths.first().copied())
-            .unwrap_or(1) as usize;
+            let rps = rldecoded
+                .page_map
+                .as_ref()
+                .and_then(|pm| pm.lengths.first().copied())
+                .unwrap_or(1) as usize;
 
-        let hdr_version = rldecoded.headers.first().map(|h| h.version).unwrap_or(0);
+            let hdr_version = rldecoded.headers.first().map(|h| h.version).unwrap_or(0);
 
-        let decoded_ints = if hdr_version >= 1 {
-            let hdr = &rldecoded.headers[0];
-            let planes = hdr.ops.first().copied().unwrap_or(0xFF);
-            let min = hdr.args.first().copied().unwrap_or(0);
-            let slope = hdr.args.get(1).copied().unwrap_or(0);
-            let num_elems = (hdr.osize as u32) / 4;
-            blob::irzip_decode(&rldecoded.data, 32, num_elems, min, slope, planes)
-                .unwrap_or_default()
-        } else {
-            let num_elems = rldecoded.row_length
-                .unwrap_or_else(|| (rldecoded.data.len() as u64 * 8) / 32)
-                as u32;
-            blob::izip_decode(&rldecoded.data, 32, num_elems).unwrap_or_default()
-        };
+            let decoded_ints = if hdr_version >= 1 {
+                let hdr = &rldecoded.headers[0];
+                let planes = hdr.ops.first().copied().unwrap_or(0xFF);
+                let min = hdr.args.first().copied().unwrap_or(0);
+                let slope = hdr.args.get(1).copied().unwrap_or(0);
+                let num_elems = (hdr.osize as u32) / 4;
+                blob::irzip_decode(&rldecoded.data, 32, num_elems, min, slope, planes)
+                    .unwrap_or_default()
+            } else {
+                let num_elems = rldecoded
+                    .row_length
+                    .unwrap_or_else(|| (rldecoded.data.len() as u64 * 8) / 32)
+                    as u32;
+                blob::izip_decode(&rldecoded.data, 32, num_elems).unwrap_or_default()
+            };
 
-        // Expand via page map if present.
-        let rl_bytes = if let Some(ref pm) = rldecoded.page_map {
-            let elem_bytes = 4usize; // u32
-            let row_length = pm.lengths.first().copied().unwrap_or(1) as usize;
-            let entry_bytes = row_length * elem_bytes;
+            // Expand via page map if present.
+            let rl_bytes = if let Some(ref pm) = rldecoded.page_map {
+                let elem_bytes = 4usize; // u32
+                let row_length = pm.lengths.first().copied().unwrap_or(1) as usize;
+                let entry_bytes = row_length * elem_bytes;
 
-            if !pm.data_runs.is_empty() && pm.data_runs.len() as u64 >= pm.total_rows() {
-                let mut expanded = Vec::with_capacity(pm.data_runs.len() * entry_bytes);
-                for &offset in &pm.data_runs {
-                    let start = offset as usize * entry_bytes;
-                    let end = start + entry_bytes;
-                    if end <= decoded_ints.len() {
-                        expanded.extend_from_slice(&decoded_ints[start..end]);
+                if !pm.data_runs.is_empty() && pm.data_runs.len() as u64 >= pm.total_rows() {
+                    let mut expanded = Vec::with_capacity(pm.data_runs.len() * entry_bytes);
+                    for &offset in &pm.data_runs {
+                        let start = offset as usize * entry_bytes;
+                        let end = start + entry_bytes;
+                        if end <= decoded_ints.len() {
+                            expanded.extend_from_slice(&decoded_ints[start..end]);
+                        }
                     }
+                    expanded
+                } else if !pm.data_runs.is_empty() {
+                    pm.expand_data_runs_bytes(&decoded_ints, elem_bytes)
+                } else {
+                    decoded_ints
                 }
-                expanded
-            } else if !pm.data_runs.is_empty() {
-                pm.expand_data_runs_bytes(&decoded_ints, elem_bytes)
             } else {
                 decoded_ints
+            };
+
+            let lengths: Vec<u32> = rl_bytes
+                .chunks_exact(4)
+                .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+
+            if blob_idx == 0 {
+                tracing::info!(
+                    "READ_LEN: {} values, reads_per_spot={}, first_10={:?}",
+                    lengths.len(),
+                    rps,
+                    &lengths[..lengths.len().min(10)],
+                );
             }
-        } else {
-            decoded_ints
-        };
 
-        let lengths: Vec<u32> = rl_bytes
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect();
-
-        if blob_idx == 0 {
-            tracing::info!(
-                "READ_LEN: {} values, reads_per_spot={}, first_10={:?}",
-                lengths.len(), rps,
-                &lengths[..lengths.len().min(10)],
-            );
-        }
-
-        (lengths, rps)
-    } else if !raw.has_read_len {
-        if let Some(ref pm) = read_page_map {
-            let mut row_lengths = Vec::new();
-            for (len, run) in pm.lengths.iter().zip(pm.leng_runs.iter()) {
-                for _ in 0..*run {
-                    if *len > 100_000 {
-                        continue;
+            (lengths, rps)
+        } else if !raw.has_read_len {
+            if let Some(ref pm) = read_page_map {
+                let mut row_lengths = Vec::new();
+                for (len, run) in pm.lengths.iter().zip(pm.leng_runs.iter()) {
+                    for _ in 0..*run {
+                        if *len > 100_000 {
+                            continue;
+                        }
+                        row_lengths.push(*len);
                     }
-                    row_lengths.push(*len);
                 }
+                (row_lengths, 1)
+            } else {
+                (vec![read_data.len() as u32], 1)
             }
-            (row_lengths, 1)
         } else {
+            // has_read_len but raw is empty (blob out of range).
             (vec![read_data.len() as u32], 1)
-        }
-    } else {
-        // has_read_len but raw is empty (blob out of range).
-        (vec![read_data.len() as u32], 1)
-    };
+        };
 
     // ------------------------------------------------------------------
     // Decode NAME blob.
     // ------------------------------------------------------------------
     let spot_names: Option<Vec<Vec<u8>>> = if raw.has_name && !raw.name_raw.is_empty() {
-        let ndecoded = decode_raw(&raw.name_raw, raw.name_cs, raw.name_id_range)?;
+        let ndecoded = decode_raw(raw.name_raw, raw.name_cs, raw.name_id_range)?;
         let name_bytes = decode_zip_encoding(&ndecoded);
 
         let num_spots = if reads_per_spot > 0 {
@@ -404,17 +465,16 @@ fn decode_blob_to_spots(
                 tracing::info!(
                     "NAME: {} names decoded, first={:?}",
                     names.len(),
-                    names.first().map(|n| String::from_utf8_lossy(n).to_string()),
+                    names
+                        .first()
+                        .map(|n| String::from_utf8_lossy(n).to_string()),
                 );
             }
             Some(names)
         } else if let Some(row_len) = ndecoded.row_length {
             let rl = row_len as usize;
             if rl > 0 {
-                let names: Vec<Vec<u8>> = name_bytes
-                    .chunks(rl)
-                    .map(|c| c.to_vec())
-                    .collect();
+                let names: Vec<Vec<u8>> = name_bytes.chunks(rl).map(|c| c.to_vec()).collect();
                 Some(names)
             } else {
                 None
@@ -449,7 +509,7 @@ fn decode_blob_to_spots(
 
         let seq_end = seq_offset + spot_total_bases;
         if seq_end > read_data.len() {
-            tracing::warn!(
+            tracing::debug!(
                 "blob {blob_idx}, spot {spot_idx_in_blob}: sequence overrun at offset \
                  {seq_offset} + {spot_total_bases} > {}; stopping blob",
                 read_data.len(),
@@ -537,6 +597,18 @@ fn decode_and_write(
         .num_threads(num_threads)
         .build()
         .map_err(|e| Error::Vdb(format!("failed to build rayon thread pool: {e}")))?;
+
+    // Dedicated thread pool for parallel gzip compression.
+    // Compression is the bottleneck (~60% CPU), so give it 2x the threads.
+    let compress_threads = num_threads * 2;
+    let compress_pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(compress_threads)
+            .thread_name(|i| format!("pargz-{i}"))
+            .build()
+            .map_err(|e| Error::Vdb(format!("failed to build gzip thread pool: {e}")))?,
+    );
+
     tracing::info!("{accession}: using {num_threads} threads for decode");
 
     let fastq_config = FastqConfig {
@@ -552,7 +624,7 @@ fn decode_and_write(
     let mut writers: HashMap<OutputSlot, OutputWriter> = HashMap::new();
     let mut output_files: Vec<PathBuf> = Vec::new();
 
-    let mut spots_read: u64 = 0;
+    let spots_read = std::sync::atomic::AtomicU64::new(0);
     let mut reads_written: u64 = 0;
 
     // Capture column metadata before the batch loop. These are Copy/Clone
@@ -572,153 +644,215 @@ fn decode_and_write(
     let name_blob_count = cursor.name_col().map_or(0, |c| c.blob_count());
     let name_cs = cursor.name_col().map_or(0, |c| c.meta().checksum_type);
 
-    tracing::info!(
-        "{accession}: streaming decode of {num_blobs} blobs (batch-parallel)",
-    );
+    tracing::info!("{accession}: streaming decode of {num_blobs} blobs (batch-parallel)",);
+
+    let decode_pb = if config.progress {
+        let is_tty = std::io::stderr().is_terminal();
+        let pb = if is_tty {
+            indicatif::ProgressBar::new(num_blobs as u64)
+        } else {
+            // Non-TTY (e.g. SLURM log): each update prints a new line.
+            let target = indicatif::ProgressDrawTarget::term_like_with_hz(Box::new(LogTarget), 1);
+            indicatif::ProgressBar::with_draw_target(Some(num_blobs as u64), target)
+        };
+        pb.set_style(
+            indicatif::ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] [{bar:40}] {pos}/{len} blobs ({per_sec}, {eta})")
+                .expect("valid progress bar template")
+                .progress_chars("=>-"),
+        );
+        Some(pb)
+    } else {
+        None
+    };
 
     /// Number of blobs per batch for parallel decode.
     const BATCH_SIZE: usize = 1024;
 
-    let mut blob_idx: usize = 0;
-    while blob_idx < num_blobs {
-        let batch_end = (blob_idx + BATCH_SIZE).min(num_blobs);
-        let batch_len = batch_end - blob_idx;
+    // ------------------------------------------------------------------
+    // Pipelined decode → write.
+    //
+    // A crossbeam channel decouples the decode loop (producer) from the
+    // write loop (consumer).  While the writer drains batch N, the
+    // decode pool is already working on batch N+1.
+    // ------------------------------------------------------------------
+    type FormattedBlob = (Vec<(OutputSlot, FastqRecord)>, u64);
+    // Capacity 2: at most 2 decoded batches buffered.
+    let (batch_tx, batch_rx) =
+        crossbeam_channel::bounded::<Vec<Result<FormattedBlob>>>(2);
 
-        // Pre-compute per-blob spots_before offsets for synthetic naming.
-        let mut spots_before_per_blob: Vec<u64> = Vec::with_capacity(batch_len);
-        {
-            let mut cumulative = spots_read;
-            for bi in blob_idx..batch_end {
-                spots_before_per_blob.push(cumulative);
-                cumulative += cursor.read_col().blobs()[bi].id_range as u64;
+    let write_result: Result<()> = std::thread::scope(|scope| {
+        // ---- Writer thread ----
+        let writer_handle = scope.spawn(|| -> Result<()> {
+            let mut blob_counter: usize = 0;
+            while let Ok(formatted_batches) = batch_rx.recv() {
+                for result in formatted_batches {
+                    let (records, num_spots) = result?;
+
+                    for (slot, record) in &records {
+                        let writer = writers.entry(*slot).or_insert_with(|| {
+                            let filename = output_filename(accession, *slot, config.gzip);
+                            let path = config.output_dir.join(&filename);
+                            output_files.push(path.clone());
+
+                            let file = std::fs::File::create(&path)
+                                .expect("failed to create output file");
+                            let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+
+                            if config.gzip {
+                                OutputWriter::Gz(ParGzWriter::new(
+                                    buf,
+                                    config.gzip_level,
+                                    DEFAULT_BLOCK_SIZE,
+                                    compress_pool.clone(),
+                                ))
+                            } else {
+                                OutputWriter::Plain(buf)
+                            }
+                        });
+
+                        writer.write_all(&record.data).map_err(Error::Io)?;
+                        reads_written += 1;
+                    }
+
+                    spots_read.fetch_add(num_spots, std::sync::atomic::Ordering::Relaxed);
+                    blob_counter += 1;
+
+                    if let Some(ref pb) = decode_pb {
+                        pb.inc(1);
+                    }
+
+                    if blob_counter.is_multiple_of(50) || blob_counter == num_blobs {
+                        tracing::debug!(
+                            "{accession}: decoded {blob_counter}/{num_blobs} blobs, \
+                             {} spots so far",
+                            spots_read.load(std::sync::atomic::Ordering::Relaxed),
+                        );
+                    }
+                }
             }
-        }
-
-        // ==============================================================
-        // Fully parallel: read from mmap + decode on rayon workers.
-        //
-        // With mmap, ColumnReader is Send+Sync — blob reads are just
-        // memory slices with zero syscalls. Each rayon worker reads its
-        // own blob data directly from the shared mmap.
-        // ==============================================================
-        let decoded_batches: Vec<Result<Vec<SpotRecord>>> = pool.install(|| {
-            (blob_idx..batch_end)
-                .into_par_iter()
-                .enumerate()
-                .map(|(i, bi)| {
-                    // Read raw bytes from mmap (zero-copy slice → Vec).
-                    let read_blob = &cursor.read_col().blobs()[bi];
-                    let read_raw = cursor.read_col().read_raw_blob_for_row(read_blob.start_id)?;
-                    let read_id_range = read_blob.id_range as u64;
-
-                    let (q_raw, q_id_range) = if has_quality && bi < quality_blob_count {
-                        let qcol = cursor.quality_col().unwrap();
-                        let qblob = &qcol.blobs()[bi];
-                        (qcol.read_raw_blob_for_row(qblob.start_id)?, qblob.id_range as u64)
-                    } else {
-                        (Vec::new(), 0)
-                    };
-
-                    let (rl_raw, rl_id_range) = if has_read_len && bi < read_len_blob_count {
-                        let rlcol = cursor.read_len_col().unwrap();
-                        let rlblob = &rlcol.blobs()[bi];
-                        (rlcol.read_raw_blob_for_row(rlblob.start_id)?, rlblob.id_range as u64)
-                    } else {
-                        (Vec::new(), 0)
-                    };
-
-                    let (n_raw, n_id_range) = if has_name && bi < name_blob_count {
-                        let ncol = cursor.name_col().unwrap();
-                        let nblob = &ncol.blobs()[bi];
-                        (ncol.read_raw_blob_for_row(nblob.start_id)?, nblob.id_range as u64)
-                    } else {
-                        (Vec::new(), 0)
-                    };
-
-                    let raw = RawBlobData {
-                        read_raw,
-                        read_id_range,
-                        quality_raw: q_raw,
-                        quality_id_range: q_id_range,
-                        quality_cs,
-                        read_len_raw: rl_raw,
-                        read_len_id_range: rl_id_range,
-                        read_len_cs,
-                        name_raw: n_raw,
-                        name_id_range: n_id_range,
-                        name_cs,
-                        has_read_len,
-                        has_name,
-                    };
-
-                    decode_blob_to_spots(
-                        &raw,
-                        read_cs,
-                        is_lite,
-                        bi,
-                        spots_before_per_blob[i],
-                    )
-                })
-                .collect()
+            Ok(())
         });
 
-        // Raw blob data was decoded inside the parallel closure and dropped.
+        // ---- Decode loop (main thread) ----
+        let mut blob_idx: usize = 0;
+        while blob_idx < num_blobs {
+            let batch_end = (blob_idx + BATCH_SIZE).min(num_blobs);
+            let batch_len = batch_end - blob_idx;
 
-        // ==============================================================
-        // Step 3: Write FASTQ output sequentially (I/O, maintains order).
-        // ==============================================================
-        for (i, decoded_result) in decoded_batches.into_iter().enumerate() {
-            let spots = decoded_result?;
-            let current_blob = blob_idx + i;
-
-            for spot in &spots {
-                let records = format_spot(spot, accession, &fastq_config);
-
-                for (slot, record) in &records {
-                    let writer = writers.entry(*slot).or_insert_with(|| {
-                        let filename = output_filename(accession, *slot, config.gzip);
-                        let path = config.output_dir.join(&filename);
-                        output_files.push(path.clone());
-
-                        let file =
-                            std::fs::File::create(&path).expect("failed to create output file");
-                        let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
-
-                        if config.gzip {
-                            OutputWriter::Gz(GzEncoder::new(
-                                buf,
-                                flate2::Compression::new(config.gzip_level),
-                            ))
-                        } else {
-                            OutputWriter::Plain(buf)
-                        }
-                    });
-
-                    writer.write_all(&record.data).map_err(Error::Io)?;
-                    reads_written += 1;
+            let mut spots_before_per_blob: Vec<u64> = Vec::with_capacity(batch_len);
+            {
+                let mut cumulative = spots_read.load(std::sync::atomic::Ordering::Relaxed);
+                for bi in blob_idx..batch_end {
+                    spots_before_per_blob.push(cumulative);
+                    cumulative += cursor.read_col().blobs()[bi].id_range as u64;
                 }
             }
 
-            spots_read += spots.len() as u64;
+            let formatted_batches: Vec<Result<FormattedBlob>> = pool.install(|| {
+                (blob_idx..batch_end)
+                    .into_par_iter()
+                    .enumerate()
+                    .map(|(i, bi)| {
+                        let read_blob = &cursor.read_col().blobs()[bi];
+                        let read_raw =
+                            cursor.read_col().read_raw_blob_slice(read_blob.start_id)?;
+                        let read_id_range = read_blob.id_range as u64;
 
-            // Log progress every 50 blobs.
-            if (current_blob + 1) % 50 == 0 || current_blob + 1 == num_blobs {
-                tracing::info!(
-                    "{accession}: decoded {}/{} blobs, {} spots so far",
-                    current_blob + 1,
-                    num_blobs,
-                    spots_read,
-                );
+                        let (q_raw, q_id_range): (&[u8], u64) =
+                            if has_quality && bi < quality_blob_count {
+                                let qcol = cursor.quality_col().unwrap();
+                                let qblob = &qcol.blobs()[bi];
+                                (
+                                    qcol.read_raw_blob_slice(qblob.start_id)?,
+                                    qblob.id_range as u64,
+                                )
+                            } else {
+                                (&[], 0)
+                            };
+
+                        let (rl_raw, rl_id_range): (&[u8], u64) =
+                            if has_read_len && bi < read_len_blob_count {
+                                let rlcol = cursor.read_len_col().unwrap();
+                                let rlblob = &rlcol.blobs()[bi];
+                                (
+                                    rlcol.read_raw_blob_slice(rlblob.start_id)?,
+                                    rlblob.id_range as u64,
+                                )
+                            } else {
+                                (&[], 0)
+                            };
+
+                        let (n_raw, n_id_range): (&[u8], u64) =
+                            if has_name && bi < name_blob_count {
+                                let ncol = cursor.name_col().unwrap();
+                                let nblob = &ncol.blobs()[bi];
+                                (
+                                    ncol.read_raw_blob_slice(nblob.start_id)?,
+                                    nblob.id_range as u64,
+                                )
+                            } else {
+                                (&[], 0)
+                            };
+
+                        let raw = RawBlobData {
+                            read_raw,
+                            read_id_range,
+                            quality_raw: q_raw,
+                            quality_id_range: q_id_range,
+                            quality_cs,
+                            read_len_raw: rl_raw,
+                            read_len_id_range: rl_id_range,
+                            read_len_cs,
+                            name_raw: n_raw,
+                            name_id_range: n_id_range,
+                            name_cs,
+                            has_read_len,
+                            has_name,
+                        };
+
+                        let spots = decode_blob_to_spots(
+                            &raw,
+                            read_cs,
+                            is_lite,
+                            bi,
+                            spots_before_per_blob[i],
+                        )?;
+
+                        let num_spots = spots.len() as u64;
+                        let mut records = Vec::new();
+                        for spot in &spots {
+                            let formatted = format_spot(spot, accession, &fastq_config);
+                            records.extend(formatted);
+                        }
+
+                        Ok((records, num_spots))
+                    })
+                    .collect()
+            });
+
+            // Send to writer thread (blocks if writer is behind by 2 batches).
+            if batch_tx.send(formatted_batches).is_err() {
+                break; // Writer thread exited (error).
             }
+
+            blob_idx = batch_end;
         }
 
-        blob_idx = batch_end;
+        // Signal writer we're done, then wait for it.
+        drop(batch_tx);
+        writer_handle.join().unwrap()
+    });
+
+    write_result?;
+
+    if let Some(pb) = decode_pb {
+        pb.finish_and_clear();
     }
 
+    let total_spots = spots_read.load(std::sync::atomic::Ordering::Relaxed);
     tracing::info!(
-        "{accession}: streaming decode complete -- {} spots, {} reads written",
-        spots_read,
-        reads_written,
+        "{accession}: streaming decode complete -- {total_spots} spots, {reads_written} reads written",
     );
 
     // Finish all writers.
@@ -726,7 +860,7 @@ fn decode_and_write(
         writer.finish().map_err(Error::Io)?;
     }
 
-    Ok((spots_read, reads_written, output_files))
+    Ok((total_spots, reads_written, output_files))
 }
 
 // ---------------------------------------------------------------------------
@@ -809,7 +943,7 @@ pub async fn run_get(
         chunk_size: 0, // adaptive
         force: true,   // always overwrite temp file
         validate: false,
-        progress: true, // always show download progress
+        progress: config.progress,
     };
 
     tracing::info!(
@@ -836,32 +970,9 @@ pub async fn run_get(
 
     // --- Phase 2: Parse VDB + output FASTQ ---
     let is_lite = resolved.sra_file.is_lite;
-    let accession_owned = accession.clone();
-    let temp_path_for_blocking = temp_path.clone();
 
-    let config_for_blocking = PipelineConfig {
-        output_dir: config.output_dir.clone(),
-        split_mode: config.split_mode,
-        gzip: config.gzip,
-        gzip_level: config.gzip_level,
-        threads: config.threads,
-        connections: config.connections,
-        skip_technical: config.skip_technical,
-        min_read_len: config.min_read_len,
-        force: config.force,
-        progress: config.progress,
-    };
-
-    let (spots_read, reads_written, output_files) = tokio::task::spawn_blocking(move || {
-        decode_and_write(
-            &temp_path_for_blocking,
-            &accession_owned,
-            &config_for_blocking,
-            is_lite,
-        )
-    })
-    .await
-    .map_err(|e| Error::Vdb(format!("decode task panicked: {e}")))??;
+    let (spots_read, reads_written, output_files) =
+        tokio::task::block_in_place(|| decode_and_write(&temp_path, accession, config, is_lite))?;
 
     // --- Phase 3: Cleanup ---
     if let Err(e) = tokio::fs::remove_file(&temp_path).await {

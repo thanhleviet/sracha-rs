@@ -886,6 +886,12 @@ impl ColumnReader {
     /// The caller should use [`crate::vdb::blob::decode_blob`] for proper
     /// envelope parsing, CRC validation, and decompression.
     pub fn read_raw_blob_for_row(&self, row_id: i64) -> Result<Vec<u8>> {
+        self.read_raw_blob_slice(row_id).map(|s| s.to_vec())
+    }
+
+    /// Zero-copy variant: returns a slice into the underlying data (mmap or
+    /// in-memory buffer) without allocating.
+    pub fn read_raw_blob_slice(&self, row_id: i64) -> Result<&[u8]> {
         let blob = self
             .find_blob(row_id)
             .ok_or_else(|| Error::Vdb(format!("no blob found for row_id {row_id}")))?;
@@ -901,7 +907,7 @@ impl ColumnReader {
                         data.len()
                     )));
                 }
-                Ok(data[blob_offset..blob_offset + size].to_vec())
+                Ok(&data[blob_offset..blob_offset + size])
             }
             DataSource::Mmap { mmap, .. } => {
                 if blob_offset + size > mmap.len() {
@@ -910,7 +916,7 @@ impl ColumnReader {
                         mmap.len()
                     )));
                 }
-                Ok(mmap[blob_offset..blob_offset + size].to_vec())
+                Ok(&mmap[blob_offset..blob_offset + size])
             }
         }
     }
@@ -1614,10 +1620,8 @@ mod tests {
         let archive_bytes = build_kar_archive(&[&root_dir], &data_section);
 
         // Write to a temp file so OnDisk reads work.
-        let sra_path = std::env::temp_dir().join(format!(
-            "sracha-kdb-test-{}.sra",
-            std::process::id(),
-        ));
+        let sra_path =
+            std::env::temp_dir().join(format!("sracha-kdb-test-{}.sra", std::process::id(),));
         std::fs::write(&sra_path, &archive_bytes).unwrap();
 
         let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();

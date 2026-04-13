@@ -5,10 +5,9 @@
 //! Multiple concatenated gzip members form a valid gzip stream per RFC 1952.
 
 use std::io::{self, Write};
+use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender, bounded};
-use flate2::Compression;
-use flate2::write::GzEncoder;
 
 /// Default block size: 256 KiB.
 pub const DEFAULT_BLOCK_SIZE: usize = 256 * 1024;
@@ -34,6 +33,8 @@ pub struct ParGzWriter<W: Write + Send> {
     block_size: usize,
     /// Gzip compression level (1–9).
     level: u32,
+    /// Dedicated thread pool for compression (never the global rayon pool).
+    pool: Arc<rayon::ThreadPool>,
     /// Monotonically increasing block counter.
     next_seq: u64,
     /// Sender half — rayon workers send `(seq, compressed_bytes)` here.
@@ -57,18 +58,20 @@ impl<W: Write + Send> ParGzWriter<W> {
     /// - `inner`: the underlying writer (file, stdout, etc.)
     /// - `level`: gzip compression level (1–9)
     /// - `block_size`: bytes per uncompressed block (e.g. [`DEFAULT_BLOCK_SIZE`])
-    pub fn new(inner: W, level: u32, block_size: usize) -> Self {
+    /// - `pool`: dedicated rayon thread pool for compression work
+    pub fn new(inner: W, level: u32, block_size: usize, pool: Arc<rayon::ThreadPool>) -> Self {
         assert!(block_size > 0, "block_size must be > 0");
-        // Bound the channel to roughly 2× the default rayon thread count so
-        // that compression can run ahead of the drain loop without unbounded
+        // Bound the channel to roughly 2× the pool thread count so that
+        // compression can run ahead of the drain loop without unbounded
         // memory growth.
-        let bound = rayon::current_num_threads() * 2;
+        let bound = pool.current_num_threads() * 2;
         let (tx, rx) = bounded(bound);
         Self {
             inner: Some(inner),
             buf: Vec::with_capacity(block_size),
             block_size,
             level,
+            pool,
             next_seq: 0,
             tx,
             rx,
@@ -102,7 +105,7 @@ impl<W: Write + Send> ParGzWriter<W> {
 
     // -- internal helpers ---------------------------------------------------
 
-    /// Submit `block` for compression on the rayon pool.
+    /// Submit `block` for compression on the dedicated pool.
     fn dispatch_block(&mut self, block: Vec<u8>) {
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -110,7 +113,7 @@ impl<W: Write + Send> ParGzWriter<W> {
         let level = self.level;
         let tx = self.tx.clone();
 
-        rayon::spawn(move || {
+        self.pool.spawn(move || {
             let compressed = compress_block(&block, level);
             // If the receiver is dropped the send will fail, which is fine —
             // it means the writer was dropped without calling finish().
@@ -246,13 +249,17 @@ impl<W: Write + Send> Write for ParGzWriter<W> {
 // --------------------------------------------------------------------------
 
 fn compress_block(data: &[u8], level: u32) -> Vec<u8> {
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::new(level));
-    encoder
-        .write_all(data)
-        .expect("in-memory write should not fail");
-    encoder
-        .finish()
-        .expect("in-memory gzip finish should not fail")
+    use libdeflater::{CompressionLvl, Compressor};
+
+    let lvl = CompressionLvl::new(level.clamp(1, 12) as i32).expect("valid compression level");
+    let mut compressor = Compressor::new(lvl);
+    let max_sz = compressor.gzip_compress_bound(data.len());
+    let mut out = vec![0u8; max_sz];
+    let actual = compressor
+        .gzip_compress(data, &mut out)
+        .expect("gzip compression should not fail");
+    out.truncate(actual);
+    out
 }
 
 // --------------------------------------------------------------------------
@@ -267,10 +274,19 @@ mod tests {
 
     use flate2::read::MultiGzDecoder;
 
+    fn test_pool() -> Arc<rayon::ThreadPool> {
+        Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .unwrap(),
+        )
+    }
+
     /// Helper: compress `input` via `ParGzWriter` and return the raw
     /// compressed bytes.
     fn compress_via_par(input: &[u8], level: u32, block_size: usize) -> Vec<u8> {
-        let mut writer = ParGzWriter::new(Vec::new(), level, block_size);
+        let mut writer = ParGzWriter::new(Vec::new(), level, block_size, test_pool());
         writer.write_all(input).unwrap();
         writer.finish().unwrap()
     }
@@ -328,7 +344,7 @@ mod tests {
 
     #[test]
     fn finish_returns_inner_writer() {
-        let writer = ParGzWriter::new(Vec::<u8>::new(), 6, DEFAULT_BLOCK_SIZE);
+        let writer = ParGzWriter::new(Vec::<u8>::new(), 6, DEFAULT_BLOCK_SIZE, test_pool());
         let inner = writer.finish().unwrap();
         // The inner Vec should be accessible and empty (no data written).
         assert!(inner.is_empty());
@@ -348,7 +364,7 @@ mod tests {
     #[test]
     fn write_one_byte_at_a_time() {
         let input = b"abcdefghijklmnopqrstuvwxyz";
-        let mut writer = ParGzWriter::new(Vec::new(), 6, 8);
+        let mut writer = ParGzWriter::new(Vec::new(), 6, 8, test_pool());
         for &byte in input.iter() {
             writer.write_all(&[byte]).unwrap();
         }
@@ -359,7 +375,7 @@ mod tests {
 
     #[test]
     fn flush_mid_stream() {
-        let mut writer = ParGzWriter::new(Vec::new(), 6, DEFAULT_BLOCK_SIZE);
+        let mut writer = ParGzWriter::new(Vec::new(), 6, DEFAULT_BLOCK_SIZE, test_pool());
         writer.write_all(b"part one").unwrap();
         writer.flush().unwrap();
         writer.write_all(b"part two").unwrap();

@@ -337,7 +337,6 @@ fn page_map_deserialize_v0(data: &[u8], row_count: u64) -> Result<PageMap> {
 }
 
 fn page_map_deserialize_v1(data: &[u8], row_count: u64) -> Result<PageMap> {
-    use std::io::Read as _;
 
     if data.is_empty() {
         return Err(Error::Vdb("page_map_v1: empty input".into()));
@@ -402,13 +401,7 @@ fn page_map_deserialize_v1(data: &[u8], row_count: u64) -> Result<PageMap> {
 
     if endp > hsize {
         // VDB uses raw deflate (inflateInit2 with -15), not zlib format.
-        let mut decoder = flate2::read::DeflateDecoder::new(compressed);
-        let mut body = Vec::new();
-        decoder.read_to_end(&mut body).map_err(|e| {
-            Error::Vdb(format!(
-                "page_map_v1: raw deflate decompression failed: {e}"
-            ))
-        })?;
+        let body = deflate_decompress(compressed, bsize)?;
         decompressed.extend_from_slice(&body);
     }
 
@@ -427,7 +420,8 @@ fn page_map_deserialize_v1(data: &[u8], row_count: u64) -> Result<PageMap> {
                 "page_map: {bad} of {} lengths > 100K. First bad at [{first_bad_idx}]={}, context: {:?}",
                 pm.lengths.len(),
                 pm.lengths[first_bad_idx],
-                &pm.lengths[first_bad_idx.saturating_sub(2)..pm.lengths.len().min(first_bad_idx + 3)],
+                &pm.lengths
+                    [first_bad_idx.saturating_sub(2)..pm.lengths.len().min(first_bad_idx + 3)],
             );
             // Show raw bytes around where the bad value was decoded from
             // v0 variant 2: header = byte[0] + vlen(leng_recs), then data
@@ -1200,24 +1194,142 @@ fn izip_decompress_buf(data: &[u8], flag: u32, max_out: usize) -> Result<Vec<u8>
     }
 }
 
-/// Decompress raw zlib data (no header, windowBits = -15).
+/// Decompress raw deflate data (no header, windowBits = -15) using libdeflate.
+/// `max_out` is the expected decompressed size.
 fn zlib_raw_decompress(data: &[u8], max_out: usize) -> Result<Vec<u8>> {
+    deflate_decompress(data, max_out)
+}
+
+/// Fast raw-deflate decompression via libdeflate.
+///
+/// `expected_size` is the expected output size. If the actual decompressed
+/// data is larger, falls back to flate2 streaming decoder.
+pub(crate) fn deflate_decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
+    use libdeflater::Decompressor;
+
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut decompressor = Decompressor::new();
+    let mut out = vec![0u8; expected_size];
+    match decompressor.deflate_decompress(data, &mut out) {
+        Ok(actual) => {
+            out.truncate(actual);
+            Ok(out)
+        }
+        Err(_) => {
+            // Fallback: size estimate was wrong, use streaming flate2.
+            deflate_decompress_fallback(data)
+        }
+    }
+}
+
+/// Fast zlib (with header) decompression via libdeflate.
+pub(crate) fn zlib_decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
+    use libdeflater::Decompressor;
+
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut decompressor = Decompressor::new();
+    let mut out = vec![0u8; expected_size];
+    match decompressor.zlib_decompress(data, &mut out) {
+        Ok(actual) => {
+            out.truncate(actual);
+            Ok(out)
+        }
+        Err(_) => {
+            // Fallback: try streaming.
+            zlib_decompress_fallback(data)
+        }
+    }
+}
+
+/// Raw-deflate decompression via libdeflate, also returning the number of
+/// compressed input bytes consumed. Needed for irzip where multiple
+/// compressed streams are concatenated.
+pub(crate) fn deflate_decompress_ex(
+    data: &[u8],
+    expected_size: usize,
+) -> Result<(Vec<u8>, usize)> {
+    if data.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+
+    let decompressor = unsafe { libdeflate_sys::libdeflate_alloc_decompressor() };
+    if decompressor.is_null() {
+        return Err(Error::Vdb("failed to allocate libdeflate decompressor".into()));
+    }
+
+    let mut out = vec![0u8; expected_size];
+    let mut actual_in: usize = 0;
+    let mut actual_out: usize = 0;
+
+    let ret = unsafe {
+        libdeflate_sys::libdeflate_deflate_decompress_ex(
+            decompressor,
+            data.as_ptr() as *const std::ffi::c_void,
+            data.len(),
+            out.as_mut_ptr() as *mut std::ffi::c_void,
+            out.len(),
+            &mut actual_in,
+            &mut actual_out,
+        )
+    };
+
+    unsafe { libdeflate_sys::libdeflate_free_decompressor(decompressor) };
+
+    if ret == 0 {
+        // LIBDEFLATE_SUCCESS
+        out.truncate(actual_out);
+        Ok((out, actual_in))
+    } else {
+        // Fallback to flate2 streaming.
+        use flate2::read::DeflateDecoder;
+        use std::io::Read as _;
+        let mut decoder = DeflateDecoder::new(data);
+        let mut fallback_out = vec![0u8; expected_size];
+        let mut total = 0;
+        loop {
+            let n = decoder
+                .read(&mut fallback_out[total..])
+                .map_err(|e| Error::Vdb(format!("deflate_ex fallback failed: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        fallback_out.truncate(total);
+        let consumed = decoder.total_in() as usize;
+        Ok((fallback_out, consumed))
+    }
+}
+
+/// Streaming fallback for raw deflate when size is unknown.
+fn deflate_decompress_fallback(data: &[u8]) -> Result<Vec<u8>> {
     use flate2::read::DeflateDecoder;
     use std::io::Read as _;
 
     let mut decoder = DeflateDecoder::new(data);
-    let mut out = vec![0u8; max_out];
-    let mut total = 0;
-    loop {
-        let n = decoder
-            .read(&mut out[total..])
-            .map_err(|e| Error::Vdb(format!("izip: zlib decompression failed: {e}")))?;
-        if n == 0 {
-            break;
-        }
-        total += n;
-    }
-    out.truncate(total);
+    let mut out = Vec::new();
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|e| Error::Vdb(format!("deflate decompression failed: {e}")))?;
+    Ok(out)
+}
+
+/// Streaming fallback for zlib when size is unknown.
+fn zlib_decompress_fallback(data: &[u8]) -> Result<Vec<u8>> {
+    use flate2::read::ZlibDecoder;
+    use std::io::Read as _;
+
+    let mut decoder = ZlibDecoder::new(data);
+    let mut out = Vec::new();
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|e| Error::Vdb(format!("zlib decompression failed: {e}")))?;
     Ok(out)
 }
 
@@ -1570,21 +1682,13 @@ pub fn irzip_decode(
 
         // Each plane is a separate raw-deflate stream producing N bytes.
         let remaining = &data[offset..];
-        let mut decoder = flate2::read::DeflateDecoder::new(remaining);
-        let mut plane_bytes = vec![0u8; n];
-        use std::io::Read;
-        let bytes_read = decoder.read(&mut plane_bytes).map_err(|e| {
-            Error::Vdb(format!(
-                "irzip: deflate decompression of plane {bit} failed: {e}"
-            ))
-        })?;
-        if bytes_read < n {
-            // Partial decompress — pad with zeros.
-            tracing::warn!("irzip plane {bit}: decompressed {bytes_read} of {n} expected bytes");
+        let (plane_bytes, consumed) = deflate_decompress_ex(remaining, n)?;
+        if plane_bytes.len() < n {
+            tracing::debug!(
+                "irzip plane {bit}: decompressed {} of {n} expected bytes",
+                plane_bytes.len()
+            );
         }
-
-        // How many compressed bytes were consumed?
-        let consumed = decoder.total_in() as usize;
         offset += consumed;
 
         // OR this plane's bytes into the values.
@@ -1616,6 +1720,7 @@ pub fn irzip_decode(
     if slope == DELTA_POS || slope == DELTA_NEG || slope == DELTA_BOTH {
         // Delta accumulation (single series — series_count=1 path).
         let mut last_val: i64 = min;
+        #[allow(clippy::needless_range_loop)]
         for i in 0..n {
             let raw = values[i] as u64;
             let decoded = if slope == DELTA_POS {
@@ -1642,7 +1747,9 @@ pub fn irzip_decode(
     } else {
         // Simple offset: val + min + i * slope (for non-delta slopes)
         for (i, &v) in values.iter().enumerate().take(n) {
-            let val = v.wrapping_add(min).wrapping_add((i as i64).wrapping_mul(slope));
+            let val = v
+                .wrapping_add(min)
+                .wrapping_add((i as i64).wrapping_mul(slope));
             write_element(&mut output, i, val, elem_bits);
         }
     }
