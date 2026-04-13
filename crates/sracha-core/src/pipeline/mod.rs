@@ -174,9 +174,10 @@ fn decode_and_write(
     //
     // Physical encodings:
     //   READ:     INSDC:2na:packed (2 bits/base, 4 bases/byte)
-    //   QUALITY:  zip_encoding of phred scores (deflate-compressed u8 array)
+    //   QUALITY:  zip_encoding of phred scores (raw-deflate-compressed u8 array)
     //   READ_LEN: izip_encoding of u32 values
     //   READ_TYPE: zip_encoding of u8 values
+    //   NAME:     zip_encoding of ASCII bytes
     // ------------------------------------------------------------------
 
     /// Decode a raw blob, stripping envelope/headers/page_map.
@@ -192,6 +193,51 @@ fn decode_and_write(
             raw
         };
         blob::decode_blob(effective, 0, row_count, 8)
+    }
+
+    /// Decode a zip_encoding data section: the blob header tells us the
+    /// version. Version 1 = raw deflate, byte-aligned output. Version 2 =
+    /// raw deflate with trailing-bits argument. No headers (v1 blob) = the
+    /// data is already the raw-deflate stream.
+    ///
+    /// Returns decompressed bytes, or falls back to raw bytes on failure.
+    fn decode_zip_encoding(decoded: &blob::DecodedBlob) -> Vec<u8> {
+        use std::io::Read as _;
+
+        let hdr_version = decoded.headers.first().map(|h| h.version).unwrap_or(0);
+
+        // For zip_encoding, the data section is always raw-deflate
+        // compressed (windowBits = -15). The header version only affects
+        // whether trailing bits need adjustment (version 2).
+        if decoded.data.is_empty() {
+            return Vec::new();
+        }
+
+        // Try raw deflate decompression.
+        let mut dec = flate2::read::DeflateDecoder::new(decoded.data.as_slice());
+        let mut out = Vec::new();
+        if dec.read_to_end(&mut out).is_ok() && !out.is_empty() {
+            // Version 2: trim trailing bits if specified in header args.
+            if hdr_version == 2 {
+                if let Some(trailing_bits) = decoded.headers.first().and_then(|h| h.args.first()) {
+                    let total_bits = out.len() as i64 * 8;
+                    let actual_bits = total_bits - (8 - trailing_bits);
+                    let actual_bytes = ((actual_bits + 7) / 8) as usize;
+                    out.truncate(actual_bytes);
+                }
+            }
+            return out;
+        }
+
+        // Fallback: try zlib (with header) in case some columns use it.
+        let mut dec2 = flate2::read::ZlibDecoder::new(decoded.data.as_slice());
+        let mut out2 = Vec::new();
+        if dec2.read_to_end(&mut out2).is_ok() && !out2.is_empty() {
+            return out2;
+        }
+
+        // Last resort: return raw bytes (might already be uncompressed).
+        decoded.data.clone()
     }
 
     let fastq_config = FastqConfig {
@@ -220,7 +266,7 @@ fn decode_and_write(
 
     for blob_idx in 0..num_blobs {
         // --------------------------------------------------------------
-        // Decode READ blob → 2na → ASCII bases.
+        // Decode READ blob -> 2na -> ASCII bases.
         // --------------------------------------------------------------
         let read_blob = &cursor.read_col().blobs()[blob_idx];
         let read_raw = cursor.read_col().read_raw_blob_for_row(read_blob.start_id)?;
@@ -229,27 +275,16 @@ fn decode_and_write(
         let adjust = read_decoded.adjust as usize;
         let actual_bases = (total_bits.saturating_sub(adjust)) / 2;
         let read_data = crate::vdb::encoding::unpack_2na(&read_decoded.data, actual_bases);
-        // Save page map for per-row splitting when READ_LEN is absent.
         let read_page_map = read_decoded.page_map;
-        if blob_idx == 0 {
-            tracing::info!("blob 0: page_map={}, read_len_col={}", read_page_map.is_some(), cursor.read_len_col().is_some());
-            if let Some(ref pm) = read_page_map {
-                tracing::info!(
-                    "blob 0 page_map: data_recs={}, lengths={:?}, leng_runs={:?}, data_runs_len={}",
-                    pm.data_recs,
-                    &pm.lengths[..pm.lengths.len().min(5)],
-                    &pm.leng_runs[..pm.leng_runs.len().min(5)],
-                    pm.data_runs.len(),
-                );
-            } else {
-                tracing::info!("blob 0: no page map");
-            }
-        }
         drop(read_raw);
 
         // --------------------------------------------------------------
         // Decode QUALITY blob (same index).
-        // Try deflate decompression, fall back to raw bytes.
+        // zip_encoding: raw-deflate compressed phred scores.
+        // The blob header version tells the unzip variant:
+        //   v1 = raw deflate, byte-aligned
+        //   v2 = raw deflate with trailing-bits arg
+        // After decompression, bytes are numeric phred scores (0-40).
         // --------------------------------------------------------------
         let quality_data: Vec<u8> = if let Some(qcol) = cursor.quality_col() {
             if blob_idx < qcol.blob_count() {
@@ -258,47 +293,7 @@ fn decode_and_write(
                 let qraw = qcol.read_raw_blob_for_row(qblob.start_id)?;
                 let qdecoded = decode_raw(&qraw, qcs, qblob.id_range as u64)?;
                 drop(qraw);
-
-                if blob_idx == 0 {
-                    let qraw2 = qcol.read_raw_blob_for_row(qblob.start_id)?;
-                    tracing::info!(
-                        "QUALITY blob 0: hdr_ver={}, data_len={}, raw_len={}, raw_first_10={:02x?}, data_first_10={:02x?}",
-                        qdecoded.headers.first().map(|h| h.version).unwrap_or(255),
-                        qdecoded.data.len(),
-                        qraw2.len(),
-                        &qraw2[..qraw2.len().min(10)],
-                        &qdecoded.data[..qdecoded.data.len().min(10)],
-                    );
-                    drop(qraw2);
-                }
-
-                // QUALITY uses zip_encoding: the data section is deflate-compressed
-                // phred values. Try deflate, then zlib, then raw.
-                use std::io::Read as _;
-                let mut dec = flate2::read::DeflateDecoder::new(qdecoded.data.as_slice());
-                let mut out = Vec::new();
-                if dec.read_to_end(&mut out).is_ok() && !out.is_empty() {
-                    if blob_idx == 0 {
-                        tracing::info!("QUALITY deflate: {} -> {} bytes, first_10={:02x?}",
-                            qdecoded.data.len(), out.len(), &out[..out.len().min(10)]);
-                    }
-                    out
-                } else {
-                    // Try zlib (with header)
-                    let mut dec2 = flate2::read::ZlibDecoder::new(qdecoded.data.as_slice());
-                    let mut out2 = Vec::new();
-                    if dec2.read_to_end(&mut out2).is_ok() && !out2.is_empty() {
-                        if blob_idx == 0 {
-                            tracing::info!("QUALITY zlib: {} -> {} bytes", qdecoded.data.len(), out2.len());
-                        }
-                        out2
-                    } else {
-                        if blob_idx == 0 {
-                            tracing::info!("QUALITY: no decompression, using raw {} bytes", qdecoded.data.len());
-                        }
-                        qdecoded.data
-                    }
-                }
+                decode_zip_encoding(&qdecoded)
             } else {
                 Vec::new()
             }
@@ -307,19 +302,17 @@ fn decode_and_write(
         };
 
         // Convert quality to phred+33 ASCII if needed.
-        // If quality data is all zeros, treat as SRA-lite (no quality).
-        // Check if quality data is absent or all-zero (SRA-lite / broken quality).
-        // Only sample the first 1000 bytes to avoid scanning millions.
+        // If quality data is absent or all-zero, treat as SRA-lite.
         let quality_is_empty = quality_data.is_empty()
             || quality_data.iter().take(1000).all(|&b| b == 0);
         let quality_all: Vec<u8> = if !quality_is_empty {
-            if quality_data.len() == read_data.len() {
-                if quality_data.iter().all(|&b| b >= 33) {
-                    quality_data
-                } else {
-                    crate::vdb::encoding::phred_to_ascii(&quality_data)
-                }
+            // Check if values are already ASCII (>= 33) or raw phred (0-40).
+            let looks_like_ascii = quality_data.iter().take(100).all(|&b| b >= 33);
+            if looks_like_ascii && quality_data.len() == read_data.len() {
+                // Already phred+33 ASCII (e.g. SRR000001 454 data).
+                quality_data
             } else {
+                // Raw phred scores: convert to phred+33 ASCII.
                 crate::vdb::encoding::phred_to_ascii(&quality_data)
             }
         } else {
@@ -328,40 +321,24 @@ fn decode_and_write(
         };
 
         // --------------------------------------------------------------
-        // Decode READ_LEN blob (same index) → irzip/izip → u32 lengths.
+        // Decode READ_LEN blob (same index) -> irzip/izip -> u32 lengths.
+        // The page map's row_length tells us reads_per_spot.
         // --------------------------------------------------------------
-        let read_lengths: Vec<u32> = if let Some(rlcol) = cursor.read_len_col() {
+        let (read_lengths, reads_per_spot): (Vec<u32>, usize) = if let Some(rlcol) = cursor.read_len_col() {
             if blob_idx < rlcol.blob_count() {
                 let rlblob = &rlcol.blobs()[blob_idx];
                 let rlcs = rlcol.meta().checksum_type;
                 let rlraw = rlcol.read_raw_blob_for_row(rlblob.start_id)?;
-                if blob_idx == 0 {
-                    tracing::info!("READ_LEN blob 0: id_range={}, start_id={}", rlblob.id_range, rlblob.start_id);
-                }
                 let rldecoded = decode_raw(&rlraw, rlcs, rlblob.id_range as u64)?;
                 drop(rlraw);
 
+                // The page map row_length tells us how many u32 values
+                // per VDB row (i.e. reads per spot).
+                let rps = rldecoded.page_map.as_ref()
+                    .and_then(|pm| pm.lengths.first().copied())
+                    .unwrap_or(1) as usize;
+
                 let hdr_version = rldecoded.headers.first().map(|h| h.version).unwrap_or(0);
-                if blob_idx == 0 {
-                    tracing::info!(
-                        "READ_LEN blob 0: {} headers, hdr_version={}, data_len={}, first_data={:02x?}",
-                        rldecoded.headers.len(), hdr_version, rldecoded.data.len(),
-                        &rldecoded.data[..rldecoded.data.len().min(10)],
-                    );
-                    if let Some(hdr) = rldecoded.headers.first() {
-                        tracing::info!(
-                            "  hdr: flags={}, version={}, fmt={}, osize={}, ops={:02x?}, args={:?}",
-                            hdr.flags, hdr.version, hdr.fmt, hdr.osize,
-                            &hdr.ops, &hdr.args,
-                        );
-                    }
-                    // Also dump the raw blob bytes for manual verification
-                    let raw = cursor.read_len_col().unwrap().read_raw_blob_for_row(rlblob.start_id)?;
-                    tracing::info!(
-                        "  raw blob: {} bytes, first 30: {:02x?}",
-                        raw.len(), &raw[..raw.len().min(30)],
-                    );
-                }
 
                 let decoded_ints = if hdr_version >= 1 {
                     let hdr = &rldecoded.headers[0];
@@ -369,12 +346,6 @@ fn decode_and_write(
                     let min = hdr.args.first().copied().unwrap_or(0);
                     let slope = hdr.args.get(1).copied().unwrap_or(0);
                     let num_elems = (hdr.osize as u32) / 4;
-                    if blob_idx == 0 {
-                        tracing::info!(
-                            "READ_LEN irzip: data_len={}, num_elems={}, min={}, slope={}, planes=0x{:02x}, hdr_ver={}, osize={}",
-                            rldecoded.data.len(), num_elems, min, slope, planes, hdr_version, hdr.osize,
-                        );
-                    }
                     blob::irzip_decode(&rldecoded.data, 32, num_elems, min, slope, planes)
                         .unwrap_or_default()
                 } else {
@@ -385,7 +356,6 @@ fn decode_and_write(
                 };
 
                 // Expand via page map if present.
-                // For random_access page maps, data_runs contains data_offset indices.
                 let rl_bytes = if let Some(ref pm) = rldecoded.page_map {
                     let elem_bytes = 4usize; // u32
                     let row_length = pm.lengths.first().copied().unwrap_or(1) as usize;
@@ -393,7 +363,6 @@ fn decode_and_write(
 
                     if !pm.data_runs.is_empty() && pm.data_runs.len() as u64 >= pm.total_rows() {
                         // data_runs contains data_offset indices (random_access variant).
-                        // Each entry maps a row to a position in the decoded data.
                         let mut expanded = Vec::with_capacity(pm.data_runs.len() * entry_bytes);
                         for &offset in &pm.data_runs {
                             let start = offset as usize * entry_bytes;
@@ -404,7 +373,6 @@ fn decode_and_write(
                         }
                         expanded
                     } else if !pm.data_runs.is_empty() {
-                        // data_runs as repeat counts (non-random_access variant 1).
                         pm.expand_data_runs_bytes(&decoded_ints, elem_bytes)
                     } else {
                         decoded_ints
@@ -413,81 +381,140 @@ fn decode_and_write(
                     decoded_ints
                 };
 
-                rl_bytes
+                let lengths: Vec<u32> = rl_bytes
                     .chunks_exact(4)
                     .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                    .collect()
+                    .collect();
+
+                if blob_idx == 0 {
+                    tracing::info!(
+                        "READ_LEN: {} values, reads_per_spot={}, first_10={:?}",
+                        lengths.len(), rps,
+                        &lengths[..lengths.len().min(10)],
+                    );
+                }
+
+                (lengths, rps)
             } else {
-                // Fewer READ_LEN blobs than READ blobs: treat as one read.
-                vec![read_data.len() as u32]
+                (vec![read_data.len() as u32], 1)
             }
         } else if let Some(ref pm) = read_page_map {
             // No READ_LEN column: use the READ blob's page map for row lengths.
-            if blob_idx == 0 {
-                tracing::info!(
-                    "using page map: {} lengths, {} leng_runs, data_recs={}, total_bases={}, lengths[20..30]={:?}, leng_runs[20..30]={:?}",
-                    pm.lengths.len(),
-                    pm.leng_runs.len(),
-                    pm.data_recs,
-                    read_data.len(),
-                    &pm.lengths[20..pm.lengths.len().min(30)],
-                    &pm.leng_runs[20..pm.leng_runs.len().min(30)],
-                );
-            }
             let mut row_lengths = Vec::new();
             for (len, run) in pm.lengths.iter().zip(pm.leng_runs.iter()) {
                 for _ in 0..*run {
-                    // Sanity check: individual reads shouldn't exceed 100KB
                     if *len > 100_000 {
-                        tracing::warn!(
-                            "blob {blob_idx}: page map length {} exceeds 100KB, skipping (likely deserialization error)",
-                            len
-                        );
                         continue;
                     }
                     row_lengths.push(*len);
                 }
             }
-            if blob_idx == 0 {
-                let bad_count = row_lengths.iter().filter(|&&l| l > 10000).count();
-                let skipped = pm.lengths.iter().zip(pm.leng_runs.iter())
-                    .flat_map(|(l, r)| std::iter::repeat(*l).take(*r as usize))
-                    .filter(|&l| l > 100_000)
-                    .count();
-                tracing::info!(
-                    "blob 0: {} row_lengths from page map (skipped {} > 100KB), {} > 10KB, pm.lengths has {} entries",
-                    row_lengths.len(), skipped, bad_count, pm.lengths.len(),
-                );
-                // Show some of the bad values
-                let bad_vals: Vec<_> = pm.lengths.iter().filter(|&&l| l > 10000).take(5).collect();
-                if !bad_vals.is_empty() {
-                    tracing::warn!("bad page map lengths: {bad_vals:?}");
-                }
-            }
-            row_lengths
+            (row_lengths, 1)
         } else {
             // No READ_LEN, no page map: treat entire blob as one read.
-            vec![read_data.len() as u32]
+            (vec![read_data.len() as u32], 1)
+        };
+
+        // --------------------------------------------------------------
+        // Decode NAME blob (same index) if NAME column exists.
+        // zip_encoding: raw-deflate compressed ASCII names.
+        // The page map tells us per-row name lengths.
+        // --------------------------------------------------------------
+        let spot_names: Option<Vec<Vec<u8>>> = if let Some(ncol) = cursor.name_col() {
+            if blob_idx < ncol.blob_count() {
+                let nblob = &ncol.blobs()[blob_idx];
+                let ncs = ncol.meta().checksum_type;
+                let nraw = ncol.read_raw_blob_for_row(nblob.start_id)?;
+                let ndecoded = decode_raw(&nraw, ncs, nblob.id_range as u64)?;
+                drop(nraw);
+
+                let name_bytes = decode_zip_encoding(&ndecoded);
+
+                // Split the concatenated name bytes into per-row names
+                // using the page map row lengths.
+                let num_spots = if reads_per_spot > 0 {
+                    read_lengths.len() / reads_per_spot
+                } else {
+                    read_lengths.len()
+                };
+
+                if let Some(ref pm) = ndecoded.page_map {
+                    // Page map tells us per-row name lengths.
+                    let mut names = Vec::with_capacity(num_spots);
+                    let mut offset = 0usize;
+                    for (len, run) in pm.lengths.iter().zip(pm.leng_runs.iter()) {
+                        let name_len = *len as usize;
+                        for _ in 0..*run {
+                            if offset + name_len <= name_bytes.len() {
+                                names.push(name_bytes[offset..offset + name_len].to_vec());
+                                offset += name_len;
+                            }
+                        }
+                    }
+                    if blob_idx == 0 {
+                        tracing::info!(
+                            "NAME: {} names decoded, first={:?}",
+                            names.len(),
+                            names.first().map(|n| String::from_utf8_lossy(n).to_string()),
+                        );
+                    }
+                    Some(names)
+                } else if let Some(row_len) = ndecoded.row_length {
+                    // v1 blob: fixed row_length per row.
+                    let rl = row_len as usize;
+                    if rl > 0 {
+                        let names: Vec<Vec<u8>> = name_bytes
+                            .chunks(rl)
+                            .map(|c| c.to_vec())
+                            .collect();
+                        Some(names)
+                    } else {
+                        None
+                    }
+                } else {
+                    // No page map and no row_length: try NUL or newline splitting.
+                    let delimiter = if name_bytes.contains(&0) { 0u8 } else { b'\n' };
+                    let names: Vec<Vec<u8>> = name_bytes
+                        .split(|&b| b == delimiter)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_vec())
+                        .collect();
+                    if !names.is_empty() { Some(names) } else { None }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
         };
 
         // TODO: decode READ_TYPE and READ_FILTER from their physical encodings.
         // For now, assume all reads are biological and pass filter.
 
         // --------------------------------------------------------------
-        // Iterate reads in THIS blob and write FASTQ immediately.
+        // Group read_lengths into spots and write FASTQ.
+        //
+        // reads_per_spot tells us how many consecutive entries in
+        // read_lengths belong to one spot. For single-end data this is 1;
+        // for paired-end it is typically 2.
         // --------------------------------------------------------------
         let mut seq_offset: usize = 0;
         let mut qual_offset: usize = 0;
+        let mut spot_idx_in_blob: usize = 0;
 
-        for (local_read_idx, &rlen) in read_lengths.iter().enumerate() {
-            let rlen = rlen as usize;
+        let rps = reads_per_spot.max(1);
+        let mut rl_cursor = 0usize;
 
-            // Extract sequence slice for this read.
-            let seq_end = seq_offset + rlen;
+        while rl_cursor + rps <= read_lengths.len() {
+            let spot_read_lengths = &read_lengths[rl_cursor..rl_cursor + rps];
+            let spot_total_bases: usize = spot_read_lengths.iter().map(|&l| l as usize).sum();
+
+            // Extract concatenated sequence for this spot.
+            let seq_end = seq_offset + spot_total_bases;
             if seq_end > read_data.len() {
                 tracing::warn!(
-                    "blob {blob_idx}, read {local_read_idx}: sequence overrun at offset \
-                     {seq_offset} + {rlen} > {}; stopping blob",
+                    "blob {blob_idx}, spot {spot_idx_in_blob}: sequence overrun at offset \
+                     {seq_offset} + {spot_total_bases} > {}; stopping blob",
                     read_data.len(),
                 );
                 break;
@@ -495,19 +522,13 @@ fn decode_and_write(
             let sequence = &read_data[seq_offset..seq_end];
             seq_offset = seq_end;
 
-            // Extract quality slice for this read.
+            // Extract concatenated quality for this spot.
             let quality: Vec<u8> = if quality_is_empty {
-                // SRA-lite or broken quality: generate Q30 per base.
-                crate::vdb::encoding::sra_lite_quality(rlen, true)
+                crate::vdb::encoding::sra_lite_quality(spot_total_bases, true)
             } else {
-                let qual_end = qual_offset + rlen;
+                let qual_end = qual_offset + spot_total_bases;
                 if qual_end > quality_all.len() {
-                    tracing::warn!(
-                        "blob {blob_idx}, read {local_read_idx}: quality overrun at offset \
-                         {qual_offset} + {rlen} > {}; using synthetic quality",
-                        quality_all.len(),
-                    );
-                    crate::vdb::encoding::sra_lite_quality(rlen, true)
+                    crate::vdb::encoding::sra_lite_quality(spot_total_bases, true)
                 } else {
                     let q = quality_all[qual_offset..qual_end].to_vec();
                     qual_offset = qual_end;
@@ -515,20 +536,28 @@ fn decode_and_write(
                 }
             };
 
-            // Global read index for naming.
-            let global_read_idx = spots_read as usize + local_read_idx;
+            // Determine spot name: prefer NAME column, fall back to synthetic.
+            let name: Vec<u8> = if let Some(ref names) = spot_names {
+                if spot_idx_in_blob < names.len() {
+                    names[spot_idx_in_blob].clone()
+                } else {
+                    format!("{}", spots_read as usize + spot_idx_in_blob + 1).into_bytes()
+                }
+            } else {
+                format!("{}", spots_read as usize + spot_idx_in_blob + 1).into_bytes()
+            };
 
-            // Synthetic name: accession.row_number
-            let name: Vec<u8> = format!("{accession}.{}", global_read_idx + 1).into_bytes();
+            // Build read_types: assume all biological (0) for now.
+            let read_types = vec![0u8; rps];
+            let read_filter = vec![0u8; rps];
 
-            // Build a SpotRecord for this single read.
             let spot = SpotRecord {
                 name,
                 sequence: sequence.to_vec(),
-                quality: quality.to_vec(),
-                read_lengths: vec![rlen as u32],
-                read_types: vec![0u8],  // 0 = biological
-                read_filter: vec![0u8], // 0 = pass
+                quality,
+                read_lengths: spot_read_lengths.to_vec(),
+                read_types,
+                read_filter,
                 spot_group: Vec::new(),
             };
 
@@ -557,26 +586,28 @@ fn decode_and_write(
                 writer.write_all(&record.data).map_err(Error::Io)?;
                 reads_written += 1;
             }
+
+            rl_cursor += rps;
+            spot_idx_in_blob += 1;
         }
 
-        spots_read += read_lengths.len() as u64;
+        spots_read += spot_idx_in_blob as u64;
 
         // Log progress every 50 blobs.
         if (blob_idx + 1) % 50 == 0 || blob_idx + 1 == num_blobs {
             tracing::info!(
-                "{accession}: decoded {}/{} blobs, {} reads so far",
+                "{accession}: decoded {}/{} blobs, {} spots so far",
                 blob_idx + 1,
                 num_blobs,
                 spots_read,
             );
         }
 
-        // Blob data (read_data, quality_all, read_lengths) is dropped here,
-        // freeing memory before processing the next blob.
+        // Blob data is dropped here, freeing memory before the next blob.
     }
 
     tracing::info!(
-        "{accession}: streaming decode complete -- {} reads, {} written",
+        "{accession}: streaming decode complete -- {} spots, {} reads written",
         spots_read,
         reads_written,
     );
