@@ -147,15 +147,15 @@ pub struct BlockLoc {
 enum DataSource {
     /// Data loaded in memory (for `from_parts` / selective fetch).
     InMemory(Vec<u8>),
-    /// Data in a file on disk at a specific offset and size.
-    /// The file handle is kept open for the lifetime of the ColumnReader
-    /// to avoid re-opening the file on every blob read.
-    OnDisk {
-        file: std::cell::RefCell<std::fs::File>,
-        /// Absolute byte offset in the SRA file where the column data starts.
-        file_offset: u64,
-        /// Size of the column data in the SRA file.
-        file_size: u64,
+    /// Data memory-mapped from the SRA file.
+    /// The mmap covers the column's data section within the KAR archive.
+    /// Blob reads become simple slice operations — zero syscalls per blob.
+    Mmap {
+        /// Memory-mapped region covering the column data.
+        mmap: memmap2::Mmap,
+        /// Offset within the mmap where column data starts (always 0 since
+        /// we map only the column's portion).
+        _file_offset: u64,
     },
 }
 
@@ -851,13 +851,17 @@ impl ColumnReader {
                 });
             }
 
-            let file = std::fs::File::open(sra_path).map_err(|e| {
-                Error::Io(e)
-            })?;
-            reader.data = DataSource::OnDisk {
-                file: std::cell::RefCell::new(file),
-                file_offset,
-                file_size,
+            let file = std::fs::File::open(sra_path)?;
+            let mmap = unsafe {
+                memmap2::MmapOptions::new()
+                    .offset(file_offset)
+                    .len(file_size as usize)
+                    .map(&file)
+                    .map_err(|e| Error::Vdb(format!("mmap failed: {e}")))?
+            };
+            reader.data = DataSource::Mmap {
+                mmap,
+                _file_offset: file_offset,
             };
         }
 
@@ -899,33 +903,14 @@ impl ColumnReader {
                 }
                 Ok(data[blob_offset..blob_offset + size].to_vec())
             }
-            DataSource::OnDisk {
-                file,
-                file_offset,
-                file_size,
-            } => {
-                if blob_offset as u64 + size as u64 > *file_size {
+            DataSource::Mmap { mmap, .. } => {
+                if blob_offset + size > mmap.len() {
                     return Err(Error::Vdb(format!(
-                        "blob data out of bounds: offset={blob_offset}, size={size}, file_size={file_size}",
+                        "blob data out of bounds: offset={blob_offset}, size={size}, mmap_len={}",
+                        mmap.len()
                     )));
                 }
-                let abs_offset = file_offset + blob_offset as u64;
-                let mut file = file.borrow_mut();
-                file.seek(std::io::SeekFrom::Start(abs_offset))
-                    .map_err(|e| {
-                        Error::Vdb(format!(
-                            "failed to seek in SRA file {}: {e}",
-                            "<sra>"
-                        ))
-                    })?;
-                let mut buf = vec![0u8; size];
-                file.read_exact(&mut buf).map_err(|e| {
-                    Error::Vdb(format!(
-                        "failed to read blob from SRA file {}: {e}",
-                        "<sra>"
-                    ))
-                })?;
-                Ok(buf)
+                Ok(mmap[blob_offset..blob_offset + size].to_vec())
             }
         }
     }
