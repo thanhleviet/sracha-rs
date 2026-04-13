@@ -1333,14 +1333,13 @@ fn decode_and_write(
                             };
 
                         // Illumina name columns (ALTREAD templates + X + Y coords).
-                        let alt_raw: &[u8] =
-                            if has_illumina_name_parts && bi < altread_blob_count {
-                                let col = cursor.altread_col().unwrap();
-                                let blob = &col.blobs()[bi];
-                                col.read_raw_blob_slice(blob.start_id)?
-                            } else {
-                                &[]
-                            };
+                        let alt_raw: &[u8] = if has_illumina_name_parts && bi < altread_blob_count {
+                            let col = cursor.altread_col().unwrap();
+                            let blob = &col.blobs()[bi];
+                            col.read_raw_blob_slice(blob.start_id)?
+                        } else {
+                            &[]
+                        };
                         let (xr, xi): (&[u8], u64) = if has_illumina_name_parts && bi < x_blob_count
                         {
                             let col = cursor.x_col().unwrap();
