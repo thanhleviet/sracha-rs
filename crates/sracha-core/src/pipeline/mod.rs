@@ -298,6 +298,9 @@ fn decode_and_write(
                 let rlblob = &rlcol.blobs()[blob_idx];
                 let rlcs = rlcol.meta().checksum_type;
                 let rlraw = rlcol.read_raw_blob_for_row(rlblob.start_id)?;
+                if blob_idx == 0 {
+                    tracing::info!("READ_LEN blob 0: id_range={}, start_id={}", rlblob.id_range, rlblob.start_id);
+                }
                 let rldecoded = decode_raw(&rlraw, rlcs, rlblob.id_range as u64)?;
                 drop(rlraw);
 
@@ -344,9 +347,31 @@ fn decode_and_write(
                     blob::izip_decode(&rldecoded.data, 32, num_elems).unwrap_or_default()
                 };
 
-                // Expand via page map data_runs if present.
+                // Expand via page map if present.
+                // For random_access page maps, data_runs contains data_offset indices.
                 let rl_bytes = if let Some(ref pm) = rldecoded.page_map {
-                    pm.expand_data_runs_bytes(&decoded_ints, 4)
+                    let elem_bytes = 4usize; // u32
+                    let row_length = pm.lengths.first().copied().unwrap_or(1) as usize;
+                    let entry_bytes = row_length * elem_bytes;
+
+                    if !pm.data_runs.is_empty() && pm.data_runs.len() as u64 >= pm.total_rows() {
+                        // data_runs contains data_offset indices (random_access variant).
+                        // Each entry maps a row to a position in the decoded data.
+                        let mut expanded = Vec::with_capacity(pm.data_runs.len() * entry_bytes);
+                        for &offset in &pm.data_runs {
+                            let start = offset as usize * entry_bytes;
+                            let end = start + entry_bytes;
+                            if end <= decoded_ints.len() {
+                                expanded.extend_from_slice(&decoded_ints[start..end]);
+                            }
+                        }
+                        expanded
+                    } else if !pm.data_runs.is_empty() {
+                        // data_runs as repeat counts (non-random_access variant 1).
+                        pm.expand_data_runs_bytes(&decoded_ints, elem_bytes)
+                    } else {
+                        decoded_ints
+                    }
                 } else {
                     decoded_ints
                 };

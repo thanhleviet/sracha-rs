@@ -242,19 +242,35 @@ fn page_map_deserialize_v0(data: &[u8], row_count: u64) -> Result<PageMap> {
     let variant = data[0] & 3;
     let mut cur = 1;
 
+    let random_access = (data[0] >> 2) == 2;
+
     match variant {
         0 => {
-            // Fixed row length, data_run = 1 for all rows.
+            // Fixed row length.
             let (row_len, sz) = vlen_decode_u64(&data[cur..])?;
             cur += sz;
-            let _ = cur; // remaining bytes ignored
 
-            Ok(PageMap {
-                data_recs: row_count,
-                lengths: vec![row_len as u32],
-                leng_runs: vec![row_count as u32],
-                data_runs: vec![],
-            })
+            if random_access {
+                // Random access: data_offset array maps each row to a data position.
+                // The array has row_count entries, each indicating which data_rec
+                // that row uses. This allows compacting N rows into fewer unique entries.
+                let (data_offsets, _) = deserialize_lengths(&data[cur..], row_count as usize)?;
+                // data_recs = max(data_offsets) + 1
+                let max_off = data_offsets.iter().copied().max().unwrap_or(0);
+                Ok(PageMap {
+                    data_recs: (max_off + 1) as u64,
+                    lengths: vec![row_len as u32],
+                    leng_runs: vec![row_count as u32],
+                    data_runs: data_offsets, // repurpose data_runs as data_offsets
+                })
+            } else {
+                Ok(PageMap {
+                    data_recs: row_count,
+                    lengths: vec![row_len as u32],
+                    leng_runs: vec![row_count as u32],
+                    data_runs: vec![],
+                })
+            }
         }
         1 => {
             // Fixed row length, variable data_run.
