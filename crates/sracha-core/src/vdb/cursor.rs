@@ -15,6 +15,7 @@ use crate::vdb::kdb::ColumnReader;
 
 const COL_READ: &str = "READ";
 const COL_QUALITY: &str = "QUALITY";
+const COL_QUALITY_ALT: &str = "ORIGINAL_QUALITY";
 const COL_READ_LEN: &str = "READ_LEN";
 const COL_READ_TYPE: &str = "READ_TYPE";
 const COL_READ_FILTER: &str = "READ_FILTER";
@@ -60,8 +61,11 @@ impl VdbCursor {
             })?;
 
         // Optional columns — open each, swallowing errors.
+        // Try QUALITY first, then ORIGINAL_QUALITY as fallback.
         let quality_col =
-            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_QUALITY}")).ok();
+            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_QUALITY}"))
+                .or_else(|_| ColumnReader::open(archive, &format!("{seq_col_base}/{COL_QUALITY_ALT}")))
+                .ok();
         let read_len_col =
             ColumnReader::open(archive, &format!("{seq_col_base}/{COL_READ_LEN}")).ok();
         let read_type_col =
