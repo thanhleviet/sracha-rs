@@ -302,6 +302,13 @@ fn decode_and_write(
                 drop(rlraw);
 
                 let hdr_version = rldecoded.headers.first().map(|h| h.version).unwrap_or(0);
+                if blob_idx == 0 {
+                    tracing::info!(
+                        "READ_LEN blob 0: {} headers, hdr_version={}, data_len={}, first_data={:02x?}",
+                        rldecoded.headers.len(), hdr_version, rldecoded.data.len(),
+                        &rldecoded.data[..rldecoded.data.len().min(10)],
+                    );
+                }
 
                 let decoded_ints = if hdr_version >= 1 {
                     let hdr = &rldecoded.headers[0];
@@ -309,6 +316,12 @@ fn decode_and_write(
                     let min = hdr.args.first().copied().unwrap_or(0);
                     let slope = hdr.args.get(1).copied().unwrap_or(0);
                     let num_elems = (hdr.osize as u32) / 4;
+                    if blob_idx == 0 {
+                        tracing::info!(
+                            "READ_LEN irzip: data_len={}, num_elems={}, min={}, slope={}, planes=0x{:02x}, hdr_ver={}, osize={}",
+                            rldecoded.data.len(), num_elems, min, slope, planes, hdr_version, hdr.osize,
+                        );
+                    }
                     blob::irzip_decode(&rldecoded.data, 32, num_elems, min, slope, planes)
                         .unwrap_or_default()
                 } else {

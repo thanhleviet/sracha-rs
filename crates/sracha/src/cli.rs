@@ -31,7 +31,10 @@ Examples:
     sracha fastq SRR1234567.sra --split interleaved -Z
 
   Show accession metadata:
-    sracha info SRR1234567"
+    sracha info SRR1234567
+
+Documentation:
+  https://rnabioco.github.io/sracha-rs/"
 )]
 pub struct Cli {
     #[command(subcommand)]
