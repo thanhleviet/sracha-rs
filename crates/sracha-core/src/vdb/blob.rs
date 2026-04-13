@@ -1585,11 +1585,50 @@ pub fn irzip_decode(
         }
     }
 
-    // Apply min and slope: Y[i] = decoded[i] + min + i * slope
+    // Apply delta decoding based on slope type.
+    // slope is NOT a linear multiplier — it's a delta-type enum:
+    //   DELTA_POS  (0x7ffffffffffffff0): cumulative positive deltas
+    //   DELTA_NEG  (0x7ffffffffffffff1): cumulative negative deltas
+    //   DELTA_BOTH (0x7ffffffffffffff2): mixed (sign from low bit)
+    //   Other: simple offset (val + min)
+    const DELTA_POS: i64 = 0x7ffffffffffffff0_u64 as i64;
+    const DELTA_NEG: i64 = 0x7ffffffffffffff1_u64 as i64;
+    const DELTA_BOTH: i64 = 0x7ffffffffffffff2_u64 as i64;
+
     let mut output = vec![0u8; n * out_bytes];
-    for (i, &v) in values.iter().enumerate().take(n) {
-        let val = v.wrapping_add(min).wrapping_add((i as i64).wrapping_mul(slope));
-        write_element(&mut output, i, val, elem_bits);
+
+    if slope == DELTA_POS || slope == DELTA_NEG || slope == DELTA_BOTH {
+        // Delta accumulation (single series — series_count=1 path).
+        let mut last_val: i64 = min;
+        for i in 0..n {
+            let raw = values[i] as u64;
+            let decoded = if slope == DELTA_POS {
+                last_val.wrapping_add(raw as i64)
+            } else if slope == DELTA_NEG {
+                last_val.wrapping_sub(raw as i64)
+            } else {
+                // DELTA_BOTH: low bit indicates direction
+                if raw & 1 == 0 {
+                    last_val.wrapping_add((raw >> 1) as i64)
+                } else {
+                    last_val.wrapping_sub((raw >> 1) as i64)
+                }
+            };
+            if i == 0 {
+                // First element is just min
+                write_element(&mut output, i, min, elem_bits);
+                last_val = min;
+            } else {
+                write_element(&mut output, i, decoded, elem_bits);
+                last_val = decoded;
+            }
+        }
+    } else {
+        // Simple offset: val + min + i * slope (for non-delta slopes)
+        for (i, &v) in values.iter().enumerate().take(n) {
+            let val = v.wrapping_add(min).wrapping_add((i as i64).wrapping_mul(slope));
+            write_element(&mut output, i, val, elem_bits);
+        }
     }
 
     Ok(output)
