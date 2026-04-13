@@ -4,5 +4,6 @@
 *.lock
 ext/
 .sracha-tmp-*
+crates/sracha-core/tests/fixtures/*.sra
 sracha-big-*.out
 test-big.sh

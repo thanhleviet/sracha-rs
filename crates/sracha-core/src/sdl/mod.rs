@@ -153,3 +153,80 @@ impl Default for SdlClient {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_sdl_file(
+        file_type: &str,
+        noqual: bool,
+        size: Option<u64>,
+        locations: Vec<SdlLocation>,
+    ) -> SdlFile {
+        SdlFile {
+            file_type: file_type.to_string(),
+            name: None,
+            accession: None,
+            object: None,
+            size,
+            md5: None,
+            format: None,
+            modification_date: None,
+            noqual,
+            locations,
+        }
+    }
+
+    fn make_location(service: &str, ce: bool, pay: bool) -> SdlLocation {
+        SdlLocation {
+            link: format!("https://{service}.example.com/file"),
+            service: Some(service.to_string()),
+            region: None,
+            expiration_date: None,
+            ce_required: ce,
+            pay_required: pay,
+        }
+    }
+
+    #[test]
+    fn resolved_file_filters_paid_mirrors() {
+        let sdl = make_sdl_file(
+            "sra",
+            false,
+            Some(1000),
+            vec![
+                make_location("s3", false, false),
+                make_location("gs", true, false),  // CE required
+                make_location("ncbi", false, true), // pay required
+            ],
+        );
+        let resolved = resolved_file_from_sdl(&sdl).unwrap();
+        assert_eq!(resolved.mirrors.len(), 1);
+        assert_eq!(resolved.mirrors[0].service, "s3");
+    }
+
+    #[test]
+    fn resolved_file_keeps_free_mirrors() {
+        let sdl = make_sdl_file(
+            "sra",
+            false,
+            Some(5000),
+            vec![
+                make_location("s3", false, false),
+                make_location("ncbi", false, false),
+            ],
+        );
+        let resolved = resolved_file_from_sdl(&sdl).unwrap();
+        assert_eq!(resolved.mirrors.len(), 2);
+        assert_eq!(resolved.size, 5000);
+    }
+
+    #[test]
+    fn resolved_file_lite_flag() {
+        let sdl = make_sdl_file("sra", true, Some(1000), vec![]);
+        let resolved = resolved_file_from_sdl(&sdl).unwrap();
+        assert!(resolved.is_lite);
+    }
+
+}

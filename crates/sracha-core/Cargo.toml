@@ -29,3 +29,8 @@ url.workspace = true
 tempfile.workspace = true
 bytes.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+reqwest = { workspace = true, features = ["blocking"] }
+flate2.workspace = true
+tempfile.workspace = true

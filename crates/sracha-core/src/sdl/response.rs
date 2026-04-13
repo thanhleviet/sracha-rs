@@ -159,3 +159,172 @@ where
         _ => Ok(None),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_full_response() {
+        let json = r#"{
+            "version": "2",
+            "status": 200,
+            "result": [{
+                "query": "SRR000001",
+                "status": 200,
+                "files": [{
+                    "type": "sra",
+                    "name": "SRR000001",
+                    "size": 5747798,
+                    "md5": "abc123def456",
+                    "noqual": false,
+                    "locations": [{
+                        "link": "https://example.com/SRR000001",
+                        "service": "s3",
+                        "region": "us-east-1",
+                        "ceRequired": false,
+                        "payRequired": false
+                    }]
+                }]
+            }]
+        }"#;
+        let resp: SdlResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.version.as_deref(), Some("2"));
+        assert_eq!(resp.status, Some(200));
+        assert_eq!(resp.results.len(), 1);
+        let result = &resp.results[0];
+        assert_eq!(result.query.as_deref(), Some("SRR000001"));
+        assert!(result.is_ok());
+        let sra = result.find_sra_file().unwrap();
+        assert_eq!(sra.size, Some(5747798));
+        assert_eq!(sra.md5.as_deref(), Some("abc123def456"));
+        assert!(!sra.noqual);
+        assert_eq!(sra.locations.len(), 1);
+        assert_eq!(sra.locations[0].service.as_deref(), Some("s3"));
+    }
+
+    #[test]
+    fn parse_response_with_bundle_field() {
+        let json = r#"{
+            "result": [{
+                "bundle": "SRR000001",
+                "status": 200,
+                "files": []
+            }]
+        }"#;
+        let resp: SdlResponse = serde_json::from_str(json).unwrap();
+        let result = resp.find_result("SRR000001").unwrap();
+        assert_eq!(result.accession(), "SRR000001");
+    }
+
+    #[test]
+    fn parse_response_with_msg_field() {
+        let json = r#"{
+            "result": [{
+                "query": "SRR999999",
+                "status": 404,
+                "msg": "not found"
+            }]
+        }"#;
+        let resp: SdlResponse = serde_json::from_str(json).unwrap();
+        let result = &resp.results[0];
+        assert_eq!(result.message.as_deref(), Some("not found"));
+        assert!(!result.is_ok());
+    }
+
+    #[test]
+    fn parse_status_as_string() {
+        let json = r#"{
+            "status": "200",
+            "result": [{ "query": "SRR000001", "status": "200", "files": [] }]
+        }"#;
+        let resp: SdlResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.status, Some(200));
+        assert!(resp.results[0].is_ok());
+    }
+
+    #[test]
+    fn parse_size_as_string() {
+        let json = r#"{
+            "result": [{
+                "query": "SRR000001",
+                "files": [{ "type": "sra", "size": "12345", "locations": [] }]
+            }]
+        }"#;
+        let resp: SdlResponse = serde_json::from_str(json).unwrap();
+        let sra = resp.results[0].find_sra_file().unwrap();
+        assert_eq!(sra.size, Some(12345));
+    }
+
+    #[test]
+    fn parse_noqual_lite() {
+        let json = r#"{
+            "result": [{
+                "query": "SRR000001",
+                "files": [{ "type": "sra", "noqual": true, "locations": [] }]
+            }]
+        }"#;
+        let resp: SdlResponse = serde_json::from_str(json).unwrap();
+        let sra = resp.results[0].find_sra_file().unwrap();
+        assert!(sra.noqual);
+        assert!(sra.is_sra());
+    }
+
+    #[test]
+    fn find_result_by_accession() {
+        let json = r#"{
+            "result": [
+                { "query": "SRR000001", "files": [] },
+                { "query": "SRR000002", "files": [] }
+            ]
+        }"#;
+        let resp: SdlResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.find_result("SRR000001").is_some());
+        assert!(resp.find_result("SRR000002").is_some());
+        assert!(resp.find_result("SRR999999").is_none());
+    }
+
+    #[test]
+    fn find_sra_and_vdbcache_files() {
+        let json = r#"{
+            "result": [{
+                "query": "SRR000001",
+                "files": [
+                    { "type": "sra", "locations": [] },
+                    { "type": "vdbcache", "locations": [] }
+                ]
+            }]
+        }"#;
+        let resp: SdlResponse = serde_json::from_str(json).unwrap();
+        let result = &resp.results[0];
+        assert!(result.find_sra_file().is_some());
+        assert!(result.find_vdbcache_file().is_some());
+    }
+
+    #[test]
+    fn parse_empty_results() {
+        let json = r#"{ "result": [] }"#;
+        let resp: SdlResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.results.is_empty());
+        assert!(resp.find_result("SRR000001").is_none());
+    }
+
+    #[test]
+    fn parse_missing_optional_fields() {
+        let json = r#"{
+            "result": [{
+                "query": "SRR000001",
+                "files": [{ "type": "sra", "locations": [] }]
+            }]
+        }"#;
+        let resp: SdlResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.version.is_none());
+        assert!(resp.status.is_none());
+        assert!(resp.message.is_none());
+        let sra = resp.results[0].find_sra_file().unwrap();
+        assert!(sra.size.is_none());
+        assert!(sra.md5.is_none());
+        assert!(sra.name.is_none());
+        assert!(!sra.noqual);
+    }
+}

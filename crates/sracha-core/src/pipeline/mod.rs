@@ -1166,3 +1166,64 @@ pub async fn run_get(
         output_files,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sdl::{ResolvedFile, ResolvedMirror};
+
+    fn make_resolved(mirrors: Vec<ResolvedMirror>) -> ResolvedAccession {
+        ResolvedAccession {
+            accession: "SRR000001".into(),
+            sra_file: ResolvedFile {
+                mirrors,
+                size: 1000,
+                md5: None,
+                is_lite: false,
+            },
+            vdbcache_file: None,
+        }
+    }
+
+    #[test]
+    fn select_mirror_prefers_s3() {
+        let resolved = make_resolved(vec![
+            ResolvedMirror {
+                url: "https://ncbi.example.com/f".into(),
+                service: "ncbi".into(),
+            },
+            ResolvedMirror {
+                url: "https://gs.example.com/f".into(),
+                service: "gs".into(),
+            },
+            ResolvedMirror {
+                url: "https://s3.example.com/f".into(),
+                service: "s3".into(),
+            },
+        ]);
+        let url = select_mirror(&resolved).unwrap();
+        assert_eq!(url, "https://s3.example.com/f");
+    }
+
+    #[test]
+    fn select_mirror_prefers_gs_over_ncbi() {
+        let resolved = make_resolved(vec![
+            ResolvedMirror {
+                url: "https://ncbi.example.com/f".into(),
+                service: "ncbi".into(),
+            },
+            ResolvedMirror {
+                url: "https://gs.example.com/f".into(),
+                service: "gs".into(),
+            },
+        ]);
+        let url = select_mirror(&resolved).unwrap();
+        assert_eq!(url, "https://gs.example.com/f");
+    }
+
+    #[test]
+    fn select_mirror_empty_errors() {
+        let resolved = make_resolved(vec![]);
+        assert!(select_mirror(&resolved).is_err());
+    }
+}
