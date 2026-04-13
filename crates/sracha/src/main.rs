@@ -30,12 +30,33 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Fetch(args) => {
-            tracing::info!("fetching {} accession(s)", args.accessions.len());
-            for acc in &args.accessions {
-                let acc = sracha_core::accession::parse(acc)?;
-                tracing::info!("resolved accession: {acc}");
+            let client = sracha_core::sdl::SdlClient::new();
+            tokio::fs::create_dir_all(&args.output_dir).await?;
+            for acc_str in &args.accessions {
+                let acc = sracha_core::accession::parse(acc_str)?;
+                let resolved = client.resolve_one(&acc.to_string()).await?;
+                let url = resolved.sra_file.mirrors.first()
+                    .ok_or_else(|| anyhow::anyhow!("no mirrors for {acc}"))?
+                    .url.clone();
+                let output_path = args.output_dir.join(format!("{acc}.sra"));
+                let dl_config = sracha_core::download::DownloadConfig {
+                    connections: args.connections,
+                    force: args.force,
+                    validate: args.validate,
+                    progress: args.progress,
+                    ..Default::default()
+                };
+                tracing::info!("{acc}: downloading {} to {}", format_size(resolved.sra_file.size), output_path.display());
+                sracha_core::download::download_file(
+                    &[url],
+                    resolved.sra_file.size,
+                    resolved.sra_file.md5.as_deref(),
+                    &output_path,
+                    &dl_config,
+                ).await?;
+                tracing::info!("{acc}: saved to {}", output_path.display());
             }
-            anyhow::bail!("fetch not yet implemented")
+            Ok(())
         }
         Command::Fastq(args) => {
             tracing::info!("converting {} input(s) to FASTQ", args.inputs.len());
