@@ -8,8 +8,9 @@
 //! - `idx0` — blob index: array of 24-byte [`BlobLoc`] entries (legacy)
 //! - `data` — concatenated blob data (possibly zlib-compressed)
 //!
-//! The [`ColumnReader`] loads all files into memory and provides row-level
-//! access via [`read_blob_for_row`](ColumnReader::read_blob_for_row).
+//! The [`ColumnReader`] loads index files into memory and reads column data
+//! lazily from disk, providing row-level access via
+//! [`read_blob_for_row`](ColumnReader::read_blob_for_row).
 //!
 //! ## idx1/idx2 block index format
 //!
@@ -135,15 +136,37 @@ pub struct BlockLoc {
     pub start_id: i64,
 }
 
+/// Where the column data bytes live.
+///
+/// `InMemory` holds the full `data` file in a `Vec<u8>` (used by
+/// [`ColumnReader::from_parts`] for selective-fetch and test paths).
+///
+/// `OnDisk` stores the location of the data file within the SRA/KAR file
+/// so that individual blobs can be read on demand without loading the
+/// entire (potentially multi-GiB) data file into memory.
+enum DataSource {
+    /// Data loaded in memory (for `from_parts` / selective fetch).
+    InMemory(Vec<u8>),
+    /// Data in a file on disk at a specific offset and size.
+    OnDisk {
+        sra_path: std::path::PathBuf,
+        /// Absolute byte offset in the SRA file where the column data starts.
+        file_offset: u64,
+        /// Size of the column data in the SRA file.
+        file_size: u64,
+    },
+}
+
 /// Reader for a single physical column within a KAR archive.
 ///
-/// Loads the entire column data into memory on [`open`](Self::open) for fast
-/// random access by row ID.
+/// For the [`open`](Self::open) path the column data is read lazily from
+/// disk (one blob at a time) to avoid loading multi-GiB data files into
+/// memory. The [`from_parts`](Self::from_parts) path still accepts an
+/// in-memory buffer for backwards compatibility.
 pub struct ColumnReader {
     meta: ColumnMeta,
     blobs: Vec<BlobLoc>,
-    /// Entire `data` file contents.
-    data: Vec<u8>,
+    data: DataSource,
 }
 
 // ---------------------------------------------------------------------------
@@ -757,7 +780,7 @@ impl ColumnReader {
         Ok(Self {
             meta,
             blobs,
-            data: data_bytes,
+            data: DataSource::InMemory(data_bytes),
         })
     }
 
@@ -765,9 +788,14 @@ impl ColumnReader {
     ///
     /// The `col_path` should be the directory containing `idx0`, `idx1`, `idx2`,
     /// and `data` files — for example `"SRR123456/tbl/SEQUENCE/col/READ"`.
+    ///
+    /// The `sra_path` is the path to the SRA file on disk. The column data
+    /// file is NOT loaded into memory; instead its offset within the SRA
+    /// file is recorded so that individual blobs can be read on demand.
     pub fn open<R: std::io::Read + Seek>(
         archive: &mut KarArchive<R>,
         col_path: &str,
+        sra_path: &std::path::Path,
     ) -> Result<Self> {
         let idx1_path = format!("{col_path}/idx1");
         let idx0_path = format!("{col_path}/idx0");
@@ -789,11 +817,46 @@ impl ColumnReader {
         // Read the idx2 block index data (v2+).
         let idx2_buf = archive.read_file(&idx2_path).unwrap_or_default();
 
-        // Load data file.
-        let data = archive.read_file(&data_path).unwrap_or_default();
+        // Get the data file location without reading it into memory.
+        let data_location = archive.file_location(&data_path);
 
-        // Delegate to from_parts which handles all fallback logic.
-        Self::from_parts(&idx1_buf, &idx0_buf, &idx_buf, &idx2_buf, data)
+        // Build the column using from_parts with an empty data buffer
+        // (the index files are small; only the data file is large).
+        let mut reader = Self::from_parts(&idx1_buf, &idx0_buf, &idx_buf, &idx2_buf, Vec::new())?;
+
+        // Replace the InMemory(empty) data source with OnDisk if the data
+        // file exists in the archive.
+        if let Some((file_offset, file_size)) = data_location {
+            // If no blob locators were found (from_parts skipped the
+            // synthetic blob because data_bytes was empty), create one
+            // now using the on-disk file size.
+            if reader.blobs.is_empty() && file_size > 0 {
+                let data_size = if reader.meta.data_eof > 0 {
+                    reader.meta.data_eof.min(file_size) as u32
+                } else {
+                    file_size as u32
+                };
+                tracing::debug!(
+                    "creating single-blob column: {} bytes of data on disk (v{})",
+                    data_size,
+                    reader.meta.version,
+                );
+                reader.blobs.push(BlobLoc {
+                    pg: 0,
+                    size: data_size,
+                    id_range: 0,
+                    start_id: 1,
+                });
+            }
+
+            reader.data = DataSource::OnDisk {
+                sra_path: sra_path.to_path_buf(),
+                file_offset,
+                file_size,
+            };
+        }
+
+        Ok(reader)
     }
 
     /// Read the (potentially decompressed) data for the blob that contains
@@ -802,24 +865,10 @@ impl ColumnReader {
     /// For multi-row blobs this returns the entire blob's data; the caller is
     /// responsible for splitting it by row within the blob.
     pub fn read_blob_for_row(&self, row_id: i64) -> Result<Vec<u8>> {
-        let blob = self
-            .find_blob(row_id)
-            .ok_or_else(|| Error::Vdb(format!("no blob found for row_id {row_id}")))?;
-
-        let offset = self.blob_data_offset(blob);
-        let size = blob.size as usize;
-
-        if offset + size > self.data.len() {
-            return Err(Error::Vdb(format!(
-                "blob data out of bounds: offset={offset}, size={size}, data_len={}",
-                self.data.len()
-            )));
-        }
-
-        let raw = &self.data[offset..offset + size];
+        let raw = self.read_raw_blob_for_row(row_id)?;
 
         // Try zlib decompression; fall back to raw bytes.
-        Ok(try_zlib_decompress(raw).unwrap_or_else(|| raw.to_vec()))
+        Ok(try_zlib_decompress(&raw).unwrap_or(raw))
     }
 
     /// Read the raw (unprocessed) blob bytes for a given row ID.
@@ -832,17 +881,53 @@ impl ColumnReader {
             .find_blob(row_id)
             .ok_or_else(|| Error::Vdb(format!("no blob found for row_id {row_id}")))?;
 
-        let offset = self.blob_data_offset(blob);
+        let blob_offset = self.blob_data_offset(blob);
         let size = blob.size as usize;
 
-        if offset + size > self.data.len() {
-            return Err(Error::Vdb(format!(
-                "blob data out of bounds: offset={offset}, size={size}, data_len={}",
-                self.data.len()
-            )));
+        match &self.data {
+            DataSource::InMemory(data) => {
+                if blob_offset + size > data.len() {
+                    return Err(Error::Vdb(format!(
+                        "blob data out of bounds: offset={blob_offset}, size={size}, data_len={}",
+                        data.len()
+                    )));
+                }
+                Ok(data[blob_offset..blob_offset + size].to_vec())
+            }
+            DataSource::OnDisk {
+                sra_path,
+                file_offset,
+                file_size,
+            } => {
+                if blob_offset as u64 + size as u64 > *file_size {
+                    return Err(Error::Vdb(format!(
+                        "blob data out of bounds: offset={blob_offset}, size={size}, file_size={file_size}",
+                    )));
+                }
+                let abs_offset = file_offset + blob_offset as u64;
+                let mut file = std::fs::File::open(sra_path).map_err(|e| {
+                    Error::Vdb(format!(
+                        "failed to open SRA file {}: {e}",
+                        sra_path.display()
+                    ))
+                })?;
+                file.seek(std::io::SeekFrom::Start(abs_offset))
+                    .map_err(|e| {
+                        Error::Vdb(format!(
+                            "failed to seek in SRA file {}: {e}",
+                            sra_path.display()
+                        ))
+                    })?;
+                let mut buf = vec![0u8; size];
+                file.read_exact(&mut buf).map_err(|e| {
+                    Error::Vdb(format!(
+                        "failed to read blob from SRA file {}: {e}",
+                        sra_path.display()
+                    ))
+                })?;
+                Ok(buf)
+            }
         }
-
-        Ok(self.data[offset..offset + size].to_vec())
     }
 
     /// Find the blob that contains a given row ID.
@@ -1120,7 +1205,7 @@ mod tests {
                 block_locs: vec![],
             },
             blobs,
-            data: vec![0u8; 110],
+            data: DataSource::InMemory(vec![0u8; 110]),
         };
 
         let b = reader.find_blob(1).unwrap();
@@ -1157,7 +1242,7 @@ mod tests {
                 block_locs: vec![],
             },
             blobs,
-            data: vec![0u8; 110],
+            data: DataSource::InMemory(vec![0u8; 110]),
         };
 
         let b = reader.find_blob(3).unwrap();
@@ -1186,7 +1271,7 @@ mod tests {
                 block_locs: vec![],
             },
             blobs,
-            data: vec![0u8; 50],
+            data: DataSource::InMemory(vec![0u8; 50]),
         };
 
         // Before first blob.
@@ -1208,7 +1293,7 @@ mod tests {
                 block_locs: vec![],
             },
             blobs: Vec::new(),
-            data: Vec::new(),
+            data: DataSource::InMemory(Vec::new()),
         };
         assert!(reader.find_blob(1).is_none());
     }
@@ -1244,7 +1329,7 @@ mod tests {
                 block_locs: vec![],
             },
             blobs,
-            data: vec![0u8; 30],
+            data: DataSource::InMemory(vec![0u8; 30]),
         };
         assert_eq!(reader.row_count(), 13);
     }
@@ -1276,7 +1361,7 @@ mod tests {
                 block_locs: vec![],
             },
             blobs,
-            data: vec![0u8; 30],
+            data: DataSource::InMemory(vec![0u8; 30]),
         };
         assert_eq!(reader.first_row_id(), Some(1));
     }
@@ -1294,7 +1379,7 @@ mod tests {
                 block_locs: vec![],
             },
             blobs: Vec::new(),
-            data: Vec::new(),
+            data: DataSource::InMemory(Vec::new()),
         };
         assert_eq!(reader.first_row_id(), None);
     }
@@ -1332,7 +1417,7 @@ mod tests {
                 block_locs: vec![],
             },
             blobs,
-            data: vec![0u8; 45],
+            data: DataSource::InMemory(vec![0u8; 45]),
         };
         assert_eq!(reader.blob_count(), 3);
     }
@@ -1354,7 +1439,7 @@ mod tests {
                 block_locs: vec![],
             },
             blobs: Vec::new(),
-            data: vec![0u8; 200],
+            data: DataSource::InMemory(vec![0u8; 200]),
         };
         let blob = BlobLoc {
             pg: 42,
@@ -1378,7 +1463,7 @@ mod tests {
                 block_locs: vec![],
             },
             blobs: Vec::new(),
-            data: vec![0u8; 200],
+            data: DataSource::InMemory(vec![0u8; 200]),
         };
         let blob = BlobLoc {
             pg: 3,
@@ -1413,7 +1498,7 @@ mod tests {
                 block_locs: vec![],
             },
             blobs,
-            data: data.to_vec(),
+            data: DataSource::InMemory(data.to_vec()),
         };
 
         let result = reader.read_blob_for_row(1).unwrap();
@@ -1448,7 +1533,7 @@ mod tests {
                 block_locs: vec![],
             },
             blobs,
-            data: compressed,
+            data: DataSource::InMemory(compressed),
         };
 
         let result = reader.read_blob_for_row(1).unwrap();
@@ -1468,7 +1553,7 @@ mod tests {
                 block_locs: vec![],
             },
             blobs: Vec::new(),
-            data: Vec::new(),
+            data: DataSource::InMemory(Vec::new()),
         };
         assert!(reader.read_blob_for_row(1).is_err());
     }
@@ -1492,7 +1577,7 @@ mod tests {
                 block_locs: vec![],
             },
             blobs,
-            data: vec![0u8; 10], // data is too small
+            data: DataSource::InMemory(vec![0u8; 10]), // data is too small
         };
         assert!(reader.read_blob_for_row(1).is_err());
     }
@@ -1542,15 +1627,26 @@ mod tests {
         let root_dir = build_dir_node("SRR", &[&tbl_dir]);
 
         let archive_bytes = build_kar_archive(&[&root_dir], &data_section);
+
+        // Write to a temp file so OnDisk reads work.
+        let sra_path = std::env::temp_dir().join(format!(
+            "sracha-kdb-test-{}.sra",
+            std::process::id(),
+        ));
+        std::fs::write(&sra_path, &archive_bytes).unwrap();
+
         let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
 
-        let reader = ColumnReader::open(&mut archive, "SRR/tbl/SEQUENCE/col/READ").unwrap();
+        let reader =
+            ColumnReader::open(&mut archive, "SRR/tbl/SEQUENCE/col/READ", &sra_path).unwrap();
         assert_eq!(reader.blob_count(), 1);
         assert_eq!(reader.row_count(), 1);
         assert_eq!(reader.first_row_id(), Some(1));
 
         let blob_data = reader.read_blob_for_row(1).unwrap();
         assert_eq!(blob_data, b"ACGTN");
+
+        let _ = std::fs::remove_file(&sra_path);
     }
 
     // -----------------------------------------------------------------------

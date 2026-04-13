@@ -48,33 +48,48 @@ impl VdbCursor {
     ///
     /// This auto-detects the root accession directory (the first directory
     /// entry in the KAR TOC) and locates the SEQUENCE table columns within it.
-    pub fn open<R: Read + Seek>(archive: &mut KarArchive<R>) -> Result<Self> {
+    ///
+    /// `sra_path` is the path to the SRA file on disk, used for lazy
+    /// on-demand reads of column data (avoids loading multi-GiB data files
+    /// into memory).
+    pub fn open<R: Read + Seek>(
+        archive: &mut KarArchive<R>,
+        sra_path: &std::path::Path,
+    ) -> Result<Self> {
         let seq_col_base = find_sequence_col_base(archive)?;
 
         // READ is required.
         let read_col =
-            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_READ}")).map_err(|_| {
-                Error::ColumnNotFound {
+            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_READ}"), sra_path)
+                .map_err(|_| Error::ColumnNotFound {
                     table: "SEQUENCE".into(),
                     column: COL_READ.into(),
-                }
-            })?;
+                })?;
 
         // Optional columns — open each, swallowing errors.
         // Try QUALITY first, then ORIGINAL_QUALITY as fallback.
         let quality_col =
-            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_QUALITY}"))
-                .or_else(|_| ColumnReader::open(archive, &format!("{seq_col_base}/{COL_QUALITY_ALT}")))
+            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_QUALITY}"), sra_path)
+                .or_else(|_| {
+                    ColumnReader::open(
+                        archive,
+                        &format!("{seq_col_base}/{COL_QUALITY_ALT}"),
+                        sra_path,
+                    )
+                })
                 .ok();
         let read_len_col =
-            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_READ_LEN}")).ok();
+            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_READ_LEN}"), sra_path).ok();
         let read_type_col =
-            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_READ_TYPE}")).ok();
+            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_READ_TYPE}"), sra_path).ok();
         let read_filter_col =
-            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_READ_FILTER}")).ok();
-        let name_col = ColumnReader::open(archive, &format!("{seq_col_base}/{COL_NAME}")).ok();
+            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_READ_FILTER}"), sra_path)
+                .ok();
+        let name_col =
+            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_NAME}"), sra_path).ok();
         let spot_group_col =
-            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_SPOT_GROUP}")).ok();
+            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_SPOT_GROUP}"), sra_path)
+                .ok();
 
         let first_row = read_col.first_row_id().unwrap_or(1);
         let row_count = read_col.row_count();
@@ -247,42 +262,75 @@ mod tests {
         build_kar_archive(&[&root_dir], &data_section)
     }
 
+    /// Write archive bytes to a temporary file and return the path.
+    ///
+    /// The caller is responsible for cleanup (the temp file will be deleted
+    /// when the test process exits thanks to `tempfile`'s auto-cleanup, or
+    /// can be cleaned up manually).
+    fn write_temp_sra(archive_bytes: &[u8]) -> std::path::PathBuf {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "sracha-test-{}.sra",
+            std::process::id() as u64 * 1000 + rand_u64()
+        ));
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(archive_bytes).unwrap();
+        path
+    }
+
+    /// Simple pseudo-random u64 for unique temp file names.
+    fn rand_u64() -> u64 {
+        use std::time::SystemTime;
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos() as u64
+    }
+
     #[test]
     fn open_cursor_finds_sequence_table() {
         let archive_bytes = build_minimal_sra_archive();
+        let sra_path = write_temp_sra(&archive_bytes);
         let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
-        let cursor = VdbCursor::open(&mut archive).unwrap();
+        let cursor = VdbCursor::open(&mut archive, &sra_path).unwrap();
 
         assert_eq!(cursor.spot_count(), 1);
         assert_eq!(cursor.first_row(), 1);
         // No QUALITY column in our minimal archive.
         assert!(!cursor.has_quality());
+        let _ = std::fs::remove_file(&sra_path);
     }
 
     #[test]
     fn open_cursor_missing_sequence_table() {
         // Empty KAR archive with no SEQUENCE table.
         let archive_bytes = build_kar_archive(&[], b"");
+        let sra_path = write_temp_sra(&archive_bytes);
         let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
-        let result = VdbCursor::open(&mut archive);
+        let result = VdbCursor::open(&mut archive, &sra_path);
         assert!(result.is_err());
+        let _ = std::fs::remove_file(&sra_path);
     }
 
     #[test]
     fn cursor_read_column_accessible() {
         let archive_bytes = build_minimal_sra_archive();
+        let sra_path = write_temp_sra(&archive_bytes);
         let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
-        let cursor = VdbCursor::open(&mut archive).unwrap();
+        let cursor = VdbCursor::open(&mut archive, &sra_path).unwrap();
 
         let data = cursor.read_col().read_blob_for_row(1).unwrap();
         assert_eq!(data, b"ACGTN");
+        let _ = std::fs::remove_file(&sra_path);
     }
 
     #[test]
     fn cursor_optional_columns_are_none() {
         let archive_bytes = build_minimal_sra_archive();
+        let sra_path = write_temp_sra(&archive_bytes);
         let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
-        let cursor = VdbCursor::open(&mut archive).unwrap();
+        let cursor = VdbCursor::open(&mut archive, &sra_path).unwrap();
 
         assert!(cursor.quality_col().is_none());
         assert!(cursor.read_len_col().is_none());
@@ -290,5 +338,6 @@ mod tests {
         assert!(cursor.read_filter_col().is_none());
         assert!(cursor.name_col().is_none());
         assert!(cursor.spot_group_col().is_none());
+        let _ = std::fs::remove_file(&sra_path);
     }
 }

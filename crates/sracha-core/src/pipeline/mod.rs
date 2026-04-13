@@ -163,7 +163,7 @@ fn decode_and_write(
 ) -> Result<(u64, u64, Vec<PathBuf>)> {
     let file = std::fs::File::open(sra_path)?;
     let mut archive = KarArchive::open(std::io::BufReader::new(file))?;
-    let cursor = VdbCursor::open(&mut archive)?;
+    let cursor = VdbCursor::open(&mut archive, sra_path)?;
 
     // ------------------------------------------------------------------
     // Streaming blob-by-blob decode and FASTQ output.

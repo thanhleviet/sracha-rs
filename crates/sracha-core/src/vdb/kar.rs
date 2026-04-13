@@ -374,6 +374,25 @@ impl<R: Read + Seek> KarArchive<R> {
         }
     }
 
+    /// Return the absolute byte offset and size of a file in the archive,
+    /// without reading its contents.
+    ///
+    /// Returns `(absolute_offset, size)` for use with direct disk reads.
+    /// Returns `None` if the path doesn't exist or isn't a regular file.
+    pub fn file_location(&self, path: &str) -> Option<(u64, u64)> {
+        match self.entries.get(path)? {
+            KarEntry::File {
+                byte_offset,
+                byte_size,
+            } => {
+                let abs_offset = self.header.file_offset + byte_offset;
+                Some((abs_offset, *byte_size))
+            }
+            KarEntry::EmptyFile => Some((0, 0)),
+            _ => None,
+        }
+    }
+
     /// Return the size of a file, or `None` if the path doesn't exist or
     /// isn't a file.
     pub fn file_size(&self, path: &str) -> Option<u64> {
