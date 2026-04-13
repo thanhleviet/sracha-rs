@@ -106,6 +106,7 @@ async fn main() -> Result<()> {
                     min_read_len: args.min_read_len,
                     force: args.force,
                     progress: !args.no_progress,
+                    run_info: None,
                 };
 
                 let stats = sracha_core::pipeline::run_fastq(sra_path, None, &pipeline_config)?;
@@ -150,6 +151,7 @@ async fn main() -> Result<()> {
                     min_read_len: args.min_read_len,
                     force: args.force,
                     progress: !args.no_progress,
+                    run_info: resolved.run_info.clone(),
                 };
 
                 let stats = sracha_core::pipeline::run_get(&resolved, &pipeline_config).await?;
@@ -232,6 +234,17 @@ fn print_resolved(resolved: &ResolvedAccession) {
             style::label("VDBcache:"),
             style::value(format_size(vdb.size)),
             style::count(vdb.mirrors.len())
+        );
+    }
+
+    if let Some(ref ri) = resolved.run_info {
+        let layout = if ri.nreads == 2 { "PAIRED" } else { "SINGLE" };
+        println!(
+            "  {}  {} ({}, read lengths: {:?})",
+            style::label("Layout:"),
+            style::value(layout),
+            style::value(format!("{}bp spot", ri.spot_len)),
+            ri.avg_read_len
         );
     }
 }

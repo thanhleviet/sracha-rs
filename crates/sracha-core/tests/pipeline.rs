@@ -73,6 +73,7 @@ fn test_config(output_dir: &std::path::Path, split_mode: SplitMode, gzip: bool) 
         min_read_len: None,
         force: true,
         progress: false,
+        run_info: None,
     }
 }
 

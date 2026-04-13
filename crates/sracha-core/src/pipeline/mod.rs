@@ -50,6 +50,8 @@ pub struct PipelineConfig {
     pub force: bool,
     /// Show progress indicators.
     pub progress: bool,
+    /// Read structure from NCBI EUtils (authoritative, when available).
+    pub run_info: Option<crate::sdl::RunInfo>,
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +315,9 @@ struct RawBlobData<'a> {
     metadata_reads_per_spot: Option<usize>,
     /// Fixed spot length in bases (from READ column page_size).
     fixed_spot_len: Option<u32>,
+    /// Per-read lengths from NCBI EUtils API (authoritative, preferred over
+    /// metadata heuristics when READ_LEN is absent).
+    api_read_lengths: Option<Vec<u32>>,
 }
 
 /// Decode a single blob and produce FASTQ records directly.
@@ -447,58 +452,62 @@ fn decode_blob_to_fastq(
 
             (lengths, rps)
         } else if !raw.has_read_len {
-            // No READ_LEN column — use page map for per-spot lengths and
-            // metadata for reads_per_spot (defaults to 1 if unknown).
-            let meta_rps = raw.metadata_reads_per_spot.unwrap_or(1);
-            if let Some(ref pm) = read_page_map {
+            // No READ_LEN column. Prefer API-derived read structure
+            // (authoritative) over VDB metadata heuristics.
+            if let Some(ref api_lens) = raw.api_read_lengths {
+                // API-derived: we know the exact per-read lengths.
+                let rps = api_lens.len();
+                let spot_len: u32 = api_lens.iter().sum();
+                let total_bases = read_data.len() as u32;
+                let n_spots = total_bases / spot_len.max(1);
+
                 if blob_idx == 0 {
                     tracing::info!(
-                        "READ page_map (no READ_LEN): lengths={:?}, leng_runs={:?}, data_recs={}",
-                        &pm.lengths[..pm.lengths.len().min(10)],
-                        &pm.leng_runs[..pm.leng_runs.len().min(10)],
-                        pm.data_recs,
+                        "using EUtils API read lengths: {:?}, spot_len={}, n_spots={}",
+                        api_lens, spot_len, n_spots,
                     );
                 }
-                let mut row_lengths = Vec::new();
-                // Determine the expected per-spot length from the most
-                // common (smallest reasonable) page-map entry.
-                let typical_spot_len = pm
-                    .lengths
-                    .iter()
-                    .copied()
-                    .filter(|&l| l > 0 && l <= 100_000)
-                    .min()
-                    .unwrap_or(0);
 
-                for (len, run) in pm.lengths.iter().zip(pm.leng_runs.iter()) {
-                    for _ in 0..*run {
-                        if *len <= 100_000 || typical_spot_len == 0 {
-                            // Normal per-spot entry: split into reads.
-                            let spot_len = *len;
-                            if meta_rps > 1 && spot_len > 0 {
-                                let per_read = spot_len / meta_rps as u32;
-                                for r in 0..meta_rps as u32 {
-                                    if r < meta_rps as u32 - 1 {
-                                        row_lengths.push(per_read);
-                                    } else {
-                                        row_lengths.push(spot_len - per_read * r);
-                                    }
-                                }
-                            } else {
-                                row_lengths.push(spot_len);
-                            }
-                        } else {
-                            // Blob-aggregate entry: split into individual
-                            // spots using the typical spot length.
-                            let n_spots = *len / typical_spot_len;
-                            let remainder = *len - n_spots * typical_spot_len;
-                            for s in 0..n_spots {
-                                let spot_len = if s == n_spots - 1 {
-                                    typical_spot_len + remainder
-                                } else {
-                                    typical_spot_len
-                                };
-                                if meta_rps > 1 {
+                let mut row_lengths = Vec::with_capacity(n_spots as usize * rps);
+                for _ in 0..n_spots {
+                    row_lengths.extend_from_slice(api_lens);
+                }
+                // Handle remainder (partial last spot).
+                let used = n_spots * spot_len;
+                if used < total_bases {
+                    let remainder = total_bases - used;
+                    row_lengths.push(remainder);
+                }
+                (row_lengths, rps)
+            } else {
+                // Fallback: use page map / metadata heuristics.
+                let meta_rps = raw.metadata_reads_per_spot.unwrap_or(1);
+                if let Some(ref pm) = read_page_map {
+                    if blob_idx == 0 {
+                        tracing::info!(
+                            "READ page_map (no READ_LEN): lengths={:?}, leng_runs={:?}, data_recs={}",
+                            &pm.lengths[..pm.lengths.len().min(10)],
+                            &pm.leng_runs[..pm.leng_runs.len().min(10)],
+                            pm.data_recs,
+                        );
+                    }
+                    let mut row_lengths = Vec::new();
+                    // Determine the expected per-spot length from the most
+                    // common (smallest reasonable) page-map entry.
+                    let typical_spot_len = pm
+                        .lengths
+                        .iter()
+                        .copied()
+                        .filter(|&l| l > 0 && l <= 100_000)
+                        .min()
+                        .unwrap_or(0);
+
+                    for (len, run) in pm.lengths.iter().zip(pm.leng_runs.iter()) {
+                        for _ in 0..*run {
+                            if *len <= 100_000 || typical_spot_len == 0 {
+                                // Normal per-spot entry: split into reads.
+                                let spot_len = *len;
+                                if meta_rps > 1 && spot_len > 0 {
                                     let per_read = spot_len / meta_rps as u32;
                                     for r in 0..meta_rps as u32 {
                                         if r < meta_rps as u32 - 1 {
@@ -510,35 +519,59 @@ fn decode_blob_to_fastq(
                                 } else {
                                     row_lengths.push(spot_len);
                                 }
+                            } else {
+                                // Blob-aggregate entry: split into individual
+                                // spots using the typical spot length.
+                                let n_spots = *len / typical_spot_len;
+                                let remainder = *len - n_spots * typical_spot_len;
+                                for s in 0..n_spots {
+                                    let spot_len = if s == n_spots - 1 {
+                                        typical_spot_len + remainder
+                                    } else {
+                                        typical_spot_len
+                                    };
+                                    if meta_rps > 1 {
+                                        let per_read = spot_len / meta_rps as u32;
+                                        for r in 0..meta_rps as u32 {
+                                            if r < meta_rps as u32 - 1 {
+                                                row_lengths.push(per_read);
+                                            } else {
+                                                row_lengths.push(spot_len - per_read * r);
+                                            }
+                                        }
+                                    } else {
+                                        row_lengths.push(spot_len);
+                                    }
+                                }
                             }
                         }
                     }
-                }
-                (row_lengths, meta_rps)
-            } else if let Some(spot_len) = raw.fixed_spot_len.filter(|_| meta_rps > 1) {
-                // No page map but we know the fixed spot length from the
-                // READ column metadata. Split blob into uniform spots.
-                let total = read_data.len() as u32;
-                let n_spots = total / spot_len.max(1);
-                let mut row_lengths = Vec::with_capacity(n_spots as usize * meta_rps);
-                for s in 0..n_spots {
-                    let sl = if s < n_spots - 1 {
-                        spot_len
-                    } else {
-                        total - spot_len * s
-                    };
-                    let per_read = sl / meta_rps as u32;
-                    for r in 0..meta_rps as u32 {
-                        if r < meta_rps as u32 - 1 {
-                            row_lengths.push(per_read);
+                    (row_lengths, meta_rps)
+                } else if let Some(spot_len) = raw.fixed_spot_len.filter(|_| meta_rps > 1) {
+                    // No page map but we know the fixed spot length from the
+                    // READ column metadata. Split blob into uniform spots.
+                    let total = read_data.len() as u32;
+                    let n_spots = total / spot_len.max(1);
+                    let mut row_lengths = Vec::with_capacity(n_spots as usize * meta_rps);
+                    for s in 0..n_spots {
+                        let sl = if s < n_spots - 1 {
+                            spot_len
                         } else {
-                            row_lengths.push(sl - per_read * r);
+                            total - spot_len * s
+                        };
+                        let per_read = sl / meta_rps as u32;
+                        for r in 0..meta_rps as u32 {
+                            if r < meta_rps as u32 - 1 {
+                                row_lengths.push(per_read);
+                            } else {
+                                row_lengths.push(sl - per_read * r);
+                            }
                         }
                     }
+                    (row_lengths, meta_rps)
+                } else {
+                    (vec![read_data.len() as u32], 1)
                 }
-                (row_lengths, meta_rps)
-            } else {
-                (vec![read_data.len() as u32], 1)
             }
         } else {
             // has_read_len but raw is empty (blob out of range).
@@ -906,11 +939,23 @@ fn decode_and_write(
         tracing::info!("fixed_spot_len={fsl} (from blob 0 page map)");
     }
 
+    // API-derived per-read lengths (from NCBI EUtils). Only used when
+    // READ_LEN column is absent. Cloned once here so rayon closures can
+    // borrow it without moving the config.
+    let api_read_lengths: Option<Vec<u32>> = if !has_read_len {
+        config
+            .run_info
+            .as_ref()
+            .map(|ri| ri.avg_read_len.clone())
+    } else {
+        None
+    };
+
     tracing::info!(
         "{accession}: has_read_len={has_read_len} (blobs={read_len_blob_count}), \
          has_read_type={has_read_type} (blobs={read_type_blob_count}), \
          has_name={has_name}, has_quality={has_quality}, \
-         metadata_rps={metadata_reads_per_spot:?}",
+         metadata_rps={metadata_reads_per_spot:?}, api_read_lengths={api_read_lengths:?}",
     );
     tracing::info!("{accession}: streaming decode of {num_blobs} blobs (batch-parallel)",);
 
@@ -1093,6 +1138,7 @@ fn decode_and_write(
                             has_read_type,
                             metadata_reads_per_spot,
                             fixed_spot_len,
+                            api_read_lengths: api_read_lengths.clone(),
                         };
 
                         decode_blob_to_fastq(
@@ -1290,6 +1336,7 @@ mod tests {
                 is_lite: false,
             },
             vdbcache_file: None,
+            run_info: None,
         }
     }
 

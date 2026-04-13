@@ -6,6 +6,9 @@ use crate::error::{Error, Result};
 
 const SDL_URL: &str = "https://locate.ncbi.nlm.nih.gov/sdl/2/retrieve";
 
+/// NCBI EUtils RunInfo endpoint (returns CSV).
+const EUTILS_EFETCH_URL: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi";
+
 /// A single download mirror for a resolved file.
 #[derive(Debug, Clone)]
 pub struct ResolvedMirror {
@@ -28,6 +31,20 @@ pub struct ResolvedFile {
     pub is_lite: bool,
 }
 
+/// Read structure metadata from NCBI EUtils.
+///
+/// Queried from the EFetch RunInfo CSV endpoint, this provides authoritative
+/// read structure information that is more reliable than parsing VDB metadata.
+#[derive(Debug, Clone)]
+pub struct RunInfo {
+    /// Number of reads per spot (1 for SINGLE, 2 for PAIRED).
+    pub nreads: usize,
+    /// Per-read average lengths (e.g. `[151, 151]` for paired 151bp).
+    pub avg_read_len: Vec<u32>,
+    /// Total bases per spot (sum of `avg_read_len`).
+    pub spot_len: u32,
+}
+
 /// Resolved download information for a single accession.
 #[derive(Debug, Clone)]
 pub struct ResolvedAccession {
@@ -37,6 +54,8 @@ pub struct ResolvedAccession {
     pub sra_file: ResolvedFile,
     /// Optional vdbcache companion file.
     pub vdbcache_file: Option<ResolvedFile>,
+    /// Read structure from NCBI EUtils (may be `None` if the API call failed).
+    pub run_info: Option<RunInfo>,
 }
 
 /// Client for the NCBI SDL (Service Discovery Layer) API.
@@ -90,6 +109,10 @@ impl SdlClient {
     }
 
     /// Resolve a single accession and return a clean summary with URLs, size, MD5, etc.
+    ///
+    /// Also queries the NCBI EUtils API for read structure metadata (nreads,
+    /// per-read lengths). This is used as the authoritative source for
+    /// splitting paired-end reads when the SRA file lacks a `READ_LEN` column.
     pub async fn resolve_one(&self, accession: &str) -> Result<ResolvedAccession> {
         let response = self.resolve(&[accession.to_string()]).await?;
 
@@ -116,12 +139,123 @@ impl SdlClient {
             .find_vdbcache_file()
             .and_then(|f| resolved_file_from_sdl(f).ok());
 
+        // Fetch read structure from EUtils (non-fatal on failure).
+        let run_info = self.fetch_run_info(accession).await;
+
         Ok(ResolvedAccession {
             accession: accession.to_string(),
             sra_file,
             vdbcache_file,
+            run_info,
         })
     }
+
+    /// Query NCBI EUtils EFetch RunInfo CSV for read structure metadata.
+    ///
+    /// Returns `None` on any failure (network, parse, unexpected format) —
+    /// this is a best-effort enhancement, not a hard requirement.
+    async fn fetch_run_info(&self, accession: &str) -> Option<RunInfo> {
+        let url = format!(
+            "{EUTILS_EFETCH_URL}?db=sra&id={accession}&rettype=runinfo&retmode=text"
+        );
+
+        tracing::debug!("EUtils RunInfo request: {url}");
+
+        let resp = match self.http.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("{accession}: EUtils RunInfo request failed: {e}");
+                return None;
+            }
+        };
+
+        if !resp.status().is_success() {
+            tracing::warn!(
+                "{accession}: EUtils RunInfo HTTP {}",
+                resp.status()
+            );
+            return None;
+        }
+
+        let body = match resp.text().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("{accession}: EUtils RunInfo body read failed: {e}");
+                return None;
+            }
+        };
+
+        tracing::debug!("EUtils RunInfo response: {body}");
+
+        parse_run_info_csv(&body, accession)
+    }
+}
+
+/// Parse the EFetch RunInfo CSV to extract read structure.
+///
+/// The CSV has a header row and one data row. We need `LibraryLayout`
+/// (PAIRED/SINGLE) and `avgLength` (total bases per spot).
+fn parse_run_info_csv(body: &str, accession: &str) -> Option<RunInfo> {
+    let mut lines = body.lines().filter(|l| !l.trim().is_empty());
+    let header = lines.next()?;
+    let data = lines.next()?;
+
+    let headers: Vec<&str> = header.split(',').collect();
+    let values: Vec<&str> = data.split(',').collect();
+
+    if headers.len() != values.len() {
+        tracing::warn!(
+            "{accession}: RunInfo CSV header/data column mismatch ({} vs {})",
+            headers.len(),
+            values.len()
+        );
+        return None;
+    }
+
+    let get_field = |name: &str| -> Option<&str> {
+        headers
+            .iter()
+            .position(|h| *h == name)
+            .and_then(|i| values.get(i).copied())
+    };
+
+    let layout = get_field("LibraryLayout")?;
+    let avg_length: u32 = get_field("avgLength")?.parse().ok()?;
+
+    let nreads = match layout {
+        "PAIRED" => 2usize,
+        "SINGLE" => 1,
+        other => {
+            tracing::warn!("{accession}: unknown LibraryLayout '{other}', defaulting to 1");
+            1
+        }
+    };
+
+    let per_read = avg_length / nreads as u32;
+    if per_read == 0 {
+        tracing::warn!("{accession}: computed per_read_len=0 from avgLength={avg_length}");
+        return None;
+    }
+
+    // Build per-read lengths. Last read gets any remainder from integer division.
+    let mut avg_read_len = vec![per_read; nreads];
+    let used = per_read * nreads as u32;
+    if used < avg_length
+        && let Some(last) = avg_read_len.last_mut()
+    {
+        *last += avg_length - used;
+    }
+
+    tracing::info!(
+        "{accession}: EUtils RunInfo: layout={layout}, avgLength={avg_length}, \
+         nreads={nreads}, per_read_len={avg_read_len:?}",
+    );
+
+    Some(RunInfo {
+        nreads,
+        avg_read_len,
+        spot_len: avg_length,
+    })
 }
 
 /// Extract a [`ResolvedFile`] from an [`SdlFile`] response entry.
@@ -227,5 +361,56 @@ mod tests {
         let sdl = make_sdl_file("sra", true, Some(1000), vec![]);
         let resolved = resolved_file_from_sdl(&sdl).unwrap();
         assert!(resolved.is_lite);
+    }
+
+    // -----------------------------------------------------------------------
+    // RunInfo CSV parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_run_info_paired() {
+        let csv = "Run,spots,bases,avgLength,LibraryLayout\n\
+                   SRR17778092,506446387,152946808874,302,PAIRED\n";
+        let ri = parse_run_info_csv(csv, "SRR17778092").unwrap();
+        assert_eq!(ri.nreads, 2);
+        assert_eq!(ri.spot_len, 302);
+        assert_eq!(ri.avg_read_len, vec![151, 151]);
+    }
+
+    #[test]
+    fn parse_run_info_single() {
+        let csv = "Run,avgLength,LibraryLayout\n\
+                   SRR000001,150,SINGLE\n";
+        let ri = parse_run_info_csv(csv, "SRR000001").unwrap();
+        assert_eq!(ri.nreads, 1);
+        assert_eq!(ri.spot_len, 150);
+        assert_eq!(ri.avg_read_len, vec![150]);
+    }
+
+    #[test]
+    fn parse_run_info_odd_avg_length() {
+        // avgLength=301 for PAIRED → 150 + 151
+        let csv = "avgLength,LibraryLayout\n301,PAIRED\n";
+        let ri = parse_run_info_csv(csv, "test").unwrap();
+        assert_eq!(ri.nreads, 2);
+        assert_eq!(ri.avg_read_len, vec![150, 151]);
+        assert_eq!(ri.spot_len, 301);
+    }
+
+    #[test]
+    fn parse_run_info_missing_layout() {
+        let csv = "avgLength\n302\n";
+        assert!(parse_run_info_csv(csv, "test").is_none());
+    }
+
+    #[test]
+    fn parse_run_info_empty_body() {
+        assert!(parse_run_info_csv("", "test").is_none());
+    }
+
+    #[test]
+    fn parse_run_info_header_only() {
+        let csv = "avgLength,LibraryLayout\n";
+        assert!(parse_run_info_csv(csv, "test").is_none());
     }
 }
