@@ -40,7 +40,7 @@ pixi run release
 ## Architecture
 
 ```mermaid
-flowchart LR
+flowchart TD
     A[sracha get SRR000001] --> B[SDL Resolve]
     B -->|mirror URLs| C[Parallel Download]
     C -->|".sra file"| D[KAR Archive Parse]
