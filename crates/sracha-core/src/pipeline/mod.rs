@@ -259,13 +259,45 @@ fn decode_and_write(
                 let qdecoded = decode_raw(&qraw, qcs, qblob.id_range as u64)?;
                 drop(qraw);
 
+                if blob_idx == 0 {
+                    let qraw2 = qcol.read_raw_blob_for_row(qblob.start_id)?;
+                    tracing::info!(
+                        "QUALITY blob 0: hdr_ver={}, data_len={}, raw_len={}, raw_first_10={:02x?}, data_first_10={:02x?}",
+                        qdecoded.headers.first().map(|h| h.version).unwrap_or(255),
+                        qdecoded.data.len(),
+                        qraw2.len(),
+                        &qraw2[..qraw2.len().min(10)],
+                        &qdecoded.data[..qdecoded.data.len().min(10)],
+                    );
+                    drop(qraw2);
+                }
+
+                // QUALITY uses zip_encoding: the data section is deflate-compressed
+                // phred values. Try deflate, then zlib, then raw.
                 use std::io::Read as _;
                 let mut dec = flate2::read::DeflateDecoder::new(qdecoded.data.as_slice());
                 let mut out = Vec::new();
                 if dec.read_to_end(&mut out).is_ok() && !out.is_empty() {
+                    if blob_idx == 0 {
+                        tracing::info!("QUALITY deflate: {} -> {} bytes, first_10={:02x?}",
+                            qdecoded.data.len(), out.len(), &out[..out.len().min(10)]);
+                    }
                     out
                 } else {
-                    qdecoded.data
+                    // Try zlib (with header)
+                    let mut dec2 = flate2::read::ZlibDecoder::new(qdecoded.data.as_slice());
+                    let mut out2 = Vec::new();
+                    if dec2.read_to_end(&mut out2).is_ok() && !out2.is_empty() {
+                        if blob_idx == 0 {
+                            tracing::info!("QUALITY zlib: {} -> {} bytes", qdecoded.data.len(), out2.len());
+                        }
+                        out2
+                    } else {
+                        if blob_idx == 0 {
+                            tracing::info!("QUALITY: no decompression, using raw {} bytes", qdecoded.data.len());
+                        }
+                        qdecoded.data
+                    }
                 }
             } else {
                 Vec::new()
@@ -275,7 +307,12 @@ fn decode_and_write(
         };
 
         // Convert quality to phred+33 ASCII if needed.
-        let quality_all: Vec<u8> = if !quality_data.is_empty() {
+        // If quality data is all zeros, treat as SRA-lite (no quality).
+        // Check if quality data is absent or all-zero (SRA-lite / broken quality).
+        // Only sample the first 1000 bytes to avoid scanning millions.
+        let quality_is_empty = quality_data.is_empty()
+            || quality_data.iter().take(1000).all(|&b| b == 0);
+        let quality_all: Vec<u8> = if !quality_is_empty {
             if quality_data.len() == read_data.len() {
                 if quality_data.iter().all(|&b| b >= 33) {
                     quality_data
@@ -459,17 +496,24 @@ fn decode_and_write(
             seq_offset = seq_end;
 
             // Extract quality slice for this read.
-            let qual_end = qual_offset + rlen;
-            if qual_end > quality_all.len() {
-                tracing::warn!(
-                    "blob {blob_idx}, read {local_read_idx}: quality overrun at offset \
-                     {qual_offset} + {rlen} > {}; stopping blob",
-                    quality_all.len(),
-                );
-                break;
-            }
-            let quality = &quality_all[qual_offset..qual_end];
-            qual_offset = qual_end;
+            let quality: Vec<u8> = if quality_is_empty {
+                // SRA-lite or broken quality: generate Q30 per base.
+                crate::vdb::encoding::sra_lite_quality(rlen, true)
+            } else {
+                let qual_end = qual_offset + rlen;
+                if qual_end > quality_all.len() {
+                    tracing::warn!(
+                        "blob {blob_idx}, read {local_read_idx}: quality overrun at offset \
+                         {qual_offset} + {rlen} > {}; using synthetic quality",
+                        quality_all.len(),
+                    );
+                    crate::vdb::encoding::sra_lite_quality(rlen, true)
+                } else {
+                    let q = quality_all[qual_offset..qual_end].to_vec();
+                    qual_offset = qual_end;
+                    q
+                }
+            };
 
             // Global read index for naming.
             let global_read_idx = spots_read as usize + local_read_idx;
