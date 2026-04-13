@@ -809,7 +809,7 @@ pub async fn run_get(
         chunk_size: 0, // adaptive
         force: true,   // always overwrite temp file
         validate: false,
-        progress: config.progress,
+        progress: true, // always show download progress
     };
 
     tracing::info!(
