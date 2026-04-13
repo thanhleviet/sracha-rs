@@ -107,6 +107,9 @@ impl OutputWriter {
 // ---------------------------------------------------------------------------
 
 /// Select the best mirror URL for downloading.
+///
+/// Prefers cloud mirrors (s3, gs) over NCBI on-premises servers because
+/// cloud CDNs are typically much faster for parallel chunked downloads.
 fn select_mirror(resolved: &ResolvedAccession) -> Result<String> {
     let mirrors = &resolved.sra_file.mirrors;
     if mirrors.is_empty() {
@@ -116,15 +119,30 @@ fn select_mirror(resolved: &ResolvedAccession) -> Result<String> {
         });
     }
 
-    // Prefer ncbi or s3 mirrors.
-    for m in mirrors {
-        if m.service == "ncbi" || m.service == "s3" {
-            return Ok(m.url.clone());
+    // Prefer cloud mirrors — much faster for parallel downloads.
+    // Priority: s3 > gs > sra-ncbi > ncbi > any
+    let priority = |s: &str| -> u8 {
+        match s {
+            "s3" => 0,
+            "gs" => 1,
+            s if s.contains("sra-ncbi") => 2,
+            "ncbi" => 3,
+            _ => 4,
         }
-    }
+    };
 
-    // Fall back to the first mirror.
-    Ok(mirrors[0].url.clone())
+    let best = mirrors
+        .iter()
+        .min_by_key(|m| priority(m.service.as_str()))
+        .unwrap();
+
+    tracing::info!(
+        "selected mirror: [{}] {}",
+        best.service,
+        &best.url[..best.url.len().min(80)],
+    );
+
+    Ok(best.url.clone())
 }
 
 // ---------------------------------------------------------------------------
