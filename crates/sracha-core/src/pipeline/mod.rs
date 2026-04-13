@@ -229,6 +229,8 @@ fn decode_and_write(
         let adjust = read_decoded.adjust as usize;
         let actual_bases = (total_bits.saturating_sub(adjust)) / 2;
         let read_data = crate::vdb::encoding::unpack_2na(&read_decoded.data, actual_bases);
+        // Save page map for per-row splitting when READ_LEN is absent.
+        let read_page_map = read_decoded.page_map;
         drop(read_raw);
 
         // --------------------------------------------------------------
@@ -317,8 +319,19 @@ fn decode_and_write(
                 // Fewer READ_LEN blobs than READ blobs: treat as one read.
                 vec![read_data.len() as u32]
             }
+        } else if let Some(ref pm) = read_page_map {
+            // No READ_LEN column: use the READ blob's page map for row lengths.
+            // The page map's (lengths, leng_runs) describe per-row element counts.
+            // For 2na-packed READ, elements are bases (after unpacking).
+            let mut row_lengths = Vec::new();
+            for (len, run) in pm.lengths.iter().zip(pm.leng_runs.iter()) {
+                for _ in 0..*run {
+                    row_lengths.push(*len);
+                }
+            }
+            row_lengths
         } else {
-            // No READ_LEN column: treat entire blob as one read.
+            // No READ_LEN, no page map: treat entire blob as one read.
             vec![read_data.len() as u32]
         };
 
