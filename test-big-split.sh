@@ -36,11 +36,6 @@ echo ""
 echo "Done at $(date)"
 ls -lh ${OUTDIR}/
 
-# Report line counts and read counts for each file.
-echo ""
-echo "=== Line / read counts ==="
-for f in ${OUTDIR}/*.fastq.gz; do
-    lines=$(zcat "$f" | wc -l)
-    reads=$((lines / 4))
-    echo "$(basename $f): ${lines} lines, ${reads} reads"
-done
+zcat ${OUTDIR}/*_1.fastq.gz 2>/dev/null | head -4
+echo "---"
+zcat ${OUTDIR}/*_2.fastq.gz 2>/dev/null | head -4
