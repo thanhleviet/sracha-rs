@@ -231,6 +231,19 @@ fn decode_and_write(
         let read_data = crate::vdb::encoding::unpack_2na(&read_decoded.data, actual_bases);
         // Save page map for per-row splitting when READ_LEN is absent.
         let read_page_map = read_decoded.page_map;
+        if blob_idx == 0 {
+            if let Some(ref pm) = read_page_map {
+                tracing::info!(
+                    "blob 0 page_map: data_recs={}, lengths={:?}, leng_runs={:?}, data_runs_len={}",
+                    pm.data_recs,
+                    &pm.lengths[..pm.lengths.len().min(5)],
+                    &pm.leng_runs[..pm.leng_runs.len().min(5)],
+                    pm.data_runs.len(),
+                );
+            } else {
+                tracing::info!("blob 0: no page map");
+            }
+        }
         drop(read_raw);
 
         // --------------------------------------------------------------
@@ -321,8 +334,15 @@ fn decode_and_write(
             }
         } else if let Some(ref pm) = read_page_map {
             // No READ_LEN column: use the READ blob's page map for row lengths.
-            // The page map's (lengths, leng_runs) describe per-row element counts.
-            // For 2na-packed READ, elements are bases (after unpacking).
+            if blob_idx == 0 {
+                tracing::info!(
+                    "using page map for row lengths: lengths={:?}, leng_runs={:?}, data_recs={}, total_bases={}",
+                    &pm.lengths[..pm.lengths.len().min(5)],
+                    &pm.leng_runs[..pm.leng_runs.len().min(5)],
+                    pm.data_recs,
+                    read_data.len(),
+                );
+            }
             let mut row_lengths = Vec::new();
             for (len, run) in pm.lengths.iter().zip(pm.leng_runs.iter()) {
                 for _ in 0..*run {
@@ -531,8 +551,8 @@ pub async fn run_get(
     };
 
     tracing::info!(
-        "{accession}: downloading {} bytes to {}",
-        total_sra_size,
+        "{accession}: downloading {} to {}",
+        crate::util::format_size(total_sra_size),
         temp_path.display(),
     );
 
@@ -548,8 +568,8 @@ pub async fn run_get(
     let bytes_downloaded = dl_result.size;
 
     tracing::info!(
-        "{accession}: download complete ({} bytes)",
-        bytes_downloaded,
+        "{accession}: download complete ({})",
+        crate::util::format_size(bytes_downloaded),
     );
 
     // --- Phase 2: Parse VDB + output FASTQ ---
@@ -591,8 +611,8 @@ pub async fn run_get(
 
     tracing::info!(
         "{accession}: done -- {spots_read} spots, {reads_written} reads written, \
-         {} bytes downloaded",
-        bytes_downloaded,
+         {} downloaded",
+        crate::util::format_size(bytes_downloaded),
     );
 
     Ok(PipelineStats {

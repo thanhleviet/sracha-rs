@@ -5,4 +5,5 @@ pub mod error;
 pub mod fastq;
 pub mod pipeline;
 pub mod sdl;
+pub mod util;
 pub mod vdb;

@@ -377,10 +377,10 @@ pub async fn download_file(
         let chunks = plan_chunks(file_size, chunk_size);
 
         tracing::info!(
-            "Downloading {} bytes in {} chunks ({} bytes each) with {} connections",
-            file_size,
+            "Downloading {} in {} chunks ({} each) with {} connections",
+            crate::util::format_size(file_size),
             chunks.len(),
-            chunk_size,
+            crate::util::format_size(chunk_size),
             config.connections,
         );
 
@@ -445,8 +445,8 @@ pub async fn download_file(
     } else {
         // --- Single-stream fallback ---
         tracing::info!(
-            "Downloading {} bytes in single stream (range support: {}, size < 32 MiB: {})",
-            file_size,
+            "Downloading {} in single stream (range support: {}, size < 32 MiB: {})",
+            crate::util::format_size(file_size),
             probe.supports_range,
             file_size < SMALL_FILE,
         );

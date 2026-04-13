@@ -387,13 +387,13 @@ fn page_map_deserialize_v1(data: &[u8], row_count: u64) -> Result<PageMap> {
     if endp > hsize {
         // VDB uses raw deflate (inflateInit2 with -15), not zlib format.
         let mut decoder = flate2::read::DeflateDecoder::new(compressed);
-        let mut body = vec![0u8; bsize];
-        let n = decoder.read(&mut body).map_err(|e| {
+        let mut body = Vec::new();
+        decoder.read_to_end(&mut body).map_err(|e| {
             Error::Vdb(format!(
                 "page_map_v1: raw deflate decompression failed: {e}"
             ))
         })?;
-        decompressed.extend_from_slice(&body[..n]);
+        decompressed.extend_from_slice(&body);
     }
 
     // Now deserialize as v0 with the full decompressed data.
