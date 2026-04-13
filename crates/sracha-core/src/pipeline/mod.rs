@@ -308,6 +308,19 @@ fn decode_and_write(
                         rldecoded.headers.len(), hdr_version, rldecoded.data.len(),
                         &rldecoded.data[..rldecoded.data.len().min(10)],
                     );
+                    if let Some(hdr) = rldecoded.headers.first() {
+                        tracing::info!(
+                            "  hdr: flags={}, version={}, fmt={}, osize={}, ops={:02x?}, args={:?}",
+                            hdr.flags, hdr.version, hdr.fmt, hdr.osize,
+                            &hdr.ops, &hdr.args,
+                        );
+                    }
+                    // Also dump the raw blob bytes for manual verification
+                    let raw = cursor.read_len_col().unwrap().read_raw_blob_for_row(rlblob.start_id)?;
+                    tracing::info!(
+                        "  raw blob: {} bytes, first 30: {:02x?}",
+                        raw.len(), &raw[..raw.len().min(30)],
+                    );
                 }
 
                 let decoded_ints = if hdr_version >= 1 {
