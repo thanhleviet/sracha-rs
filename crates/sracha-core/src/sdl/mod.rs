@@ -155,9 +155,7 @@ impl SdlClient {
     /// Returns `None` on any failure (network, parse, unexpected format) —
     /// this is a best-effort enhancement, not a hard requirement.
     async fn fetch_run_info(&self, accession: &str) -> Option<RunInfo> {
-        let url = format!(
-            "{EUTILS_EFETCH_URL}?db=sra&id={accession}&rettype=runinfo&retmode=text"
-        );
+        let url = format!("{EUTILS_EFETCH_URL}?db=sra&id={accession}&rettype=runinfo&retmode=text");
 
         tracing::debug!("EUtils RunInfo request: {url}");
 
@@ -170,10 +168,7 @@ impl SdlClient {
         };
 
         if !resp.status().is_success() {
-            tracing::warn!(
-                "{accession}: EUtils RunInfo HTTP {}",
-                resp.status()
-            );
+            tracing::warn!("{accession}: EUtils RunInfo HTTP {}", resp.status());
             return None;
         }
 

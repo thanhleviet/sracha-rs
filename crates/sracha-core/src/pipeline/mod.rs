@@ -383,131 +383,157 @@ fn decode_blob_to_fastq(
     // ------------------------------------------------------------------
     // Decode READ_LEN blob -> irzip/izip -> u32 lengths.
     // ------------------------------------------------------------------
-    let (read_lengths, reads_per_spot): (Vec<u32>, usize) =
-        if raw.has_read_len && !raw.read_len_raw.is_empty() {
-            let rldecoded = decode_raw(raw.read_len_raw, raw.read_len_cs, raw.read_len_id_range)?;
+    let (read_lengths, reads_per_spot): (Vec<u32>, usize) = if raw.has_read_len
+        && !raw.read_len_raw.is_empty()
+    {
+        let rldecoded = decode_raw(raw.read_len_raw, raw.read_len_cs, raw.read_len_id_range)?;
 
-            let rps = rldecoded
-                .page_map
-                .as_ref()
-                .and_then(|pm| pm.lengths.first().copied())
-                .unwrap_or(1) as usize;
+        let rps = rldecoded
+            .page_map
+            .as_ref()
+            .and_then(|pm| pm.lengths.first().copied())
+            .unwrap_or(1) as usize;
 
-            let hdr_version = rldecoded.headers.first().map(|h| h.version).unwrap_or(0);
+        let hdr_version = rldecoded.headers.first().map(|h| h.version).unwrap_or(0);
 
-            let decoded_ints = if hdr_version >= 1 {
-                let hdr = &rldecoded.headers[0];
-                let planes = hdr.ops.first().copied().unwrap_or(0xFF);
-                let min = hdr.args.first().copied().unwrap_or(0);
-                let slope = hdr.args.get(1).copied().unwrap_or(0);
-                let num_elems = (hdr.osize as u32) / 4;
-                blob::irzip_decode(&rldecoded.data, 32, num_elems, min, slope, planes)
-                    .unwrap_or_default()
-            } else {
-                let num_elems = rldecoded
-                    .row_length
-                    .unwrap_or_else(|| (rldecoded.data.len() as u64 * 8) / 32)
-                    as u32;
-                blob::izip_decode(&rldecoded.data, 32, num_elems).unwrap_or_default()
-            };
+        let decoded_ints = if hdr_version >= 1 {
+            let hdr = &rldecoded.headers[0];
+            let planes = hdr.ops.first().copied().unwrap_or(0xFF);
+            let min = hdr.args.first().copied().unwrap_or(0);
+            let slope = hdr.args.get(1).copied().unwrap_or(0);
+            let num_elems = (hdr.osize as u32) / 4;
+            blob::irzip_decode(&rldecoded.data, 32, num_elems, min, slope, planes)
+                .unwrap_or_default()
+        } else {
+            let num_elems = rldecoded
+                .row_length
+                .unwrap_or_else(|| (rldecoded.data.len() as u64 * 8) / 32)
+                as u32;
+            blob::izip_decode(&rldecoded.data, 32, num_elems).unwrap_or_default()
+        };
 
-            // Expand via page map if present.
-            let rl_bytes = if let Some(ref pm) = rldecoded.page_map {
-                let elem_bytes = 4usize; // u32
-                let row_length = pm.lengths.first().copied().unwrap_or(1) as usize;
-                let entry_bytes = row_length * elem_bytes;
+        // Expand via page map if present.
+        let rl_bytes = if let Some(ref pm) = rldecoded.page_map {
+            let elem_bytes = 4usize; // u32
+            let row_length = pm.lengths.first().copied().unwrap_or(1) as usize;
+            let entry_bytes = row_length * elem_bytes;
 
-                if !pm.data_runs.is_empty() && pm.data_runs.len() as u64 >= pm.total_rows() {
-                    let mut expanded = Vec::with_capacity(pm.data_runs.len() * entry_bytes);
-                    for &offset in &pm.data_runs {
-                        let start = offset as usize * entry_bytes;
-                        let end = start + entry_bytes;
-                        if end <= decoded_ints.len() {
-                            expanded.extend_from_slice(&decoded_ints[start..end]);
-                        }
+            if !pm.data_runs.is_empty() && pm.data_runs.len() as u64 >= pm.total_rows() {
+                let mut expanded = Vec::with_capacity(pm.data_runs.len() * entry_bytes);
+                for &offset in &pm.data_runs {
+                    let start = offset as usize * entry_bytes;
+                    let end = start + entry_bytes;
+                    if end <= decoded_ints.len() {
+                        expanded.extend_from_slice(&decoded_ints[start..end]);
                     }
-                    expanded
-                } else if !pm.data_runs.is_empty() {
-                    pm.expand_data_runs_bytes(&decoded_ints, elem_bytes)
-                } else {
-                    decoded_ints
                 }
+                expanded
+            } else if !pm.data_runs.is_empty() {
+                pm.expand_data_runs_bytes(&decoded_ints, elem_bytes)
             } else {
                 decoded_ints
-            };
+            }
+        } else {
+            decoded_ints
+        };
 
-            let lengths: Vec<u32> = rl_bytes
-                .chunks_exact(4)
-                .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                .collect();
+        let lengths: Vec<u32> = rl_bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+
+        if blob_idx == 0 {
+            tracing::info!(
+                "READ_LEN: {} values, reads_per_spot={}, first_10={:?}",
+                lengths.len(),
+                rps,
+                &lengths[..lengths.len().min(10)],
+            );
+        }
+
+        (lengths, rps)
+    } else if !raw.has_read_len {
+        // No READ_LEN column. Prefer API-derived read structure
+        // (authoritative) over VDB metadata heuristics.
+        if let Some(ref api_lens) = raw.api_read_lengths {
+            // API-derived: we know the exact per-read lengths.
+            let rps = api_lens.len();
+            let spot_len: u32 = api_lens.iter().sum();
+            let total_bases = read_data.len() as u32;
+            let n_spots = total_bases / spot_len.max(1);
 
             if blob_idx == 0 {
                 tracing::info!(
-                    "READ_LEN: {} values, reads_per_spot={}, first_10={:?}",
-                    lengths.len(),
-                    rps,
-                    &lengths[..lengths.len().min(10)],
+                    "using EUtils API read lengths: {:?}, spot_len={}, n_spots={}",
+                    api_lens,
+                    spot_len,
+                    n_spots,
                 );
             }
 
-            (lengths, rps)
-        } else if !raw.has_read_len {
-            // No READ_LEN column. Prefer API-derived read structure
-            // (authoritative) over VDB metadata heuristics.
-            if let Some(ref api_lens) = raw.api_read_lengths {
-                // API-derived: we know the exact per-read lengths.
-                let rps = api_lens.len();
-                let spot_len: u32 = api_lens.iter().sum();
-                let total_bases = read_data.len() as u32;
-                let n_spots = total_bases / spot_len.max(1);
-
+            let mut row_lengths = Vec::with_capacity(n_spots as usize * rps);
+            for _ in 0..n_spots {
+                row_lengths.extend_from_slice(api_lens);
+            }
+            // Handle remainder (partial last spot).
+            let used = n_spots * spot_len;
+            if used < total_bases {
+                let remainder = total_bases - used;
+                row_lengths.push(remainder);
+            }
+            (row_lengths, rps)
+        } else {
+            // Fallback: use page map / metadata heuristics.
+            let meta_rps = raw.metadata_reads_per_spot.unwrap_or(1);
+            if let Some(ref pm) = read_page_map {
                 if blob_idx == 0 {
                     tracing::info!(
-                        "using EUtils API read lengths: {:?}, spot_len={}, n_spots={}",
-                        api_lens, spot_len, n_spots,
+                        "READ page_map (no READ_LEN): lengths={:?}, leng_runs={:?}, data_recs={}",
+                        &pm.lengths[..pm.lengths.len().min(10)],
+                        &pm.leng_runs[..pm.leng_runs.len().min(10)],
+                        pm.data_recs,
                     );
                 }
+                let mut row_lengths = Vec::new();
+                // Determine the expected per-spot length from the most
+                // common (smallest reasonable) page-map entry.
+                let typical_spot_len = pm
+                    .lengths
+                    .iter()
+                    .copied()
+                    .filter(|&l| l > 0 && l <= 100_000)
+                    .min()
+                    .unwrap_or(0);
 
-                let mut row_lengths = Vec::with_capacity(n_spots as usize * rps);
-                for _ in 0..n_spots {
-                    row_lengths.extend_from_slice(api_lens);
-                }
-                // Handle remainder (partial last spot).
-                let used = n_spots * spot_len;
-                if used < total_bases {
-                    let remainder = total_bases - used;
-                    row_lengths.push(remainder);
-                }
-                (row_lengths, rps)
-            } else {
-                // Fallback: use page map / metadata heuristics.
-                let meta_rps = raw.metadata_reads_per_spot.unwrap_or(1);
-                if let Some(ref pm) = read_page_map {
-                    if blob_idx == 0 {
-                        tracing::info!(
-                            "READ page_map (no READ_LEN): lengths={:?}, leng_runs={:?}, data_recs={}",
-                            &pm.lengths[..pm.lengths.len().min(10)],
-                            &pm.leng_runs[..pm.leng_runs.len().min(10)],
-                            pm.data_recs,
-                        );
-                    }
-                    let mut row_lengths = Vec::new();
-                    // Determine the expected per-spot length from the most
-                    // common (smallest reasonable) page-map entry.
-                    let typical_spot_len = pm
-                        .lengths
-                        .iter()
-                        .copied()
-                        .filter(|&l| l > 0 && l <= 100_000)
-                        .min()
-                        .unwrap_or(0);
-
-                    for (len, run) in pm.lengths.iter().zip(pm.leng_runs.iter()) {
-                        for _ in 0..*run {
-                            if *len <= 100_000 || typical_spot_len == 0 {
-                                // Normal per-spot entry: split into reads.
-                                let spot_len = *len;
-                                if meta_rps > 1 && spot_len > 0 {
+                for (len, run) in pm.lengths.iter().zip(pm.leng_runs.iter()) {
+                    for _ in 0..*run {
+                        if *len <= 100_000 || typical_spot_len == 0 {
+                            // Normal per-spot entry: split into reads.
+                            let spot_len = *len;
+                            if meta_rps > 1 && spot_len > 0 {
+                                let per_read = spot_len / meta_rps as u32;
+                                for r in 0..meta_rps as u32 {
+                                    if r < meta_rps as u32 - 1 {
+                                        row_lengths.push(per_read);
+                                    } else {
+                                        row_lengths.push(spot_len - per_read * r);
+                                    }
+                                }
+                            } else {
+                                row_lengths.push(spot_len);
+                            }
+                        } else {
+                            // Blob-aggregate entry: split into individual
+                            // spots using the typical spot length.
+                            let n_spots = *len / typical_spot_len;
+                            let remainder = *len - n_spots * typical_spot_len;
+                            for s in 0..n_spots {
+                                let spot_len = if s == n_spots - 1 {
+                                    typical_spot_len + remainder
+                                } else {
+                                    typical_spot_len
+                                };
+                                if meta_rps > 1 {
                                     let per_read = spot_len / meta_rps as u32;
                                     for r in 0..meta_rps as u32 {
                                         if r < meta_rps as u32 - 1 {
@@ -519,64 +545,41 @@ fn decode_blob_to_fastq(
                                 } else {
                                     row_lengths.push(spot_len);
                                 }
-                            } else {
-                                // Blob-aggregate entry: split into individual
-                                // spots using the typical spot length.
-                                let n_spots = *len / typical_spot_len;
-                                let remainder = *len - n_spots * typical_spot_len;
-                                for s in 0..n_spots {
-                                    let spot_len = if s == n_spots - 1 {
-                                        typical_spot_len + remainder
-                                    } else {
-                                        typical_spot_len
-                                    };
-                                    if meta_rps > 1 {
-                                        let per_read = spot_len / meta_rps as u32;
-                                        for r in 0..meta_rps as u32 {
-                                            if r < meta_rps as u32 - 1 {
-                                                row_lengths.push(per_read);
-                                            } else {
-                                                row_lengths.push(spot_len - per_read * r);
-                                            }
-                                        }
-                                    } else {
-                                        row_lengths.push(spot_len);
-                                    }
-                                }
                             }
                         }
                     }
-                    (row_lengths, meta_rps)
-                } else if let Some(spot_len) = raw.fixed_spot_len.filter(|_| meta_rps > 1) {
-                    // No page map but we know the fixed spot length from the
-                    // READ column metadata. Split blob into uniform spots.
-                    let total = read_data.len() as u32;
-                    let n_spots = total / spot_len.max(1);
-                    let mut row_lengths = Vec::with_capacity(n_spots as usize * meta_rps);
-                    for s in 0..n_spots {
-                        let sl = if s < n_spots - 1 {
-                            spot_len
-                        } else {
-                            total - spot_len * s
-                        };
-                        let per_read = sl / meta_rps as u32;
-                        for r in 0..meta_rps as u32 {
-                            if r < meta_rps as u32 - 1 {
-                                row_lengths.push(per_read);
-                            } else {
-                                row_lengths.push(sl - per_read * r);
-                            }
-                        }
-                    }
-                    (row_lengths, meta_rps)
-                } else {
-                    (vec![read_data.len() as u32], 1)
                 }
+                (row_lengths, meta_rps)
+            } else if let Some(spot_len) = raw.fixed_spot_len.filter(|_| meta_rps > 1) {
+                // No page map but we know the fixed spot length from the
+                // READ column metadata. Split blob into uniform spots.
+                let total = read_data.len() as u32;
+                let n_spots = total / spot_len.max(1);
+                let mut row_lengths = Vec::with_capacity(n_spots as usize * meta_rps);
+                for s in 0..n_spots {
+                    let sl = if s < n_spots - 1 {
+                        spot_len
+                    } else {
+                        total - spot_len * s
+                    };
+                    let per_read = sl / meta_rps as u32;
+                    for r in 0..meta_rps as u32 {
+                        if r < meta_rps as u32 - 1 {
+                            row_lengths.push(per_read);
+                        } else {
+                            row_lengths.push(sl - per_read * r);
+                        }
+                    }
+                }
+                (row_lengths, meta_rps)
+            } else {
+                (vec![read_data.len() as u32], 1)
             }
-        } else {
-            // has_read_len but raw is empty (blob out of range).
-            (vec![read_data.len() as u32], 1)
-        };
+        }
+    } else {
+        // has_read_len but raw is empty (blob out of range).
+        (vec![read_data.len() as u32], 1)
+    };
 
     // ------------------------------------------------------------------
     // Decode NAME blob.
@@ -943,10 +946,7 @@ fn decode_and_write(
     // READ_LEN column is absent. Cloned once here so rayon closures can
     // borrow it without moving the config.
     let api_read_lengths: Option<Vec<u32>> = if !has_read_len {
-        config
-            .run_info
-            .as_ref()
-            .map(|ri| ri.avg_read_len.clone())
+        config.run_info.as_ref().map(|ri| ri.avg_read_len.clone())
     } else {
         None
     };
