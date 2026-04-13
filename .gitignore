@@ -3,3 +3,4 @@
 .pixi
 *.lock
 ext/
+.sracha-tmp-*

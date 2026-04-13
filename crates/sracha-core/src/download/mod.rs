@@ -287,7 +287,7 @@ async fn compute_md5(path: &Path) -> Result<String> {
     }
 
     let digest = hasher.finalize();
-    Ok(format!("{digest:x}"))
+    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Create a progress bar for the download.

@@ -1,12 +1,20 @@
 use std::path::PathBuf;
 
+use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+
+const STYLES: Styles = Styles::styled()
+    .header(AnsiColor::Yellow.on_default().effects(Effects::BOLD))
+    .usage(AnsiColor::Yellow.on_default().effects(Effects::BOLD))
+    .literal(AnsiColor::Green.on_default().effects(Effects::BOLD))
+    .placeholder(AnsiColor::Cyan.on_default());
 
 #[derive(Parser)]
 #[command(
     name = "sracha",
     version,
-    about = "Fast SRA downloader and FASTQ converter"
+    about = "Fast SRA downloader and FASTQ converter",
+    styles = STYLES,
 )]
 pub struct Cli {
     #[command(subcommand)]

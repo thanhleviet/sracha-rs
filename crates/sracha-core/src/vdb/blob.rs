@@ -634,7 +634,7 @@ fn decode_blob_v2(data: &[u8]) -> Result<BlobEnvelope> {
 // ---------------------------------------------------------------------------
 
 /// Result of decoding a VDB blob.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DecodedBlob {
     /// The raw column data (after stripping envelope, headers, page map).
     /// This may be deflate-compressed or izip-compressed data that needs

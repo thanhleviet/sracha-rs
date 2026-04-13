@@ -1,4 +1,5 @@
 mod cli;
+mod style;
 
 use anyhow::Result;
 use clap::Parser;
@@ -14,9 +15,9 @@ async fn main() -> Result<()> {
     // Set up tracing
     let filter = match (cli.quiet, cli.verbose) {
         (true, _) => "error",
-        (_, 0) => "warn",
-        (_, 1) => "info",
-        (_, 2) => "debug",
+        (_, 0) => "info",
+        (_, 1) => "debug",
+        (_, 2) => "trace",
         _ => "trace",
     };
     tracing_subscriber::fmt()
@@ -48,7 +49,7 @@ async fn main() -> Result<()> {
             for input in &args.inputs {
                 let sra_path = std::path::Path::new(input);
                 if !sra_path.exists() {
-                    eprintln!("error: file not found: {input}");
+                    eprintln!("{} file not found: {}", style::error_label("error:"), style::path(input));
                     continue;
                 }
 
@@ -69,10 +70,12 @@ async fn main() -> Result<()> {
 
                 eprintln!(
                     "{}: {} spots, {} reads written",
-                    stats.accession, stats.spots_read, stats.reads_written,
+                    style::header(&stats.accession),
+                    style::count(stats.spots_read),
+                    style::count(stats.reads_written),
                 );
                 for path in &stats.output_files {
-                    eprintln!("  -> {}", path.display());
+                    eprintln!("  -> {}", style::path(path.display()));
                 }
             }
 
@@ -115,16 +118,16 @@ async fn main() -> Result<()> {
                     100.0
                 };
                 eprintln!(
-                    "{}: {} spots, {} reads written, {} downloaded ({:.1}% of {})",
-                    stats.accession,
-                    stats.spots_read,
-                    stats.reads_written,
-                    format_size(stats.bytes_downloaded),
-                    pct,
-                    format_size(stats.total_sra_size),
+                    "{}: {} spots, {} reads written, {} downloaded ({} of {})",
+                    style::header(&stats.accession),
+                    style::count(stats.spots_read),
+                    style::count(stats.reads_written),
+                    style::value(format_size(stats.bytes_downloaded)),
+                    style::percentage(format!("{pct:.1}%")),
+                    style::value(format_size(stats.total_sra_size)),
                 );
                 for path in &stats.output_files {
-                    eprintln!("  -> {}", path.display());
+                    eprintln!("  -> {}", style::path(path.display()));
                 }
             }
 
@@ -139,13 +142,13 @@ async fn main() -> Result<()> {
                 let acc = match sracha_core::accession::parse(acc_str) {
                     Ok(a) => a,
                     Err(e) => {
-                        eprintln!("error: {acc_str}: {e}");
+                        eprintln!("{} {acc_str}: {e}", style::error_label("error:"));
                         continue;
                     }
                 };
                 match client.resolve_one(&acc.to_string()).await {
                     Ok(resolved) => print_resolved(&resolved),
-                    Err(e) => eprintln!("error: {acc_str}: {e}"),
+                    Err(e) => eprintln!("{} {acc_str}: {e}", style::error_label("error:")),
                 }
             }
             Ok(())
@@ -156,20 +159,29 @@ async fn main() -> Result<()> {
 fn print_resolved(resolved: &ResolvedAccession) {
     let f = &resolved.sra_file;
 
-    println!("{}", resolved.accession);
-    println!("  Size:    {}", format_size(f.size));
-    println!("  MD5:     {}", f.md5.as_deref().unwrap_or("not provided"));
-    println!("  Lite:    {}", if f.is_lite { "yes" } else { "no" });
-    println!("  Mirrors: {}", f.mirrors.len());
+    println!("{}", style::header(&resolved.accession));
+    println!("  {}    {}", style::label("Size:"), style::value(format_size(f.size)));
+    println!(
+        "  {}     {}",
+        style::label("MD5:"),
+        style::value(f.md5.as_deref().unwrap_or("not provided"))
+    );
+    println!(
+        "  {}    {}",
+        style::label("Lite:"),
+        style::value(if f.is_lite { "yes" } else { "no" })
+    );
+    println!("  {} {}", style::label("Mirrors:"), style::count(f.mirrors.len()));
     for m in &f.mirrors {
-        println!("    [{service}] {url}", service = m.service, url = m.url);
+        println!("    [{}] {}", style::value(&m.service), style::path(&m.url));
     }
 
     if let Some(ref vdb) = resolved.vdbcache_file {
         println!(
-            "  VDBcache: yes ({}, {} mirrors)",
-            format_size(vdb.size),
-            vdb.mirrors.len()
+            "  {} yes ({}, {} mirrors)",
+            style::label("VDBcache:"),
+            style::value(format_size(vdb.size)),
+            style::count(vdb.mirrors.len())
         );
     }
 }

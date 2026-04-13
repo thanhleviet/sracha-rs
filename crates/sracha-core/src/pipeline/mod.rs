@@ -14,6 +14,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use crate::compress::{DEFAULT_BLOCK_SIZE, ParGzWriter};
+use flate2::write::GzEncoder;
 use crate::download::{DownloadConfig, download_file};
 use crate::error::{Error, Result};
 use crate::fastq::{FastqConfig, OutputSlot, SplitMode, SpotRecord, format_spot, output_filename};
@@ -76,7 +77,7 @@ pub struct PipelineStats {
 
 /// An output writer that handles both gzip-compressed and plain FASTQ output.
 enum OutputWriter {
-    Gz(ParGzWriter<std::io::BufWriter<std::fs::File>>),
+    Gz(GzEncoder<std::io::BufWriter<std::fs::File>>),
     Plain(std::io::BufWriter<std::fs::File>),
 }
 
@@ -181,100 +182,94 @@ fn decode_and_write(
         blob::decode_blob(effective, 0, row_count, 8)
     }
 
-    // Concatenate all decoded data across all blobs for each column.
-    let mut all_read_data = Vec::new();
-    let mut all_quality_data = Vec::new();
-    let mut all_read_len_data = Vec::new();
+    // ------------------------------------------------------------------
+    // Parallel blob decode with rayon.
+    // Collect raw blobs (sequential I/O), then decode in parallel.
+    // ------------------------------------------------------------------
+    use rayon::prelude::*;
 
-    // Decode all READ blobs → 2na packed data → unpack to ASCII.
+    // Step 1: Collect raw blob bytes (sequential — disk I/O).
+    let read_raw: Vec<_> = cursor.read_col().blobs().iter()
+        .map(|b| (cursor.read_col().read_raw_blob_for_row(b.start_id).unwrap_or_default(), b.id_range as u64))
+        .collect();
     let read_cs = cursor.read_col().meta().checksum_type;
-    for blob_loc in cursor.read_col().blobs() {
-        let raw = cursor.read_col().read_raw_blob_for_row(blob_loc.start_id)?;
-        let decoded = decode_raw(&raw, read_cs, blob_loc.id_range as u64)?;
-        // READ is 2na packed: compute actual base count from data bits minus
-        // the adjust (unused trailing bits). For 2na, each base is 2 bits.
-        let total_bits = decoded.data.len() * 8;
-        let adjust = decoded.adjust as usize;
-        let actual_bases = (total_bits.saturating_sub(adjust)) / 2;
-        let bases = crate::vdb::encoding::unpack_2na(&decoded.data, actual_bases);
-        all_read_data.extend_from_slice(&bases);
-    }
 
-    // Decode all QUALITY blobs.
-    // QUALITY uses zip_encoding = zlib of raw phred values, or irzip for some files.
-    if let Some(qcol) = cursor.quality_col() {
+    // Step 2: Decode READ blobs in parallel → 2na → ASCII bases.
+    let all_read_data: Vec<u8> = read_raw.par_iter()
+        .map(|(raw, id_range)| {
+            let decoded = decode_raw(raw, read_cs, *id_range).unwrap_or_default();
+            let total_bits = decoded.data.len() * 8;
+            let adjust = decoded.adjust as usize;
+            let actual_bases = (total_bits.saturating_sub(adjust)) / 2;
+            crate::vdb::encoding::unpack_2na(&decoded.data, actual_bases)
+        })
+        .flatten()
+        .collect();
+
+    // Decode QUALITY blobs in parallel.
+    let all_quality_data: Vec<u8> = if let Some(qcol) = cursor.quality_col() {
         let qcs = qcol.meta().checksum_type;
-        for blob_loc in qcol.blobs() {
-            let raw = qcol.read_raw_blob_for_row(blob_loc.start_id)?;
-            let decoded = decode_raw(&raw, qcs, blob_loc.id_range as u64)?;
+        let qual_raw: Vec<_> = qcol.blobs().iter()
+            .map(|b| (qcol.read_raw_blob_for_row(b.start_id).unwrap_or_default(), b.id_range as u64))
+            .collect();
 
-            let _hdr_version = decoded.headers.first().map(|h| h.version).unwrap_or(0);
+        qual_raw.par_iter()
+            .map(|(raw, id_range)| {
+                let decoded = decode_raw(raw, qcs, *id_range).unwrap_or_default();
+                use std::io::Read;
+                let mut dec = flate2::read::DeflateDecoder::new(decoded.data.as_slice());
+                let mut out = Vec::new();
+                if dec.read_to_end(&mut out).is_ok() && !out.is_empty() {
+                    out
+                } else {
+                    decoded.data
+                }
+            })
+            .flatten()
+            .collect()
+    } else {
+        Vec::new()
+    };
 
-            // QUALITY uses zip_encoding (plain zlib), not izip.
-            // Try raw deflate decompression first; fall back to raw bytes.
-            use std::io::Read;
-            let mut decoder = flate2::read::DeflateDecoder::new(decoded.data.as_slice());
-            let mut decompressed = Vec::new();
-            if decoder.read_to_end(&mut decompressed).is_ok() && !decompressed.is_empty() {
-                all_quality_data.extend_from_slice(&decompressed);
-            } else {
-                // Not compressed — use raw bytes (might already be phred values)
-                all_quality_data.extend_from_slice(&decoded.data);
-            }
-        }
-    }
-
-    // Decode all READ_LEN blobs → izip/irzip → u32 lengths.
-    // After decoding, expand data_recs → actual rows using page map data_runs.
-    if let Some(rlcol) = cursor.read_len_col() {
+    // Decode READ_LEN blobs in parallel → irzip/izip → u32 lengths.
+    let all_read_len_data: Vec<u8> = if let Some(rlcol) = cursor.read_len_col() {
         let rlcs = rlcol.meta().checksum_type;
-        for blob_loc in rlcol.blobs() {
-            let raw = rlcol.read_raw_blob_for_row(blob_loc.start_id)?;
-            let decoded = decode_raw(&raw, rlcs, blob_loc.id_range as u64)?;
+        let rl_raw: Vec<_> = rlcol.blobs().iter()
+            .map(|b| (rlcol.read_raw_blob_for_row(b.start_id).unwrap_or_default(), b.id_range as u64))
+            .collect();
 
-            // Check blob header version to determine izip vs irzip.
-            let hdr_version = decoded.headers.first().map(|h| h.version).unwrap_or(0);
+        rl_raw.par_iter()
+            .map(|(raw, id_range)| {
+                let decoded = decode_raw(raw, rlcs, *id_range).unwrap_or_default();
+                let hdr_version = decoded.headers.first().map(|h| h.version).unwrap_or(0);
 
-            let decoded_ints = if hdr_version >= 1 {
-                // irzip v1+: plane-based zlib with min/slope from header
-                let hdr = &decoded.headers[0];
-                let planes = hdr.ops.first().copied().unwrap_or(0xFF);
-                let min = hdr.args.first().copied().unwrap_or(0);
-                let slope = hdr.args.get(1).copied().unwrap_or(0);
-                let num_elems = (hdr.osize as u32) / 4; // osize is in bytes, u32 = 4 bytes
+                let decoded_ints = if hdr_version >= 1 {
+                    let hdr = &decoded.headers[0];
+                    let planes = hdr.ops.first().copied().unwrap_or(0xFF);
+                    let min = hdr.args.first().copied().unwrap_or(0);
+                    let slope = hdr.args.get(1).copied().unwrap_or(0);
+                    let num_elems = (hdr.osize as u32) / 4;
+                    blob::irzip_decode(&decoded.data, 32, num_elems, min, slope, planes)
+                        .unwrap_or_default()
+                } else {
+                    let num_elems = decoded.row_length
+                        .unwrap_or_else(|| (decoded.data.len() as u64 * 8) / 32)
+                        as u32;
+                    blob::izip_decode(&decoded.data, 32, num_elems).unwrap_or_default()
+                };
 
-                tracing::debug!(
-                    "READ_LEN irzip: {} bytes data, hdr_ver={}, planes=0x{:02x}, min={}, slope={}, num_elems={}",
-                    decoded.data.len(),
-                    hdr_version,
-                    planes,
-                    min,
-                    slope,
-                    num_elems,
-                );
-
-                blob::irzip_decode(&decoded.data, 32, num_elems, min, slope, planes)?
-            } else {
-                // izip v0: traditional format
-                let num_elems = decoded
-                    .row_length
-                    .unwrap_or_else(|| (decoded.data.len() as u64 * 8) / 32)
-                    as u32;
-                blob::izip_decode(&decoded.data, 32, num_elems)?
-            };
-
-            // Expand data_recs → actual rows using page map data_runs.
-            // irzip/izip produces one value per data_rec (unique entry), but
-            // the page map's data_runs tell us how many rows share each entry.
-            let expanded = if let Some(ref pm) = decoded.page_map {
-                pm.expand_data_runs_bytes(&decoded_ints, 4)
-            } else {
-                decoded_ints
-            };
-
-            all_read_len_data.extend_from_slice(&expanded);
-        }
-    }
+                // Expand via page map data_runs if present.
+                if let Some(ref pm) = decoded.page_map {
+                    pm.expand_data_runs_bytes(&decoded_ints, 4)
+                } else {
+                    decoded_ints
+                }
+            })
+            .flatten()
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let read_data = &all_read_data;
 
@@ -430,7 +425,7 @@ fn decode_and_write(
                 let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
 
                 if config.gzip {
-                    OutputWriter::Gz(ParGzWriter::new(buf, config.gzip_level, DEFAULT_BLOCK_SIZE))
+                    OutputWriter::Gz(GzEncoder::new(buf, flate2::Compression::new(config.gzip_level)))
                 } else {
                     OutputWriter::Plain(buf)
                 }
