@@ -197,7 +197,7 @@ mod tests {
             Some(1000),
             vec![
                 make_location("s3", false, false),
-                make_location("gs", true, false),  // CE required
+                make_location("gs", true, false),   // CE required
                 make_location("ncbi", false, true), // pay required
             ],
         );
@@ -228,5 +228,4 @@ mod tests {
         let resolved = resolved_file_from_sdl(&sdl).unwrap();
         assert!(resolved.is_lite);
     }
-
 }

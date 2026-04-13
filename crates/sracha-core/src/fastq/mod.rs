@@ -103,7 +103,12 @@ pub enum OutputSlot {
 /// Format a single read segment into a [`FastqRecord`].
 ///
 /// The defline follows the format: `@{run_name}.{spot_name} length={len}`
-pub fn format_read(run_name: &str, spot_name: &[u8], sequence: &[u8], quality: &[u8]) -> FastqRecord {
+pub fn format_read(
+    run_name: &str,
+    spot_name: &[u8],
+    sequence: &[u8],
+    quality: &[u8],
+) -> FastqRecord {
     let len = sequence.len();
     // Pre-allocate: @defline\nseq\n+\nqual\n
     // defline: @ + run_name + . + spot_name + " length=" + digits + \n

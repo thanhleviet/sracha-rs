@@ -659,17 +659,17 @@ fn try_zlib_decompress(data: &[u8]) -> Option<Vec<u8>> {
     let estimated = data.len() * 4;
 
     // Try zlib format first (0x78 header).
-    if let Ok(out) = blob::zlib_decompress(data, estimated) {
-        if !out.is_empty() {
-            return Some(out);
-        }
+    if let Ok(out) = blob::zlib_decompress(data, estimated)
+        && !out.is_empty()
+    {
+        return Some(out);
     }
 
     // Try raw deflate (no header — VDB uses inflateInit2 with -15).
-    if let Ok(out) = blob::deflate_decompress(data, estimated) {
-        if !out.is_empty() {
-            return Some(out);
-        }
+    if let Ok(out) = blob::deflate_decompress(data, estimated)
+        && !out.is_empty()
+    {
+        return Some(out);
     }
 
     None

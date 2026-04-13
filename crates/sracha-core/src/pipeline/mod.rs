@@ -17,9 +17,7 @@ use std::sync::Arc;
 use crate::compress::{DEFAULT_BLOCK_SIZE, ParGzWriter};
 use crate::download::{DownloadConfig, download_file};
 use crate::error::{Error, Result};
-use crate::fastq::{
-    FastqConfig, FastqRecord, OutputSlot, SplitMode, format_read, output_filename,
-};
+use crate::fastq::{FastqConfig, FastqRecord, OutputSlot, SplitMode, format_read, output_filename};
 use crate::sdl::ResolvedAccession;
 use crate::vdb::blob;
 use crate::vdb::cursor::VdbCursor;
@@ -243,27 +241,26 @@ fn decode_zip_encoding(decoded: &blob::DecodedBlob) -> Vec<u8> {
         .unwrap_or(decoded.data.len() * 4);
 
     // Try raw deflate via libdeflate.
-    if let Ok(mut out) = blob::deflate_decompress(decoded.data.as_slice(), estimated) {
-        if !out.is_empty() {
-            // Version 2: trim trailing bits if specified in header args.
-            if hdr_version == 2
-                && let Some(trailing_bits) =
-                    decoded.headers.first().and_then(|h| h.args.first())
-            {
-                let total_bits = out.len() as i64 * 8;
-                let actual_bits = total_bits - (8 - trailing_bits);
-                let actual_bytes = ((actual_bits + 7) / 8) as usize;
-                out.truncate(actual_bytes);
-            }
-            return out;
+    if let Ok(mut out) = blob::deflate_decompress(decoded.data.as_slice(), estimated)
+        && !out.is_empty()
+    {
+        // Version 2: trim trailing bits if specified in header args.
+        if hdr_version == 2
+            && let Some(trailing_bits) = decoded.headers.first().and_then(|h| h.args.first())
+        {
+            let total_bits = out.len() as i64 * 8;
+            let actual_bits = total_bits - (8 - trailing_bits);
+            let actual_bytes = ((actual_bits + 7) / 8) as usize;
+            out.truncate(actual_bytes);
         }
+        return out;
     }
 
     // Fallback: try zlib (with header).
-    if let Ok(out2) = blob::zlib_decompress(decoded.data.as_slice(), estimated) {
-        if !out2.is_empty() {
-            return out2;
-        }
+    if let Ok(out2) = blob::zlib_decompress(decoded.data.as_slice(), estimated)
+        && !out2.is_empty()
+    {
+        return out2;
     }
 
     // Last resort: return raw bytes (might already be uncompressed).
@@ -526,8 +523,7 @@ fn decode_blob_to_fastq(
     // 0 = biological, 1 = technical (SRA_READ_TYPE values).
     // ------------------------------------------------------------------
     let read_type_data: Vec<u8> = if raw.has_read_type && !raw.read_type_raw.is_empty() {
-        let rtdecoded =
-            decode_raw(raw.read_type_raw, raw.read_type_cs, raw.read_type_id_range)?;
+        let rtdecoded = decode_raw(raw.read_type_raw, raw.read_type_cs, raw.read_type_id_range)?;
         let raw_bytes = decode_zip_encoding(&rtdecoded);
         if !raw_bytes.is_empty() {
             raw_bytes
@@ -592,27 +588,30 @@ fn decode_blob_to_fastq(
             if spot_idx_in_blob < names.len() {
                 &names[spot_idx_in_blob]
             } else {
-                name_owned =
-                    itoa_buf.format(spots_before as usize + spot_idx_in_blob + 1).as_bytes().to_vec();
+                name_owned = itoa_buf
+                    .format(spots_before as usize + spot_idx_in_blob + 1)
+                    .as_bytes()
+                    .to_vec();
                 &name_owned
             }
         } else {
-            name_owned =
-                itoa_buf.format(spots_before as usize + spot_idx_in_blob + 1).as_bytes().to_vec();
+            name_owned = itoa_buf
+                .format(spots_before as usize + spot_idx_in_blob + 1)
+                .as_bytes()
+                .to_vec();
             &name_owned
         };
 
         // Read types for this spot: borrow from decoded data or default to biological.
-        let spot_read_types: &[u8] = if !read_type_data.is_empty()
-            && rt_offset + rps <= read_type_data.len()
-        {
-            let rt = &read_type_data[rt_offset..rt_offset + rps];
-            rt_offset += rps;
-            rt
-        } else {
-            rt_offset += rps;
-            &[] // empty = all biological (checked below)
-        };
+        let spot_read_types: &[u8] =
+            if !read_type_data.is_empty() && rt_offset + rps <= read_type_data.len() {
+                let rt = &read_type_data[rt_offset..rt_offset + rps];
+                rt_offset += rps;
+                rt
+            } else {
+                rt_offset += rps;
+                &[] // empty = all biological (checked below)
+            };
 
         // ------------------------------------------------------------------
         // Inline format_spot logic: split reads, filter, route, format.
@@ -641,11 +640,11 @@ fn decode_blob_to_fastq(
             }
 
             // Filter: skip reads shorter than the minimum length.
-            if let Some(min_len) = config.min_read_len {
-                if rlen < min_len {
-                    read_offset = end;
-                    continue;
-                }
+            if let Some(min_len) = config.min_read_len
+                && rlen < min_len
+            {
+                read_offset = end;
+                continue;
             }
 
             segments.push(ReadSeg {
@@ -804,6 +803,11 @@ fn decode_and_write(
     let read_type_blob_count = cursor.read_type_col().map_or(0, |c| c.blob_count());
     let read_type_cs = cursor.read_type_col().map_or(0, |c| c.meta().checksum_type);
 
+    tracing::info!(
+        "{accession}: has_read_len={has_read_len} (blobs={read_len_blob_count}), \
+         has_read_type={has_read_type} (blobs={read_type_blob_count}), \
+         has_name={has_name}, has_quality={has_quality}",
+    );
     tracing::info!("{accession}: streaming decode of {num_blobs} blobs (batch-parallel)",);
 
     let decode_pb = if config.progress {
@@ -838,8 +842,7 @@ fn decode_and_write(
     // ------------------------------------------------------------------
     type FormattedBlob = (Vec<(OutputSlot, FastqRecord)>, u64);
     // Capacity 2: at most 2 decoded batches buffered.
-    let (batch_tx, batch_rx) =
-        crossbeam_channel::bounded::<Vec<Result<FormattedBlob>>>(2);
+    let (batch_tx, batch_rx) = crossbeam_channel::bounded::<Vec<Result<FormattedBlob>>>(2);
 
     let write_result: Result<()> = std::thread::scope(|scope| {
         // ---- Writer thread ----
@@ -855,8 +858,8 @@ fn decode_and_write(
                             let path = config.output_dir.join(&filename);
                             output_files.push(path.clone());
 
-                            let file = std::fs::File::create(&path)
-                                .expect("failed to create output file");
+                            let file =
+                                std::fs::File::create(&path).expect("failed to create output file");
                             let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
 
                             if config.gzip {
@@ -915,8 +918,7 @@ fn decode_and_write(
                     .enumerate()
                     .map(|(i, bi)| {
                         let read_blob = &cursor.read_col().blobs()[bi];
-                        let read_raw =
-                            cursor.read_col().read_raw_blob_slice(read_blob.start_id)?;
+                        let read_raw = cursor.read_col().read_raw_blob_slice(read_blob.start_id)?;
                         let read_id_range = read_blob.id_range as u64;
 
                         let (q_raw, q_id_range): (&[u8], u64) =
@@ -943,17 +945,17 @@ fn decode_and_write(
                                 (&[], 0)
                             };
 
-                        let (n_raw, n_id_range): (&[u8], u64) =
-                            if has_name && bi < name_blob_count {
-                                let ncol = cursor.name_col().unwrap();
-                                let nblob = &ncol.blobs()[bi];
-                                (
-                                    ncol.read_raw_blob_slice(nblob.start_id)?,
-                                    nblob.id_range as u64,
-                                )
-                            } else {
-                                (&[], 0)
-                            };
+                        let (n_raw, n_id_range): (&[u8], u64) = if has_name && bi < name_blob_count
+                        {
+                            let ncol = cursor.name_col().unwrap();
+                            let nblob = &ncol.blobs()[bi];
+                            (
+                                ncol.read_raw_blob_slice(nblob.start_id)?,
+                                nblob.id_range as u64,
+                            )
+                        } else {
+                            (&[], 0)
+                        };
 
                         let (rt_raw, rt_id_range): (&[u8], u64) =
                             if has_read_type && bi < read_type_blob_count {

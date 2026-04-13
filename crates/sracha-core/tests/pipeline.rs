@@ -49,7 +49,11 @@ fn ensure_srr000001() -> PathBuf {
         );
         let bytes = resp.bytes().unwrap();
         std::fs::write(&path, &bytes).unwrap();
-        eprintln!("fixture saved to {} ({} bytes)", path.display(), bytes.len());
+        eprintln!(
+            "fixture saved to {} ({} bytes)",
+            path.display(),
+            bytes.len()
+        );
     });
 
     assert!(path.exists(), "fixture not found at {}", path.display());
@@ -199,13 +203,11 @@ fn run_fastq_deterministic() {
 
     let tmp1 = tempfile::tempdir().unwrap();
     let config1 = test_config(tmp1.path(), SplitMode::SplitSpot, false);
-    let stats1 =
-        sracha_core::pipeline::run_fastq(&sra_path, Some("SRR000001"), &config1).unwrap();
+    let stats1 = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR000001"), &config1).unwrap();
 
     let tmp2 = tempfile::tempdir().unwrap();
     let config2 = test_config(tmp2.path(), SplitMode::SplitSpot, false);
-    let stats2 =
-        sracha_core::pipeline::run_fastq(&sra_path, Some("SRR000001"), &config2).unwrap();
+    let stats2 = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR000001"), &config2).unwrap();
 
     assert_eq!(stats1.spots_read, stats2.spots_read);
     assert_eq!(stats1.reads_written, stats2.reads_written);
@@ -214,10 +216,7 @@ fn run_fastq_deterministic() {
     for (f1, f2) in stats1.output_files.iter().zip(stats2.output_files.iter()) {
         let data1 = std::fs::read(f1).unwrap();
         let data2 = std::fs::read(f2).unwrap();
-        assert_eq!(
-            data1, data2,
-            "output should be byte-identical across runs"
-        );
+        assert_eq!(data1, data2, "output should be byte-identical across runs");
     }
 }
 

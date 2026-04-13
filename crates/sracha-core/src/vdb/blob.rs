@@ -337,7 +337,6 @@ fn page_map_deserialize_v0(data: &[u8], row_count: u64) -> Result<PageMap> {
 }
 
 fn page_map_deserialize_v1(data: &[u8], row_count: u64) -> Result<PageMap> {
-
     if data.is_empty() {
         return Err(Error::Vdb("page_map_v1: empty input".into()));
     }
@@ -1250,17 +1249,16 @@ pub(crate) fn zlib_decompress(data: &[u8], expected_size: usize) -> Result<Vec<u
 /// Raw-deflate decompression via libdeflate, also returning the number of
 /// compressed input bytes consumed. Needed for irzip where multiple
 /// compressed streams are concatenated.
-pub(crate) fn deflate_decompress_ex(
-    data: &[u8],
-    expected_size: usize,
-) -> Result<(Vec<u8>, usize)> {
+pub(crate) fn deflate_decompress_ex(data: &[u8], expected_size: usize) -> Result<(Vec<u8>, usize)> {
     if data.is_empty() {
         return Ok((Vec::new(), 0));
     }
 
     let decompressor = unsafe { libdeflate_sys::libdeflate_alloc_decompressor() };
     if decompressor.is_null() {
-        return Err(Error::Vdb("failed to allocate libdeflate decompressor".into()));
+        return Err(Error::Vdb(
+            "failed to allocate libdeflate decompressor".into(),
+        ));
     }
 
     let mut out = vec![0u8; expected_size];
