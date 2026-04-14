@@ -10,7 +10,7 @@
 //! 3. **Phase 3 -- Cleanup + Report**: Delete the temp file and print stats.
 
 use std::collections::HashMap;
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -124,6 +124,24 @@ impl indicatif::TermLike for LogTarget {
     fn flush(&self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+/// Create a progress bar with the project's standard style.
+pub(crate) fn make_styled_pb(total: u64, template: &str) -> indicatif::ProgressBar {
+    use std::io::IsTerminal;
+    let pb = if std::io::stderr().is_terminal() {
+        indicatif::ProgressBar::new(total)
+    } else {
+        let target = indicatif::ProgressDrawTarget::term_like_with_hz(Box::new(LogTarget), 1);
+        indicatif::ProgressBar::with_draw_target(Some(total), target)
+    };
+    pb.set_style(
+        indicatif::ProgressStyle::default_bar()
+            .template(template)
+            .expect("valid progress bar template")
+            .progress_chars("━╸─"),
+    );
+    pb
 }
 
 // ---------------------------------------------------------------------------
@@ -1153,21 +1171,10 @@ fn decode_and_write(
     tracing::info!("{accession}: streaming decode of {num_blobs} blobs (batch-parallel)",);
 
     let decode_pb = if config.progress {
-        let is_tty = std::io::stderr().is_terminal();
-        let pb = if is_tty {
-            indicatif::ProgressBar::new(num_blobs as u64)
-        } else {
-            // Non-TTY (e.g. SLURM log): each update prints a new line.
-            let target = indicatif::ProgressDrawTarget::term_like_with_hz(Box::new(LogTarget), 1);
-            indicatif::ProgressBar::with_draw_target(Some(num_blobs as u64), target)
-        };
-        pb.set_style(
-            indicatif::ProgressStyle::default_bar()
-                .template("[{elapsed_precise}] [{bar:40}] {pos}/{len} blobs ({per_sec}, {eta})")
-                .expect("valid progress bar template")
-                .progress_chars("=>-"),
-        );
-        Some(pb)
+        Some(make_styled_pb(
+            num_blobs as u64,
+            "  {elapsed_precise} {bar:40} {pos}/{len} blobs  {per_sec}  eta {eta}",
+        ))
     } else {
         None
     };
@@ -1559,20 +1566,10 @@ pub fn run_validate(
     };
 
     let decode_pb = if progress {
-        let is_tty = std::io::stderr().is_terminal();
-        let pb = if is_tty {
-            indicatif::ProgressBar::new(num_blobs as u64)
-        } else {
-            let target = indicatif::ProgressDrawTarget::term_like_with_hz(Box::new(LogTarget), 1);
-            indicatif::ProgressBar::with_draw_target(Some(num_blobs as u64), target)
-        };
-        pb.set_style(
-            indicatif::ProgressStyle::default_bar()
-                .template("[{elapsed_precise}] [{bar:40}] {pos}/{len} blobs ({per_sec}, {eta})")
-                .expect("valid progress bar template")
-                .progress_chars("=>-"),
-        );
-        Some(pb)
+        Some(make_styled_pb(
+            num_blobs as u64,
+            "  {elapsed_precise} {bar:40} {pos}/{len} blobs  {per_sec}  eta {eta}",
+        ))
     } else {
         None
     };

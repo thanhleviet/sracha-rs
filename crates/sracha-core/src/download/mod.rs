@@ -344,26 +344,10 @@ fn delete_progress(path: &Path) {
 
 /// Create a progress bar for the download.
 fn make_progress_bar(total_size: u64) -> indicatif::ProgressBar {
-    use std::io::IsTerminal;
-
-    let pb = if std::io::stderr().is_terminal() {
-        indicatif::ProgressBar::new(total_size)
-    } else {
-        let target = indicatif::ProgressDrawTarget::term_like_with_hz(
-            Box::new(crate::pipeline::LogTarget),
-            1,
-        );
-        indicatif::ProgressBar::with_draw_target(Some(total_size), target)
-    };
-    pb.set_style(
-        indicatif::ProgressStyle::default_bar()
-            .template(
-                "[{elapsed_precise}] [{bar:40}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
-            )
-            .expect("valid progress bar template")
-            .progress_chars("=>-"),
-    );
-    pb
+    crate::pipeline::make_styled_pb(
+        total_size,
+        "  {elapsed_precise} {bar:40} {bytes}/{total_bytes}  {bytes_per_sec}  eta {eta}",
+    )
 }
 
 /// Download a file from one or more mirror URLs using parallel HTTP Range requests.
