@@ -11,7 +11,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Once;
 
-use sracha_core::fastq::SplitMode;
+use sracha_core::fastq::{CompressionMode, SplitMode};
 use sracha_core::pipeline::PipelineConfig;
 
 // ---------------------------------------------------------------------------
@@ -61,12 +61,15 @@ fn ensure_srr000001() -> PathBuf {
 }
 
 /// Build a `PipelineConfig` suitable for testing.
-fn test_config(output_dir: &std::path::Path, split_mode: SplitMode, gzip: bool) -> PipelineConfig {
+fn test_config(
+    output_dir: &std::path::Path,
+    split_mode: SplitMode,
+    compression: CompressionMode,
+) -> PipelineConfig {
     PipelineConfig {
         output_dir: output_dir.to_path_buf(),
         split_mode,
-        gzip,
-        gzip_level: 1, // fast compression for tests
+        compression,
         threads: 2,
         connections: 1,
         skip_technical: true,
@@ -74,6 +77,7 @@ fn test_config(output_dir: &std::path::Path, split_mode: SplitMode, gzip: bool) 
         force: true,
         progress: false,
         run_info: None,
+        fasta: false,
     }
 }
 
@@ -120,7 +124,7 @@ fn assert_valid_fastq(data: &[u8]) {
 fn run_fastq_split3() {
     let sra_path = ensure_srr000001();
     let tmp = tempfile::tempdir().unwrap();
-    let config = test_config(tmp.path(), SplitMode::Split3, false);
+    let config = test_config(tmp.path(), SplitMode::Split3, CompressionMode::None);
 
     let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR000001"), &config).unwrap();
 
@@ -156,7 +160,7 @@ fn run_fastq_split3() {
 fn run_fastq_split_spot() {
     let sra_path = ensure_srr000001();
     let tmp = tempfile::tempdir().unwrap();
-    let config = test_config(tmp.path(), SplitMode::SplitSpot, false);
+    let config = test_config(tmp.path(), SplitMode::SplitSpot, CompressionMode::None);
 
     let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR000001"), &config).unwrap();
 
@@ -176,7 +180,11 @@ fn run_fastq_split_spot() {
 fn run_fastq_gzip() {
     let sra_path = ensure_srr000001();
     let tmp = tempfile::tempdir().unwrap();
-    let config = test_config(tmp.path(), SplitMode::SplitSpot, true);
+    let config = test_config(
+        tmp.path(),
+        SplitMode::SplitSpot,
+        CompressionMode::Gzip { level: 1 },
+    );
 
     let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR000001"), &config).unwrap();
 
@@ -203,11 +211,11 @@ fn run_fastq_deterministic() {
     let sra_path = ensure_srr000001();
 
     let tmp1 = tempfile::tempdir().unwrap();
-    let config1 = test_config(tmp1.path(), SplitMode::SplitSpot, false);
+    let config1 = test_config(tmp1.path(), SplitMode::SplitSpot, CompressionMode::None);
     let stats1 = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR000001"), &config1).unwrap();
 
     let tmp2 = tempfile::tempdir().unwrap();
-    let config2 = test_config(tmp2.path(), SplitMode::SplitSpot, false);
+    let config2 = test_config(tmp2.path(), SplitMode::SplitSpot, CompressionMode::None);
     let stats2 = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR000001"), &config2).unwrap();
 
     assert_eq!(stats1.spots_read, stats2.spots_read);
@@ -228,7 +236,7 @@ fn run_fastq_deterministic() {
 #[test]
 fn run_fastq_nonexistent_file() {
     let tmp = tempfile::tempdir().unwrap();
-    let config = test_config(tmp.path(), SplitMode::SplitSpot, false);
+    let config = test_config(tmp.path(), SplitMode::SplitSpot, CompressionMode::None);
     let result =
         sracha_core::pipeline::run_fastq(std::path::Path::new("/nonexistent.sra"), None, &config);
     assert!(result.is_err());
@@ -240,7 +248,7 @@ fn run_fastq_corrupt_file() {
     let corrupt_path = tmp.path().join("corrupt.sra");
     std::fs::write(&corrupt_path, b"this is not a valid SRA file").unwrap();
 
-    let config = test_config(tmp.path(), SplitMode::SplitSpot, false);
+    let config = test_config(tmp.path(), SplitMode::SplitSpot, CompressionMode::None);
     let result = sracha_core::pipeline::run_fastq(&corrupt_path, None, &config);
     assert!(result.is_err());
 }

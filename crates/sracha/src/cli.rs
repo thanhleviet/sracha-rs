@@ -66,6 +66,9 @@ pub enum Command {
 
     /// Show accession metadata
     Info(InfoArgs),
+
+    /// Validate SRA file integrity
+    Validate(ValidateArgs),
 }
 
 #[derive(Args)]
@@ -100,6 +103,10 @@ pub struct FetchArgs {
     /// Verify MD5 after download
     #[arg(long)]
     pub validate: bool,
+
+    /// Disable download resume (re-download from scratch)
+    #[arg(long)]
+    pub no_resume: bool,
 }
 
 #[derive(Args)]
@@ -113,12 +120,24 @@ pub struct FastqArgs {
     pub split: SplitMode,
 
     /// Disable gzip compression (compressed by default)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "zstd")]
     pub no_gzip: bool,
 
     /// Gzip compression level
     #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u32).range(1..=9))]
     pub gzip_level: u32,
+
+    /// Use zstd compression instead of gzip
+    #[arg(long, conflicts_with = "no_gzip")]
+    pub zstd: bool,
+
+    /// Zstd compression level (1-22)
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(i32).range(1..=22))]
+    pub zstd_level: i32,
+
+    /// Output FASTA instead of FASTQ (drops quality scores)
+    #[arg(long)]
+    pub fasta: bool,
 
     /// Number of threads for decode [default: 8]
     #[arg(short, long, default_value_t = 8)]
@@ -171,12 +190,24 @@ pub struct GetArgs {
     pub split: SplitMode,
 
     /// Disable gzip compression (compressed by default)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "zstd")]
     pub no_gzip: bool,
 
     /// Gzip compression level
     #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u32).range(1..=9))]
     pub gzip_level: u32,
+
+    /// Use zstd compression instead of gzip
+    #[arg(long, conflicts_with = "no_gzip")]
+    pub zstd: bool,
+
+    /// Zstd compression level (1-22)
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(i32).range(1..=22))]
+    pub zstd_level: i32,
+
+    /// Output FASTA instead of FASTQ (drops quality scores)
+    #[arg(long)]
+    pub fasta: bool,
 
     /// Number of threads for decode [default: 8]
     #[arg(short, long, default_value_t = 8)]
@@ -201,6 +232,10 @@ pub struct GetArgs {
     /// Disable progress bar
     #[arg(long)]
     pub no_progress: bool,
+
+    /// Disable download resume (re-download from scratch)
+    #[arg(long)]
+    pub no_resume: bool,
 }
 
 #[derive(Args)]
@@ -211,6 +246,21 @@ pub struct InfoArgs {
     /// Read accessions from a file (one per line)
     #[arg(long)]
     pub accession_list: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub struct ValidateArgs {
+    /// SRA file(s) to validate
+    #[arg(required = true)]
+    pub inputs: Vec<String>,
+
+    /// Number of threads for decode
+    #[arg(short, long, default_value_t = 8)]
+    pub threads: usize,
+
+    /// Disable progress bar
+    #[arg(long)]
+    pub no_progress: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]

@@ -17,7 +17,10 @@ use std::sync::Arc;
 use crate::compress::{DEFAULT_BLOCK_SIZE, ParGzWriter};
 use crate::download::{DownloadConfig, download_file};
 use crate::error::{Error, Result};
-use crate::fastq::{FastqConfig, FastqRecord, OutputSlot, SplitMode, format_read, output_filename};
+use crate::fastq::{
+    CompressionMode, FastqConfig, FastqRecord, OutputSlot, SplitMode, format_fasta_read,
+    format_read, output_filename,
+};
 use crate::sdl::ResolvedAccession;
 use crate::vdb::blob;
 use crate::vdb::cursor::VdbCursor;
@@ -34,10 +37,8 @@ pub struct PipelineConfig {
     pub output_dir: PathBuf,
     /// How to split reads across output files.
     pub split_mode: SplitMode,
-    /// Whether to gzip-compress output.
-    pub gzip: bool,
-    /// Gzip compression level (1-9).
-    pub gzip_level: u32,
+    /// Output compression mode.
+    pub compression: CompressionMode,
     /// Number of threads for decode/compression.
     pub threads: usize,
     /// Number of parallel HTTP connections for downloading.
@@ -52,6 +53,8 @@ pub struct PipelineConfig {
     pub progress: bool,
     /// Read structure from NCBI EUtils (authoritative, when available).
     pub run_info: Option<crate::sdl::RunInfo>,
+    /// Output FASTA instead of FASTQ (drops quality line).
+    pub fasta: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,9 +129,10 @@ impl indicatif::TermLike for LogTarget {
 // Output writer
 // ---------------------------------------------------------------------------
 
-/// An output writer that handles both gzip-compressed and plain FASTQ output.
+/// An output writer that handles gzip, zstd, or plain output.
 enum OutputWriter {
     Gz(ParGzWriter<std::io::BufWriter<std::fs::File>>),
+    Zstd(zstd::stream::write::Encoder<'static, std::io::BufWriter<std::fs::File>>),
     Plain(std::io::BufWriter<std::fs::File>),
 }
 
@@ -136,6 +140,7 @@ impl OutputWriter {
     fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
         match self {
             OutputWriter::Gz(w) => w.write_all(data),
+            OutputWriter::Zstd(w) => w.write_all(data),
             OutputWriter::Plain(w) => w.write_all(data),
         }
     }
@@ -143,6 +148,10 @@ impl OutputWriter {
     fn finish(self) -> std::io::Result<()> {
         match self {
             OutputWriter::Gz(w) => {
+                w.finish()?;
+                Ok(())
+            }
+            OutputWriter::Zstd(w) => {
                 w.finish()?;
                 Ok(())
             }
@@ -363,31 +372,33 @@ fn decode_blob_to_fastq(
     let read_page_map = read_decoded.page_map;
 
     // ------------------------------------------------------------------
-    // Decode QUALITY blob.
+    // Decode QUALITY blob (skipped entirely in FASTA mode).
     // ------------------------------------------------------------------
-    let quality_data: Vec<u8> = if !raw.quality_raw.is_empty() {
-        let qdecoded = decode_raw(raw.quality_raw, raw.quality_cs, raw.quality_id_range)?;
-        decode_zip_encoding(&qdecoded)
+    let (quality_all, quality_is_empty): (Vec<u8>, bool) = if config.fasta {
+        (Vec::new(), true)
     } else {
-        Vec::new()
-    };
-
-    let quality_is_empty =
-        quality_data.is_empty() || quality_data.iter().take(1000).all(|&b| b == 0);
-    let quality_all: Vec<u8> = if !quality_is_empty {
-        // Check ALL bytes to decide if data is already Phred+33 ASCII.
-        // A partial check (e.g. first 100 bytes) can miss raw binary values
-        // later in the buffer — values < 33 (especially 0x0A newline) would
-        // corrupt the FASTQ output.
-        let all_valid_ascii = quality_data.len() == read_data.len()
-            && quality_data.iter().all(|&b| (33..=126).contains(&b));
-        if all_valid_ascii {
-            quality_data
+        let quality_data: Vec<u8> = if !raw.quality_raw.is_empty() {
+            let qdecoded = decode_raw(raw.quality_raw, raw.quality_cs, raw.quality_id_range)?;
+            decode_zip_encoding(&qdecoded)
         } else {
-            crate::vdb::encoding::phred_to_ascii(&quality_data)
-        }
-    } else {
-        Vec::new() // will use lite_qual_buf below
+            Vec::new()
+        };
+
+        let is_empty = quality_data.is_empty() || quality_data.iter().take(1000).all(|&b| b == 0);
+        let all: Vec<u8> = if !is_empty {
+            // Check ALL bytes to decide if data is already Phred+33 ASCII.
+            let all_valid_ascii = quality_data.len() == read_data.len()
+                && quality_data.iter().all(|&b| (33..=126).contains(&b));
+            if all_valid_ascii {
+                quality_data
+            } else {
+                crate::vdb::encoding::phred_to_ascii(&quality_data)
+            }
+        } else {
+            Vec::new()
+        };
+
+        (all, is_empty)
     };
 
     // Pre-allocate a single quality buffer for SRA-lite / empty quality.
@@ -968,60 +979,36 @@ fn decode_blob_to_fastq(
         }
 
         if !segments.is_empty() {
+            // Helper: format a single read as FASTQ or FASTA.
+            let fmt = |seg: &ReadSeg| -> FastqRecord {
+                let seq = &sequence[seg.start..seg.start + seg.len];
+                if config.fasta {
+                    format_fasta_read(run_name, spot_number, original_name, seq)
+                } else {
+                    let qual = &quality[seg.start..seg.start + seg.len];
+                    format_read(run_name, spot_number, original_name, seq, qual)
+                }
+            };
+
             match config.split_mode {
                 SplitMode::Split3 | SplitMode::Interleaved => {
                     if segments.len() == 2 {
-                        let r1 = format_read(
-                            run_name,
-                            spot_number,
-                            original_name,
-                            &sequence[segments[0].start..segments[0].start + segments[0].len],
-                            &quality[segments[0].start..segments[0].start + segments[0].len],
-                        );
-                        let r2 = format_read(
-                            run_name,
-                            spot_number,
-                            original_name,
-                            &sequence[segments[1].start..segments[1].start + segments[1].len],
-                            &quality[segments[1].start..segments[1].start + segments[1].len],
-                        );
-                        records.push((OutputSlot::Read1, r1));
-                        records.push((OutputSlot::Read2, r2));
+                        records.push((OutputSlot::Read1, fmt(&segments[0])));
+                        records.push((OutputSlot::Read2, fmt(&segments[1])));
                     } else {
                         for seg in &segments {
-                            let rec = format_read(
-                                run_name,
-                                spot_number,
-                                original_name,
-                                &sequence[seg.start..seg.start + seg.len],
-                                &quality[seg.start..seg.start + seg.len],
-                            );
-                            records.push((OutputSlot::Unpaired, rec));
+                            records.push((OutputSlot::Unpaired, fmt(seg)));
                         }
                     }
                 }
                 SplitMode::SplitFiles => {
                     for (file_idx, seg) in segments.iter().enumerate() {
-                        let rec = format_read(
-                            run_name,
-                            spot_number,
-                            original_name,
-                            &sequence[seg.start..seg.start + seg.len],
-                            &quality[seg.start..seg.start + seg.len],
-                        );
-                        records.push((OutputSlot::ReadN(file_idx as u32), rec));
+                        records.push((OutputSlot::ReadN(file_idx as u32), fmt(seg)));
                     }
                 }
                 SplitMode::SplitSpot => {
                     for seg in &segments {
-                        let rec = format_read(
-                            run_name,
-                            spot_number,
-                            original_name,
-                            &sequence[seg.start..seg.start + seg.len],
-                            &quality[seg.start..seg.start + seg.len],
-                        );
-                        records.push((OutputSlot::Single, rec));
+                        records.push((OutputSlot::Single, fmt(seg)));
                     }
                 }
             }
@@ -1078,16 +1065,20 @@ fn decode_and_write(
         .build()
         .map_err(|e| Error::Vdb(format!("failed to build rayon thread pool: {e}")))?;
 
-    // Dedicated thread pool for parallel gzip compression.
-    // Compression is the bottleneck (~60% CPU), so give it 2x the threads.
-    let compress_threads = num_threads * 2;
-    let compress_pool = Arc::new(
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(compress_threads)
-            .thread_name(|i| format!("pargz-{i}"))
-            .build()
-            .map_err(|e| Error::Vdb(format!("failed to build gzip thread pool: {e}")))?,
-    );
+    // Dedicated thread pool for parallel gzip compression (only needed for gzip).
+    let compress_pool: Option<Arc<rayon::ThreadPool>> =
+        if matches!(config.compression, CompressionMode::Gzip { .. }) {
+            let compress_threads = num_threads * 2;
+            Some(Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(compress_threads)
+                    .thread_name(|i| format!("pargz-{i}"))
+                    .build()
+                    .map_err(|e| Error::Vdb(format!("failed to build gzip thread pool: {e}")))?,
+            ))
+        } else {
+            None
+        };
 
     tracing::info!("{accession}: using {num_threads} threads for decode");
 
@@ -1095,6 +1086,7 @@ fn decode_and_write(
         split_mode: config.split_mode,
         skip_technical: config.skip_technical,
         min_read_len: config.min_read_len,
+        fasta: config.fasta,
     };
 
     // Create output directory.
@@ -1217,7 +1209,12 @@ fn decode_and_write(
 
                     for (slot, record) in &records {
                         let writer = writers.entry(*slot).or_insert_with(|| {
-                            let filename = output_filename(accession, *slot, config.gzip);
+                            let filename = output_filename(
+                                accession,
+                                *slot,
+                                config.fasta,
+                                &config.compression,
+                            );
                             let path = config.output_dir.join(&filename);
                             output_files.push(path.clone());
 
@@ -1225,15 +1222,24 @@ fn decode_and_write(
                                 std::fs::File::create(&path).expect("failed to create output file");
                             let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
 
-                            if config.gzip {
-                                OutputWriter::Gz(ParGzWriter::new(
-                                    buf,
-                                    config.gzip_level,
-                                    DEFAULT_BLOCK_SIZE,
-                                    compress_pool.clone(),
-                                ))
-                            } else {
-                                OutputWriter::Plain(buf)
+                            match config.compression {
+                                CompressionMode::Gzip { level } => {
+                                    OutputWriter::Gz(ParGzWriter::new(
+                                        buf,
+                                        level,
+                                        DEFAULT_BLOCK_SIZE,
+                                        compress_pool.clone().expect("gzip pool must exist"),
+                                    ))
+                                }
+                                CompressionMode::Zstd { level, threads } => {
+                                    let mut encoder = zstd::stream::write::Encoder::new(buf, level)
+                                        .expect("failed to create zstd encoder");
+                                    encoder
+                                        .multithread(threads)
+                                        .expect("failed to set zstd threads");
+                                    OutputWriter::Zstd(encoder)
+                                }
+                                CompressionMode::None => OutputWriter::Plain(buf),
                             }
                         });
 
@@ -1445,6 +1451,252 @@ fn decode_and_write(
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Result of validating an SRA file.
+pub struct ValidationResult {
+    /// Label for the file that was validated.
+    pub label: String,
+    /// Whether the file is valid (no errors).
+    pub valid: bool,
+    /// Number of spots decoded during validation.
+    pub spots_validated: u64,
+    /// Number of blobs validated.
+    pub blobs_validated: usize,
+    /// Columns found in the SEQUENCE table.
+    pub columns_found: Vec<String>,
+    /// Errors encountered during validation.
+    pub errors: Vec<String>,
+}
+
+/// Validate an SRA file by opening as KAR archive, parsing the SEQUENCE
+/// table, and decoding all blobs. No output files are produced.
+pub fn run_validate(
+    sra_path: &std::path::Path,
+    threads: usize,
+    progress: bool,
+) -> ValidationResult {
+    let label = sra_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let mut errors = Vec::new();
+    let mut columns_found = Vec::new();
+
+    // Step 1: Open KAR archive.
+    let file = match std::fs::File::open(sra_path) {
+        Ok(f) => f,
+        Err(e) => {
+            errors.push(format!("cannot open file: {e}"));
+            return ValidationResult {
+                label,
+                valid: false,
+                spots_validated: 0,
+                blobs_validated: 0,
+                columns_found,
+                errors,
+            };
+        }
+    };
+
+    let mut archive = match KarArchive::open(std::io::BufReader::new(file)) {
+        Ok(a) => a,
+        Err(e) => {
+            errors.push(format!("invalid KAR archive: {e}"));
+            return ValidationResult {
+                label,
+                valid: false,
+                spots_validated: 0,
+                blobs_validated: 0,
+                columns_found,
+                errors,
+            };
+        }
+    };
+
+    // Step 2: Open VDB cursor.
+    let cursor = match VdbCursor::open(&mut archive, sra_path) {
+        Ok(c) => c,
+        Err(e) => {
+            errors.push(format!("cannot open VDB cursor: {e}"));
+            return ValidationResult {
+                label,
+                valid: false,
+                spots_validated: 0,
+                blobs_validated: 0,
+                columns_found,
+                errors,
+            };
+        }
+    };
+
+    // Record found columns.
+    columns_found.push("READ".into());
+    if cursor.has_quality() {
+        columns_found.push("QUALITY".into());
+    }
+    if cursor.read_len_col().is_some() {
+        columns_found.push("READ_LEN".into());
+    }
+    if cursor.read_type_col().is_some() {
+        columns_found.push("READ_TYPE".into());
+    }
+    if cursor.name_col().is_some() {
+        columns_found.push("NAME".into());
+    }
+
+    let expected_spots = cursor.spot_count();
+    let num_blobs = cursor.read_col().blob_count();
+    let read_cs = cursor.read_col().meta().checksum_type;
+    let has_quality = cursor.quality_col().is_some();
+    let quality_blob_count = cursor.quality_col().map_or(0, |c| c.blob_count());
+    let quality_cs = cursor.quality_col().map_or(0, |c| c.meta().checksum_type);
+    let has_read_len = cursor.read_len_col().is_some();
+    let read_len_blob_count = cursor.read_len_col().map_or(0, |c| c.blob_count());
+    let read_len_cs = cursor.read_len_col().map_or(0, |c| c.meta().checksum_type);
+
+    // Step 3: Decode all blobs in parallel.
+    let pool = match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+        Ok(p) => p,
+        Err(e) => {
+            errors.push(format!("failed to build thread pool: {e}"));
+            return ValidationResult {
+                label,
+                valid: false,
+                spots_validated: 0,
+                blobs_validated: 0,
+                columns_found,
+                errors,
+            };
+        }
+    };
+
+    let decode_pb = if progress {
+        let is_tty = std::io::stderr().is_terminal();
+        let pb = if is_tty {
+            indicatif::ProgressBar::new(num_blobs as u64)
+        } else {
+            let target = indicatif::ProgressDrawTarget::term_like_with_hz(Box::new(LogTarget), 1);
+            indicatif::ProgressBar::with_draw_target(Some(num_blobs as u64), target)
+        };
+        pb.set_style(
+            indicatif::ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] [{bar:40}] {pos}/{len} blobs ({per_sec}, {eta})")
+                .expect("valid progress bar template")
+                .progress_chars("=>-"),
+        );
+        Some(pb)
+    } else {
+        None
+    };
+
+    let total_spots = std::sync::atomic::AtomicU64::new(0);
+    let mut blobs_validated: usize = 0;
+
+    const BATCH_SIZE: usize = 1024;
+    let mut blob_idx: usize = 0;
+
+    while blob_idx < num_blobs {
+        let batch_end = (blob_idx + BATCH_SIZE).min(num_blobs);
+
+        let batch_errors: Vec<(usize, String)> = pool.install(|| {
+            (blob_idx..batch_end)
+                .into_par_iter()
+                .filter_map(|bi| {
+                    // Decode READ blob.
+                    let read_blob = &cursor.read_col().blobs()[bi];
+                    let read_raw = match cursor.read_col().read_raw_blob_slice(read_blob.start_id) {
+                        Ok(r) => r,
+                        Err(e) => return Some((bi, format!("READ blob {bi}: {e}"))),
+                    };
+                    let id_range = read_blob.id_range as u64;
+                    if let Err(e) = decode_raw(read_raw, read_cs, id_range) {
+                        return Some((bi, format!("READ blob {bi} decode: {e}")));
+                    }
+
+                    // Count spots from this blob.
+                    total_spots.fetch_add(id_range, std::sync::atomic::Ordering::Relaxed);
+
+                    // Decode QUALITY blob.
+                    if has_quality && bi < quality_blob_count {
+                        let qcol = cursor.quality_col().unwrap();
+                        let qblob = &qcol.blobs()[bi];
+                        match qcol.read_raw_blob_slice(qblob.start_id) {
+                            Ok(q_raw) => {
+                                let q_id = qblob.id_range as u64;
+                                match decode_raw(q_raw, quality_cs, q_id) {
+                                    Ok(qd) => {
+                                        decode_zip_encoding(&qd);
+                                    }
+                                    Err(e) => {
+                                        return Some((
+                                            bi,
+                                            format!("QUALITY blob {bi} decode: {e}"),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(e) => return Some((bi, format!("QUALITY blob {bi}: {e}"))),
+                        }
+                    }
+
+                    // Decode READ_LEN blob.
+                    if has_read_len && bi < read_len_blob_count {
+                        let rlcol = cursor.read_len_col().unwrap();
+                        let rlblob = &rlcol.blobs()[bi];
+                        match rlcol.read_raw_blob_slice(rlblob.start_id) {
+                            Ok(rl_raw) => {
+                                let rl_id = rlblob.id_range as u64;
+                                if let Err(e) = decode_raw(rl_raw, read_len_cs, rl_id) {
+                                    return Some((bi, format!("READ_LEN blob {bi} decode: {e}")));
+                                }
+                            }
+                            Err(e) => {
+                                return Some((bi, format!("READ_LEN blob {bi}: {e}")));
+                            }
+                        }
+                    }
+
+                    None
+                })
+                .collect()
+        });
+
+        for (bi, msg) in &batch_errors {
+            errors.push(msg.clone());
+            tracing::error!("validation error at blob {bi}: {msg}");
+        }
+
+        blobs_validated += batch_end - blob_idx;
+
+        if let Some(ref pb) = decode_pb {
+            pb.inc((batch_end - blob_idx) as u64);
+        }
+
+        blob_idx = batch_end;
+    }
+
+    if let Some(pb) = decode_pb {
+        pb.finish_and_clear();
+    }
+
+    let decoded_spots = total_spots.load(std::sync::atomic::Ordering::Relaxed);
+    if expected_spots > 0 && decoded_spots != expected_spots {
+        errors.push(format!(
+            "spot count mismatch: metadata says {expected_spots}, decoded {decoded_spots}",
+        ));
+    }
+
+    ValidationResult {
+        valid: errors.is_empty(),
+        label,
+        spots_validated: decoded_spots,
+        blobs_validated,
+        columns_found,
+        errors,
+    }
+}
+
 /// Statistics from a completed fastq conversion (no download).
 pub struct FastqStats {
     /// The accession/label used in FASTQ deflines.
@@ -1519,9 +1771,10 @@ pub async fn run_get(
     let dl_config = DownloadConfig {
         connections: config.connections,
         chunk_size: 0, // adaptive
-        force: true,   // always overwrite temp file
+        force: false,  // allow resume of interrupted temp download
         validate: false,
         progress: config.progress,
+        resume: true, // enable resume for temp downloads
     };
 
     tracing::info!(

@@ -61,6 +61,8 @@ pub struct FastqConfig {
     pub skip_technical: bool,
     /// Discard reads shorter than this length, if set.
     pub min_read_len: Option<u32>,
+    /// Output FASTA instead of FASTQ (drops quality line).
+    pub fasta: bool,
 }
 
 impl Default for FastqConfig {
@@ -69,6 +71,7 @@ impl Default for FastqConfig {
             split_mode: SplitMode::Split3,
             skip_technical: true,
             min_read_len: None,
+            fasta: false,
         }
     }
 }
@@ -230,6 +233,48 @@ pub fn format_read(
     FastqRecord { data }
 }
 
+/// Format a single read segment into a FASTA record (no quality line).
+///
+/// Defline format: `>{run}.{spot_num} {description} length={len}`
+///
+/// Bases with Phred quality 0 are NOT replaced with N in FASTA mode since
+/// no quality information is available to the caller.
+pub fn format_fasta_read(
+    run_name: &str,
+    spot_number: &[u8],
+    original_name: Option<&[u8]>,
+    sequence: &[u8],
+) -> FastqRecord {
+    let len = sequence.len();
+    let description = original_name.unwrap_or(spot_number);
+
+    let mut itoa_buf = itoa::Buffer::new();
+    let len_str = itoa_buf.format(len);
+
+    let defline_len =
+        run_name.len() + 1 + spot_number.len() + 1 + description.len() + 8 + len_str.len();
+
+    // Pre-allocate: >defline\nsequence\n
+    let mut data = Vec::with_capacity(1 + defline_len + 1 + len + 1);
+
+    // >defline
+    data.push(b'>');
+    data.extend_from_slice(run_name.as_bytes());
+    data.push(b'.');
+    data.extend_from_slice(spot_number);
+    data.push(b' ');
+    data.extend_from_slice(description);
+    data.extend_from_slice(b" length=");
+    data.extend_from_slice(len_str.as_bytes());
+    data.push(b'\n');
+
+    // Sequence
+    data.extend_from_slice(sequence);
+    data.push(b'\n');
+
+    FastqRecord { data }
+}
+
 /// A read segment extracted from a spot, after filtering.
 struct ReadSegment<'a> {
     sequence: &'a [u8],
@@ -344,19 +389,44 @@ pub fn format_spot(
 }
 
 // ---------------------------------------------------------------------------
+// Compression mode
+// ---------------------------------------------------------------------------
+
+/// Compression mode for output files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionMode {
+    /// No compression.
+    None,
+    /// Gzip compression (parallel pigz-style).
+    Gzip { level: u32 },
+    /// Zstd compression (native multi-threaded).
+    Zstd { level: i32, threads: u32 },
+}
+
+// ---------------------------------------------------------------------------
 // Output filename generation
 // ---------------------------------------------------------------------------
 
 /// Generate an output file name for a given slot.
 ///
-/// Examples:
-/// - `OutputSlot::Single`   -> `SRR123456.fastq` (or `.fastq.gz`)
+/// Examples (FASTQ, gzip):
+/// - `OutputSlot::Single`   -> `SRR123456.fastq.gz`
 /// - `OutputSlot::Read1`    -> `SRR123456_1.fastq.gz`
-/// - `OutputSlot::Read2`    -> `SRR123456_2.fastq.gz`
-/// - `OutputSlot::Unpaired` -> `SRR123456_0.fastq.gz`
-/// - `OutputSlot::ReadN(3)` -> `SRR123456_4.fastq.gz` (1-indexed in filename)
-pub fn output_filename(accession: &str, slot: OutputSlot, gzip: bool) -> String {
-    let ext = if gzip { ".fastq.gz" } else { ".fastq" };
+///
+/// Examples (FASTA, zstd):
+/// - `OutputSlot::Single`   -> `SRR123456.fasta.zst`
+pub fn output_filename(
+    accession: &str,
+    slot: OutputSlot,
+    fasta: bool,
+    compression: &CompressionMode,
+) -> String {
+    let base = if fasta { ".fasta" } else { ".fastq" };
+    let ext = match compression {
+        CompressionMode::None => base.to_string(),
+        CompressionMode::Gzip { .. } => format!("{base}.gz"),
+        CompressionMode::Zstd { .. } => format!("{base}.zst"),
+    };
     match slot {
         OutputSlot::Single => format!("{accession}{ext}"),
         OutputSlot::Read1 => format!("{accession}_1{ext}"),
@@ -869,8 +939,9 @@ mod tests {
 
     #[test]
     fn output_filename_single_gzip() {
+        let gz = CompressionMode::Gzip { level: 6 };
         assert_eq!(
-            output_filename("SRR123456", OutputSlot::Single, true),
+            output_filename("SRR123456", OutputSlot::Single, false, &gz),
             "SRR123456.fastq.gz"
         );
     }
@@ -878,40 +949,49 @@ mod tests {
     #[test]
     fn output_filename_single_no_gzip() {
         assert_eq!(
-            output_filename("SRR123456", OutputSlot::Single, false),
+            output_filename(
+                "SRR123456",
+                OutputSlot::Single,
+                false,
+                &CompressionMode::None
+            ),
             "SRR123456.fastq"
         );
     }
 
     #[test]
     fn output_filename_read1() {
+        let gz = CompressionMode::Gzip { level: 6 };
         assert_eq!(
-            output_filename("SRR123456", OutputSlot::Read1, true),
+            output_filename("SRR123456", OutputSlot::Read1, false, &gz),
             "SRR123456_1.fastq.gz"
         );
     }
 
     #[test]
     fn output_filename_read2() {
+        let gz = CompressionMode::Gzip { level: 6 };
         assert_eq!(
-            output_filename("SRR123456", OutputSlot::Read2, true),
+            output_filename("SRR123456", OutputSlot::Read2, false, &gz),
             "SRR123456_2.fastq.gz"
         );
     }
 
     #[test]
     fn output_filename_unpaired() {
+        let gz = CompressionMode::Gzip { level: 6 };
         assert_eq!(
-            output_filename("SRR123456", OutputSlot::Unpaired, true),
+            output_filename("SRR123456", OutputSlot::Unpaired, false, &gz),
             "SRR123456_0.fastq.gz"
         );
     }
 
     #[test]
     fn output_filename_read_n_zero_indexed() {
+        let gz = CompressionMode::Gzip { level: 6 };
         // ReadN(0) -> _1 in the filename (1-indexed).
         assert_eq!(
-            output_filename("SRR123456", OutputSlot::ReadN(0), true),
+            output_filename("SRR123456", OutputSlot::ReadN(0), false, &gz),
             "SRR123456_1.fastq.gz"
         );
     }
@@ -919,7 +999,12 @@ mod tests {
     #[test]
     fn output_filename_read_n_higher() {
         assert_eq!(
-            output_filename("SRR123456", OutputSlot::ReadN(2), false),
+            output_filename(
+                "SRR123456",
+                OutputSlot::ReadN(2),
+                false,
+                &CompressionMode::None
+            ),
             "SRR123456_3.fastq"
         );
     }
@@ -927,7 +1012,12 @@ mod tests {
     #[test]
     fn output_filename_unpaired_no_gzip() {
         assert_eq!(
-            output_filename("SRR999", OutputSlot::Unpaired, false),
+            output_filename(
+                "SRR999",
+                OutputSlot::Unpaired,
+                false,
+                &CompressionMode::None
+            ),
             "SRR999_0.fastq"
         );
     }
@@ -935,7 +1025,7 @@ mod tests {
     #[test]
     fn output_filename_read1_no_gzip() {
         assert_eq!(
-            output_filename("SRR999", OutputSlot::Read1, false),
+            output_filename("SRR999", OutputSlot::Read1, false, &CompressionMode::None),
             "SRR999_1.fastq"
         );
     }
@@ -943,8 +1033,49 @@ mod tests {
     #[test]
     fn output_filename_read2_no_gzip() {
         assert_eq!(
-            output_filename("SRR999", OutputSlot::Read2, false),
+            output_filename("SRR999", OutputSlot::Read2, false, &CompressionMode::None),
             "SRR999_2.fastq"
+        );
+    }
+
+    #[test]
+    fn output_filename_fasta_gzip() {
+        let gz = CompressionMode::Gzip { level: 6 };
+        assert_eq!(
+            output_filename("SRR123456", OutputSlot::Single, true, &gz),
+            "SRR123456.fasta.gz"
+        );
+    }
+
+    #[test]
+    fn output_filename_fasta_no_compression() {
+        assert_eq!(
+            output_filename("SRR123456", OutputSlot::Read1, true, &CompressionMode::None),
+            "SRR123456_1.fasta"
+        );
+    }
+
+    #[test]
+    fn output_filename_fastq_zstd() {
+        let zst = CompressionMode::Zstd {
+            level: 3,
+            threads: 4,
+        };
+        assert_eq!(
+            output_filename("SRR123456", OutputSlot::Single, false, &zst),
+            "SRR123456.fastq.zst"
+        );
+    }
+
+    #[test]
+    fn output_filename_fasta_zstd() {
+        let zst = CompressionMode::Zstd {
+            level: 3,
+            threads: 4,
+        };
+        assert_eq!(
+            output_filename("SRR123456", OutputSlot::Read2, true, &zst),
+            "SRR123456_2.fasta.zst"
         );
     }
 

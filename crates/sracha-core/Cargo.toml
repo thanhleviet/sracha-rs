@@ -17,6 +17,7 @@ flate2.workspace = true
 libdeflater.workspace = true
 libdeflate-sys.workspace = true
 crossbeam-channel.workspace = true
+zstd.workspace = true
 indicatif.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true

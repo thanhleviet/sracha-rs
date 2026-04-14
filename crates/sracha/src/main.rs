@@ -9,6 +9,7 @@ use tracing_subscriber::EnvFilter;
 
 use cli::{Cli, Command};
 use sracha_core::accession::{self, InputAccession};
+use sracha_core::fastq::CompressionMode;
 use sracha_core::sdl::{ResolvedAccession, SdlClient};
 use sracha_core::util::format_size;
 
@@ -60,6 +61,7 @@ async fn main() -> Result<()> {
                     force: args.force,
                     validate: args.validate,
                     progress: !args.no_progress,
+                    resume: !args.no_resume,
                     ..Default::default()
                 };
                 tracing::info!(
@@ -81,13 +83,30 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Fastq(args) => {
-            tracing::info!("converting {} input(s) to FASTQ", args.inputs.len());
+            let format_label = if args.fasta { "FASTA" } else { "FASTQ" };
+            tracing::info!(
+                "converting {} input(s) to {format_label}",
+                args.inputs.len()
+            );
 
             let split_mode = match args.split {
                 cli::SplitMode::Split3 => sracha_core::fastq::SplitMode::Split3,
                 cli::SplitMode::SplitFiles => sracha_core::fastq::SplitMode::SplitFiles,
                 cli::SplitMode::SplitSpot => sracha_core::fastq::SplitMode::SplitSpot,
                 cli::SplitMode::Interleaved => sracha_core::fastq::SplitMode::Interleaved,
+            };
+
+            let compression = if args.zstd {
+                CompressionMode::Zstd {
+                    level: args.zstd_level,
+                    threads: args.threads as u32,
+                }
+            } else if args.no_gzip {
+                CompressionMode::None
+            } else {
+                CompressionMode::Gzip {
+                    level: args.gzip_level,
+                }
             };
 
             for input in &args.inputs {
@@ -104,8 +123,7 @@ async fn main() -> Result<()> {
                 let pipeline_config = sracha_core::pipeline::PipelineConfig {
                     output_dir: args.output_dir.clone(),
                     split_mode,
-                    gzip: !args.no_gzip,
-                    gzip_level: args.gzip_level,
+                    compression,
                     threads: args.threads,
                     connections: 1,
                     skip_technical: !args.include_technical,
@@ -113,6 +131,7 @@ async fn main() -> Result<()> {
                     force: args.force,
                     progress: !args.no_progress,
                     run_info: None,
+                    fasta: args.fasta,
                 };
 
                 let stats = sracha_core::pipeline::run_fastq(sra_path, None, &pipeline_config)?;
@@ -135,13 +154,30 @@ async fn main() -> Result<()> {
             let sdl_client = SdlClient::new();
             let run_accessions = resolve_to_runs(&raw, &sdl_client).await?;
 
-            tracing::info!("get {} run accession(s) -> FASTQ", run_accessions.len());
+            let format_label = if args.fasta { "FASTA" } else { "FASTQ" };
+            tracing::info!(
+                "get {} run accession(s) -> {format_label}",
+                run_accessions.len()
+            );
 
             let split_mode = match args.split {
                 cli::SplitMode::Split3 => sracha_core::fastq::SplitMode::Split3,
                 cli::SplitMode::SplitFiles => sracha_core::fastq::SplitMode::SplitFiles,
                 cli::SplitMode::SplitSpot => sracha_core::fastq::SplitMode::SplitSpot,
                 cli::SplitMode::Interleaved => sracha_core::fastq::SplitMode::Interleaved,
+            };
+
+            let compression = if args.zstd {
+                CompressionMode::Zstd {
+                    level: args.zstd_level,
+                    threads: args.threads as u32,
+                }
+            } else if args.no_gzip {
+                CompressionMode::None
+            } else {
+                CompressionMode::Gzip {
+                    level: args.gzip_level,
+                }
             };
 
             for acc_str in &run_accessions {
@@ -151,8 +187,7 @@ async fn main() -> Result<()> {
                 let pipeline_config = sracha_core::pipeline::PipelineConfig {
                     output_dir: args.output_dir.clone(),
                     split_mode,
-                    gzip: !args.no_gzip,
-                    gzip_level: args.gzip_level,
+                    compression,
                     threads: args.threads,
                     connections: args.connections,
                     skip_technical: !args.include_technical,
@@ -160,6 +195,7 @@ async fn main() -> Result<()> {
                     force: args.force,
                     progress: !args.no_progress,
                     run_info: resolved.run_info.clone(),
+                    fasta: args.fasta,
                 };
 
                 let stats = sracha_core::pipeline::run_get(&resolved, &pipeline_config).await?;
@@ -206,6 +242,53 @@ async fn main() -> Result<()> {
                     Err(e) => eprintln!("{} {acc_str}: {e}", style::error_label("error:")),
                 }
             }
+            Ok(())
+        }
+        Command::Validate(args) => {
+            let mut all_valid = true;
+
+            for input in &args.inputs {
+                let sra_path = std::path::Path::new(input);
+                if !sra_path.exists() {
+                    eprintln!(
+                        "{} file not found: {}",
+                        style::error_label("error:"),
+                        style::path(input)
+                    );
+                    all_valid = false;
+                    continue;
+                }
+
+                let result =
+                    sracha_core::pipeline::run_validate(sra_path, args.threads, !args.no_progress);
+
+                if result.valid {
+                    eprintln!(
+                        "{}: {} -- {} spots, {} blobs, columns: [{}]",
+                        style::header(&result.label),
+                        style::value("ok"),
+                        style::count(result.spots_validated),
+                        style::count(result.blobs_validated),
+                        result.columns_found.join(", "),
+                    );
+                } else {
+                    all_valid = false;
+                    eprintln!(
+                        "{}: {} -- {} error(s)",
+                        style::header(&result.label),
+                        style::error_label("FAILED"),
+                        style::count(result.errors.len()),
+                    );
+                    for err in &result.errors {
+                        eprintln!("  {err}");
+                    }
+                }
+            }
+
+            if !all_valid {
+                std::process::exit(1);
+            }
+
             Ok(())
         }
     }
