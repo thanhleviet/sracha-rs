@@ -230,6 +230,61 @@ fn decode_raw(raw: &[u8], checksum_type: u8, row_count: u64) -> Result<blob::Dec
     blob::decode_blob(effective, 0, row_count, 8)
 }
 
+/// Decode irzip-compressed integers from a blob, detecting single vs dual series.
+fn decode_irzip_column(decoded: &blob::DecodedBlob) -> Vec<u8> {
+    let hdr_version = decoded.headers.first().map(|h| h.version).unwrap_or(0);
+    let decoded_ints = if hdr_version >= 1 {
+        let hdr = &decoded.headers[0];
+        let planes = hdr.ops.first().copied().unwrap_or(0xFF);
+        let min = hdr.args.first().copied().unwrap_or(0);
+        let slope = hdr.args.get(1).copied().unwrap_or(0);
+        let num_elems = (hdr.osize as u32) / 4;
+        // Detect dual-series (irzip v3): 4 args = min[0], slope[0], min[1], slope[1]
+        let series2 = hdr
+            .args
+            .get(2)
+            .and_then(|&min2| hdr.args.get(3).map(|&slope2| (min2, slope2)));
+        blob::irzip_decode(&decoded.data, 32, num_elems, min, slope, planes, series2)
+            .unwrap_or_default()
+    } else {
+        let num_elems = decoded
+            .row_length
+            .unwrap_or_else(|| (decoded.data.len() as u64 * 8) / 32)
+            as u32;
+        blob::izip_decode(&decoded.data, 32, num_elems).unwrap_or_default()
+    };
+    expand_via_page_map(decoded_ints, &decoded.page_map)
+}
+
+/// Expand decoded integer data via a page map's data_runs, if present.
+/// For columns like X, Y, and READ_LEN, the irzip/izip decoder produces
+/// unique data entries, and the page map maps each row to its data entry.
+fn expand_via_page_map(decoded_ints: Vec<u8>, page_map: &Option<blob::PageMap>) -> Vec<u8> {
+    if let Some(pm) = page_map {
+        let elem_bytes = 4usize; // u32
+        let row_length = pm.lengths.first().copied().unwrap_or(1) as usize;
+        let entry_bytes = row_length * elem_bytes;
+
+        if !pm.data_runs.is_empty() && pm.data_runs.len() as u64 >= pm.total_rows() {
+            let mut expanded = Vec::with_capacity(pm.data_runs.len() * entry_bytes);
+            for &offset in &pm.data_runs {
+                let start = offset as usize * entry_bytes;
+                let end = start + entry_bytes;
+                if end <= decoded_ints.len() {
+                    expanded.extend_from_slice(&decoded_ints[start..end]);
+                }
+            }
+            expanded
+        } else if !pm.data_runs.is_empty() {
+            pm.expand_data_runs_bytes(&decoded_ints, elem_bytes)
+        } else {
+            decoded_ints
+        }
+    } else {
+        decoded_ints
+    }
+}
+
 /// Decode a zip_encoding data section: the blob header tells us the
 /// version. Version 1 = raw deflate, byte-aligned output. Version 2 =
 /// raw deflate with trailing-bits argument. No headers (v1 blob) = the
@@ -426,48 +481,7 @@ fn decode_blob_to_fastq(
             .and_then(|pm| pm.lengths.first().copied())
             .unwrap_or(1) as usize;
 
-        let hdr_version = rldecoded.headers.first().map(|h| h.version).unwrap_or(0);
-
-        let decoded_ints = if hdr_version >= 1 {
-            let hdr = &rldecoded.headers[0];
-            let planes = hdr.ops.first().copied().unwrap_or(0xFF);
-            let min = hdr.args.first().copied().unwrap_or(0);
-            let slope = hdr.args.get(1).copied().unwrap_or(0);
-            let num_elems = (hdr.osize as u32) / 4;
-            blob::irzip_decode(&rldecoded.data, 32, num_elems, min, slope, planes)
-                .unwrap_or_default()
-        } else {
-            let num_elems = rldecoded
-                .row_length
-                .unwrap_or_else(|| (rldecoded.data.len() as u64 * 8) / 32)
-                as u32;
-            blob::izip_decode(&rldecoded.data, 32, num_elems).unwrap_or_default()
-        };
-
-        // Expand via page map if present.
-        let rl_bytes = if let Some(ref pm) = rldecoded.page_map {
-            let elem_bytes = 4usize; // u32
-            let row_length = pm.lengths.first().copied().unwrap_or(1) as usize;
-            let entry_bytes = row_length * elem_bytes;
-
-            if !pm.data_runs.is_empty() && pm.data_runs.len() as u64 >= pm.total_rows() {
-                let mut expanded = Vec::with_capacity(pm.data_runs.len() * entry_bytes);
-                for &offset in &pm.data_runs {
-                    let start = offset as usize * entry_bytes;
-                    let end = start + entry_bytes;
-                    if end <= decoded_ints.len() {
-                        expanded.extend_from_slice(&decoded_ints[start..end]);
-                    }
-                }
-                expanded
-            } else if !pm.data_runs.is_empty() {
-                pm.expand_data_runs_bytes(&decoded_ints, elem_bytes)
-            } else {
-                decoded_ints
-            }
-        } else {
-            decoded_ints
-        };
+        let rl_bytes = decode_irzip_column(&rldecoded);
 
         let lengths: Vec<u32> = rl_bytes
             .chunks_exact(4)
@@ -688,45 +702,11 @@ fn decode_blob_to_fastq(
 
         // Decode X column → u32 coordinates (irzip/izip encoded integers).
         let x_decoded = decode_raw(raw.x_raw, raw.x_cs, raw.x_id_range)?;
-        let x_bytes = {
-            let hdr_version = x_decoded.headers.first().map(|h| h.version).unwrap_or(0);
-            if hdr_version >= 1 {
-                let hdr = &x_decoded.headers[0];
-                let planes = hdr.ops.first().copied().unwrap_or(0xFF);
-                let min = hdr.args.first().copied().unwrap_or(0);
-                let slope = hdr.args.get(1).copied().unwrap_or(0);
-                let num_elems = (hdr.osize as u32) / 4;
-                blob::irzip_decode(&x_decoded.data, 32, num_elems, min, slope, planes)
-                    .unwrap_or_default()
-            } else {
-                let num_elems = x_decoded
-                    .row_length
-                    .unwrap_or_else(|| (x_decoded.data.len() as u64 * 8) / 32)
-                    as u32;
-                blob::izip_decode(&x_decoded.data, 32, num_elems).unwrap_or_default()
-            }
-        };
+        let x_bytes = decode_irzip_column(&x_decoded);
 
         // Decode Y column → u32 coordinates (irzip/izip encoded integers).
         let y_decoded = decode_raw(raw.y_raw, raw.y_cs, raw.y_id_range)?;
-        let y_bytes = {
-            let hdr_version = y_decoded.headers.first().map(|h| h.version).unwrap_or(0);
-            if hdr_version >= 1 {
-                let hdr = &y_decoded.headers[0];
-                let planes = hdr.ops.first().copied().unwrap_or(0xFF);
-                let min = hdr.args.first().copied().unwrap_or(0);
-                let slope = hdr.args.get(1).copied().unwrap_or(0);
-                let num_elems = (hdr.osize as u32) / 4;
-                blob::irzip_decode(&y_decoded.data, 32, num_elems, min, slope, planes)
-                    .unwrap_or_default()
-            } else {
-                let num_elems = y_decoded
-                    .row_length
-                    .unwrap_or_else(|| (y_decoded.data.len() as u64 * 8) / 32)
-                    as u32;
-                blob::izip_decode(&y_decoded.data, 32, num_elems).unwrap_or_default()
-            }
-        };
+        let y_bytes = decode_irzip_column(&y_decoded);
 
         // ALTREAD is a per-spot ASCII template (may vary per tile).
         // Parse templates: each spot's template is stored as a fixed-length or
@@ -756,41 +736,32 @@ fn decode_blob_to_fastq(
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
-        // Pick the template for this blob using the skey spot_start mapping.
-        // Binary search name_spot_starts to find which template covers the
-        // first spot_id of this blob.
-        let first_spot_id = spots_before as i64 + 1; // 1-based spot IDs
-        let blob_template: &[u8] = if !all_templates.is_empty() && !raw.name_spot_starts.is_empty()
-        {
-            // Binary search: find the last spot_start <= first_spot_id.
-            let tmpl_idx = match raw.name_spot_starts.binary_search(&first_spot_id) {
-                Ok(i) => i,
-                Err(i) => i.saturating_sub(1),
-            };
-            &all_templates[tmpl_idx.min(all_templates.len() - 1)]
-        } else if !all_templates.is_empty() {
-            // Fallback: use blob_idx modulo template count.
-            &all_templates[blob_idx % all_templates.len()]
-        } else {
-            b""
-        };
+        // Pick the template per spot using the skey spot_start mapping.
+        // A single blob can span multiple tile ranges, so we look up the
+        // correct template for each spot_id via binary search.
+        let has_templates =
+            !all_templates.is_empty() && !raw.name_spot_starts.is_empty();
 
-        if blob_idx == 0 && !blob_template.is_empty() {
+        if blob_idx == 0 && has_templates {
             tracing::info!(
-                "name reconstruction: {} templates, x_vals={}, y_vals={}, blob_template={:?}",
+                "name reconstruction: {} templates, x_vals={}, y_vals={}",
                 all_templates.len(),
                 x_vals.len(),
                 y_vals.len(),
-                String::from_utf8_lossy(blob_template),
             );
         }
 
-        if !blob_template.is_empty() && !x_vals.is_empty() && !y_vals.is_empty() {
+        if has_templates && !x_vals.is_empty() && !y_vals.is_empty() {
             let mut names = Vec::with_capacity(num_spots);
             let mut itoa_x = itoa::Buffer::new();
             let mut itoa_y = itoa::Buffer::new();
             for spot_i in 0..num_spots {
-                let tmpl = blob_template;
+                let spot_id = spots_before as i64 + spot_i as i64 + 1;
+                let tmpl_idx = match raw.name_spot_starts.binary_search(&spot_id) {
+                    Ok(i) => i,
+                    Err(i) => i.saturating_sub(1),
+                };
+                let tmpl = &all_templates[tmpl_idx.min(all_templates.len() - 1)];
                 let x = x_vals.get(spot_i).copied().unwrap_or(0);
                 let y = y_vals.get(spot_i).copied().unwrap_or(0);
 
@@ -1130,8 +1101,9 @@ fn decode_and_write(
 
     let metadata_reads_per_spot = cursor.metadata_reads_per_spot();
 
-    // For SRA-lite files without READ_LEN, determine the fixed spot length
-    // by reading blob 0's page map.
+    // For files without READ_LEN, determine the fixed spot length from
+    // blob 0's page map or, for v1 blobs (no page map), the row_length
+    // encoded in the blob header.
     let fixed_spot_len: Option<u32> = if !has_read_len && num_blobs > 0 {
         let blob0_info = &cursor.read_col().blobs()[0];
         let blob0_raw = cursor.read_col().read_raw_blob_slice(blob0_info.start_id)?;
@@ -1141,11 +1113,12 @@ fn decode_and_write(
             .page_map
             .as_ref()
             .and_then(|pm| pm.lengths.iter().copied().find(|&l| l > 0 && l <= 100_000))
+            .or(decoded.row_length.map(|rl| rl as u32).filter(|&l| l > 0 && l <= 100_000))
     } else {
         None
     };
     if let Some(fsl) = fixed_spot_len {
-        tracing::info!("fixed_spot_len={fsl} (from blob 0 page map)");
+        tracing::info!("fixed_spot_len={fsl} (from blob 0)");
     }
 
     // API-derived per-read lengths (from NCBI EUtils). Only used when

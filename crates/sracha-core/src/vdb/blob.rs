@@ -1512,6 +1512,25 @@ fn write_element(output: &mut [u8], idx: usize, val: i64, elem_bits: u32) {
 // irzip decode (v2 integer compression — plane-based zlib)
 // ---------------------------------------------------------------------------
 
+/// Apply delta decoding for a single value given a slope type.
+fn apply_delta(last_val: i64, raw: u64, slope: i64) -> i64 {
+    const DELTA_POS: i64 = 0x7ffffffffffffff0_u64 as i64;
+    const DELTA_NEG: i64 = 0x7ffffffffffffff1_u64 as i64;
+
+    if slope == DELTA_POS {
+        last_val.wrapping_add(raw as i64)
+    } else if slope == DELTA_NEG {
+        last_val.wrapping_sub(raw as i64)
+    } else {
+        // DELTA_BOTH: low bit indicates direction
+        if raw & 1 == 0 {
+            last_val.wrapping_add((raw >> 1) as i64)
+        } else {
+            last_val.wrapping_sub((raw >> 1) as i64)
+        }
+    }
+}
+
 /// Decode irzip-compressed integers (v2 format used for READ_LEN, READ_START, etc.).
 ///
 /// The irzip format compresses integer arrays by splitting each value into
@@ -1520,9 +1539,10 @@ fn write_element(output: &mut [u8], idx: usize, val: i64, elem_bits: u32) {
 ///
 /// Parameters from the blob header:
 /// - `min`: minimum value offset (added to each decoded value)
-/// - `slope`: linear prediction slope (applied as `val + i * slope`)
+/// - `slope`: linear prediction slope or delta-type enum
 /// - `planes`: bitmask indicating which byte-planes are present
 /// - `num_elements`: number of output elements
+/// - `series2`: optional `(min2, slope2)` for dual-series irzip v3 encoding
 pub fn irzip_decode(
     data: &[u8],
     elem_bits: u32,
@@ -1530,6 +1550,7 @@ pub fn irzip_decode(
     min: i64,
     slope: i64,
     planes: u8,
+    series2: Option<(i64, i64)>,
 ) -> Result<Vec<u8>> {
     let n = num_elements as usize;
     let out_bytes = (elem_bits / 8) as usize;
@@ -1570,41 +1591,49 @@ pub fn irzip_decode(
         }
     }
 
-    // Apply delta decoding based on slope type.
-    // slope is NOT a linear multiplier — it's a delta-type enum:
-    //   DELTA_POS  (0x7ffffffffffffff0): cumulative positive deltas
-    //   DELTA_NEG  (0x7ffffffffffffff1): cumulative negative deltas
-    //   DELTA_BOTH (0x7ffffffffffffff2): mixed (sign from low bit)
-    //   Other: simple offset (val + min)
     const DELTA_POS: i64 = 0x7ffffffffffffff0_u64 as i64;
     const DELTA_NEG: i64 = 0x7ffffffffffffff1_u64 as i64;
     const DELTA_BOTH: i64 = 0x7ffffffffffffff2_u64 as i64;
 
     let mut output = vec![0u8; n * out_bytes];
 
-    if slope == DELTA_POS || slope == DELTA_NEG || slope == DELTA_BOTH {
-        // Delta accumulation (single series — series_count=1 path).
+    if let Some((min2, slope2)) = series2 {
+        // Dual-series (irzip v3): low bit of each value selects series.
+        // Each series has independent delta accumulation.
+        let mins = [min, min2];
+        let slopes = [slope, slope2];
+        let mut last_idx: [usize; 2] = [0, 0];
+        let mut first_seen = [false, false];
+
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..n {
+            let raw = values[i] as u64;
+            let series = (raw & 1) as usize;
+            let val = raw >> 1; // remove series selector bit
+
+            if !first_seen[series] {
+                // First element of this series = min[series]
+                values[i] = mins[series];
+                first_seen[series] = true;
+                last_idx[series] = i;
+            } else {
+                let prev = values[last_idx[series]];
+                values[i] = apply_delta(prev, val, slopes[series]);
+                last_idx[series] = i;
+            }
+            write_element(&mut output, i, values[i], elem_bits);
+        }
+    } else if slope == DELTA_POS || slope == DELTA_NEG || slope == DELTA_BOTH {
+        // Single-series delta accumulation.
         let mut last_val: i64 = min;
         #[allow(clippy::needless_range_loop)]
         for i in 0..n {
             let raw = values[i] as u64;
-            let decoded = if slope == DELTA_POS {
-                last_val.wrapping_add(raw as i64)
-            } else if slope == DELTA_NEG {
-                last_val.wrapping_sub(raw as i64)
-            } else {
-                // DELTA_BOTH: low bit indicates direction
-                if raw & 1 == 0 {
-                    last_val.wrapping_add((raw >> 1) as i64)
-                } else {
-                    last_val.wrapping_sub((raw >> 1) as i64)
-                }
-            };
             if i == 0 {
-                // First element is just min
                 write_element(&mut output, i, min, elem_bits);
                 last_val = min;
             } else {
+                let decoded = apply_delta(last_val, raw, slope);
                 write_element(&mut output, i, decoded, elem_bits);
                 last_val = decoded;
             }
@@ -2245,5 +2274,106 @@ mod tests {
         let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
         let expanded = pm.expand_data_runs_bytes(&data, 4);
         assert_eq!(expanded, data);
+    }
+
+    // -----------------------------------------------------------------------
+    // irzip delta / dual-series tests
+    // -----------------------------------------------------------------------
+
+    /// Build irzip test data: single plane of raw-deflate bytes.
+    fn make_irzip_single_plane(values: &[u8]) -> Vec<u8> {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(values).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn irzip_decode_delta_both_single_series() {
+        // DELTA_BOTH single series: values encode sign in low bit.
+        // Target output: [100, 110, 105, 115]
+        // min=100, element 0 = 100 (written as min).
+        // Deltas from previous: +10, -5, +10
+        // DELTA_BOTH encoding: +10 → 20 (even), -5 → 11 (5<<1|1), +10 → 20
+        let raw_values: Vec<u8> = vec![0, 20, 11, 20];
+        let data = make_irzip_single_plane(&raw_values);
+        let delta_both: i64 = 0x7ffffffffffffff2_u64 as i64;
+
+        let result = irzip_decode(&data, 32, 4, 100, delta_both, 0x01, None).unwrap();
+        let vals: Vec<u32> = result
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(vals, vec![100, 110, 105, 115]);
+    }
+
+    #[test]
+    fn irzip_decode_dual_series() {
+        // Dual-series (irzip v3, series_count=2).
+        // Low bit selects series: 0 → series 0, 1 → series 1.
+        // Series 0: min=100, slope=DELTA_POS (cumulative positive deltas)
+        // Series 1: min=200, slope=DELTA_POS
+        //
+        // Target output: [100, 200, 105, 203]
+        //   idx 0: series 0 (even), first → min[0]=100
+        //   idx 1: series 1 (odd),  first → min[1]=200
+        //   idx 2: series 0 (even), delta=5 from 100 → 105
+        //   idx 3: series 1 (odd),  delta=3 from 200 → 203
+        //
+        // Packed values (before series bit removal):
+        //   idx 0: 0 (series 0: val=0, first element)
+        //   idx 1: 1 (series 1: val=0, first element) — low bit=1 selects series 1
+        //   idx 2: 10 (series 0: val=5<<1=10, delta=+5)
+        //   idx 3: 7 (series 1: val=3<<1|1=7, delta=+3)
+        let raw_values: Vec<u8> = vec![0, 1, 10, 7];
+        let data = make_irzip_single_plane(&raw_values);
+
+        let delta_pos: i64 = 0x7ffffffffffffff0_u64 as i64;
+        let series2 = Some((200i64, delta_pos));
+
+        let result = irzip_decode(&data, 32, 4, 100, delta_pos, 0x01, series2).unwrap();
+        let vals: Vec<u32> = result
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(vals, vec![100, 200, 105, 203]);
+    }
+
+    #[test]
+    fn irzip_decode_dual_series_delta_both() {
+        // Dual-series with DELTA_BOTH on both series.
+        // Low bit = series selector, then after >> 1, low bit = direction.
+        //
+        // Target: [1000, 2000, 1015, 1990]
+        //   idx 0: series 0, first → 1000
+        //   idx 1: series 1, first → 2000
+        //   idx 2: series 0, delta +15 from 1000 → 1015
+        //   idx 3: series 1, delta -10 from 2000 → 1990
+        //
+        // Series selector is lowest bit. After removing it:
+        //   For DELTA_BOTH: low bit = direction (0=+, 1=-)
+        //   +15: val_inner = 15<<1 = 30 (even=positive)
+        //   -10: val_inner = 10<<1|1 = 21 (odd=negative)
+        //
+        // Packed values (with series bit):
+        //   idx 0: 0 (series 0, val=0)
+        //   idx 1: 1 (series 1, val=0)
+        //   idx 2: 30<<1|0 = 60 (series 0, val_inner=30)
+        //   idx 3: 21<<1|1 = 43 (series 1, val_inner=21)
+        let raw_values: Vec<u8> = vec![0, 1, 60, 43];
+        let data = make_irzip_single_plane(&raw_values);
+
+        let delta_both: i64 = 0x7ffffffffffffff2_u64 as i64;
+        let series2 = Some((2000i64, delta_both));
+
+        let result = irzip_decode(&data, 32, 4, 1000, delta_both, 0x01, series2).unwrap();
+        let vals: Vec<u32> = result
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(vals, vec![1000, 2000, 1015, 1990]);
     }
 }

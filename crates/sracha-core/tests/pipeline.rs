@@ -60,6 +60,44 @@ fn ensure_srr000001() -> PathBuf {
     path
 }
 
+/// Ensure the SRR28588231 fixture (Illumina paired-end, 23 MiB).
+///
+/// This accession exercises: tile boundary detection (skey id2ord),
+/// per-spot template selection, fixed spot length from v1 blob headers,
+/// and irzip v3 dual-series X/Y coordinate decoding.
+fn ensure_srr28588231() -> PathBuf {
+    static DOWNLOAD: Once = Once::new();
+    let path = fixtures_dir().join("SRR28588231.sra");
+
+    DOWNLOAD.call_once(|| {
+        if path.exists() {
+            return;
+        }
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let url = "https://sra-pub-run-odp.s3.amazonaws.com/sra/SRR28588231/SRR28588231";
+        eprintln!("downloading SRR28588231 fixture from {url} ...");
+
+        let resp = reqwest::blocking::get(url)
+            .unwrap_or_else(|e| panic!("failed to download SRR28588231: {e}"));
+        assert!(
+            resp.status().is_success(),
+            "HTTP {} downloading fixture",
+            resp.status()
+        );
+        let bytes = resp.bytes().unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        eprintln!(
+            "fixture saved to {} ({} bytes)",
+            path.display(),
+            bytes.len()
+        );
+    });
+
+    assert!(path.exists(), "fixture not found at {}", path.display());
+    path
+}
+
 /// Build a `PipelineConfig` suitable for testing.
 fn test_config(
     output_dir: &std::path::Path,
@@ -251,4 +289,78 @@ fn run_fastq_corrupt_file() {
     let config = test_config(tmp.path(), SplitMode::SplitSpot, CompressionMode::None);
     let result = sracha_core::pipeline::run_fastq(&corrupt_path, None, &config);
     assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// SRR28588231 regression tests (Illumina paired-end, #3)
+//
+// Guards against:
+//   - Writing entire blobs as single records (v1 fixed_spot_len detection)
+//   - Wrong tile assignments at spot boundaries (skey id2ord big-endian)
+//   - Wrong X/Y coordinates (irzip v3 dual-series decoding)
+// ---------------------------------------------------------------------------
+
+/// Compute MD5 hex digest of a file.
+fn md5_file(path: &std::path::Path) -> String {
+    use md5::{Digest, Md5};
+    let data = std::fs::read(path).unwrap();
+    let hash = Md5::digest(&data);
+    hash.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[ignore] // requires network on first run
+#[test]
+fn illumina_paired_spot_count() {
+    // SRR28588231 has 66,220 spots × 2 reads = 132,440 reads.
+    // Without the v1 row_length fix this produced 16 spots (one per blob).
+    let sra_path = ensure_srr28588231();
+    let tmp = tempfile::tempdir().unwrap();
+    let config = test_config(tmp.path(), SplitMode::Split3, CompressionMode::None);
+
+    let stats =
+        sracha_core::pipeline::run_fastq(&sra_path, Some("SRR28588231"), &config).unwrap();
+
+    assert_eq!(stats.spots_read, 66_220, "expected 66,220 spots");
+    assert_eq!(stats.reads_written, 132_440, "expected 132,440 reads");
+    assert_eq!(
+        stats.output_files.len(),
+        2,
+        "paired-end should produce _1 and _2 files"
+    );
+
+    // Each file should have 66,220 records × 4 lines = 264,880 lines.
+    for path in &stats.output_files {
+        let data = std::fs::read(path).unwrap();
+        assert_valid_fastq(&data);
+        let line_count = data.iter().filter(|&&b| b == b'\n').count();
+        assert_eq!(
+            line_count, 264_880,
+            "each paired file should have 264,880 lines, got {line_count}"
+        );
+    }
+}
+
+#[ignore] // requires network on first run
+#[test]
+fn illumina_paired_byte_identity() {
+    // Byte-for-byte identity with fasterq-dump 3.2.0 output.
+    // These md5s cover tile boundaries, X/Y coordinates, and sequence/quality.
+    let sra_path = ensure_srr28588231();
+    let tmp = tempfile::tempdir().unwrap();
+    let config = test_config(tmp.path(), SplitMode::Split3, CompressionMode::None);
+
+    let stats =
+        sracha_core::pipeline::run_fastq(&sra_path, Some("SRR28588231"), &config).unwrap();
+
+    let md5_1 = md5_file(&stats.output_files[0]);
+    let md5_2 = md5_file(&stats.output_files[1]);
+
+    assert_eq!(
+        md5_1, "f889b1aec36ef6ba73f71d1e1c1a805a",
+        "SRR28588231_1.fastq md5 mismatch — deflines or data differ from fasterq-dump"
+    );
+    assert_eq!(
+        md5_2, "d307ea894444f2ede7a1ee51d65c6e04",
+        "SRR28588231_2.fastq md5 mismatch — deflines or data differ from fasterq-dump"
+    );
 }

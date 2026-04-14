@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Illumina tile boundaries**: Fixed skey id2ord delta unpacking to use
+  big-endian bitstream order matching ncbi-vdb's `Unpack` function. Tile
+  assignments at spot boundaries are now correct. Also fixed `span_bits`
+  header offset for v2 index files. Closes #3.
+- **Per-spot template selection**: Name templates are now looked up per spot
+  (not per blob), so tile transitions within a blob produce correct deflines.
+- **Fixed spot length for v1 blobs**: When READ_LEN is absent, the v1 blob
+  header `row_length` is now used as a fallback for fixed spot length detection,
+  enabling correct spot splitting without API access.
+- **irzip v3 dual-series decoding**: Implemented the series_count=2 path for
+  irzip decompression, fixing X/Y coordinate decoding for blobs that use
+  interleaved dual-series delta encoding.
+- **X/Y page map expansion**: X and Y column values are now expanded via
+  page map data runs, matching the existing READ_LEN expansion logic.
+
 ## 0.1.2 (2026-04-14)
 
 ### Added
@@ -81,8 +98,3 @@
   (`@RUN.SPOT_NUM DESCRIPTION length=LEN`) with the `+` line repeating the
   full defline.
 
-### Known Issues
-
-- Illumina tile assignment in deflines has boundary offsets for some spots near
-  tile transitions due to incomplete skey id2ord delta unpacking. Sequence and
-  quality data are unaffected. See #3.

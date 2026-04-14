@@ -322,10 +322,20 @@ impl VdbCursor {
         // Layout after PTrie: count(u32) + ord2node[count](u32) + packed_deltas
         // The packed deltas use span_bits per element with count-1 entries.
         // After unpacking, integrate (prefix sum) to get spot_id offsets.
-        let span_bits = if skey_data.len() >= 36 {
-            u16::from_le_bytes(skey_data[34..36].try_into().unwrap_or([0, 0])) as usize
-        } else {
-            0
+        //
+        // span_bits offset depends on header version:
+        //   v2: offset 26 (8-byte base header)
+        //   v3/v4: offset 34 (16-byte base header)
+        let span_bits = {
+            let endian = u32::from_le_bytes(skey_data[0..4].try_into().unwrap());
+            let version = u32::from_le_bytes(skey_data[4..8].try_into().unwrap());
+            if endian == 0x05031988 && (version == 3 || version == 4) && skey_data.len() >= 36 {
+                u16::from_le_bytes(skey_data[34..36].try_into().unwrap()) as usize
+            } else if endian == 0x05031988 && version <= 2 && skey_data.len() >= 28 {
+                u16::from_le_bytes(skey_data[26..28].try_into().unwrap()) as usize
+            } else {
+                0
+            }
         };
 
         // Search for ord2node count in the skey data.
@@ -371,23 +381,29 @@ impl VdbCursor {
                 .collect();
 
             // Unpack id2ord deltas from span_bits-packed data.
+            // The packed data is a big-endian bitstream: element[0] occupies
+            // the most-significant bits of byte[0], matching the ncbi-vdb
+            // Unpack function (libs/klib/unpack.c) which reads right-to-left
+            // with byte-swapped 32-bit chunks.
             let packed_data = &skey_data[ord2node_end..];
             let mut id2ord: Vec<i64> = vec![0i64; count];
             if count > 1 && span_bits > 0 {
-                let mut bit_offset = 0usize;
+                let mask = (1u64 << span_bits) - 1;
                 for i in 0..count - 1 {
-                    let byte_pos = bit_offset / 8;
-                    let bit_pos = bit_offset % 8;
-                    // Read enough bytes for span_bits starting at bit_pos.
-                    let mut raw: u64 = 0;
-                    for b in 0..(span_bits + bit_pos).div_ceil(8).min(8) {
-                        if byte_pos + b < packed_data.len() {
-                            raw |= (packed_data[byte_pos + b] as u64) << (b * 8);
+                    let bit_offset = i * span_bits;
+                    let first_byte = bit_offset / 8;
+                    let last_byte = (bit_offset + span_bits - 1) / 8;
+                    // Accumulate relevant bytes in big-endian order.
+                    let mut raw: u128 = 0;
+                    for j in first_byte..=last_byte {
+                        if j < packed_data.len() {
+                            raw = (raw << 8) | packed_data[j] as u128;
                         }
                     }
-                    let delta = ((raw >> bit_pos) & ((1u64 << span_bits) - 1)) as i64;
+                    let num_bytes = last_byte - first_byte + 1;
+                    let shift = num_bytes * 8 - (bit_offset % 8) - span_bits;
+                    let delta = ((raw >> shift) as u64 & mask) as i64;
                     id2ord[i + 1] = delta;
-                    bit_offset += span_bits;
                 }
                 // Integrate (prefix sum).
                 for i in 1..count {
