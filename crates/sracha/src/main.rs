@@ -195,7 +195,14 @@ async fn main() -> Result<()> {
                 }
             };
 
-            for resolved in &resolved_all {
+            // Process accessions with one-ahead download prefetch: while
+            // decoding accession N, start downloading accession N+1 so that
+            // network and CPU overlap.
+            let mut pending_download: Option<
+                tokio::task::JoinHandle<sracha_core::error::Result<sracha_core::pipeline::DownloadedSra>>,
+            > = None;
+
+            for (i, resolved) in resolved_all.iter().enumerate() {
                 let pipeline_config = sracha_core::pipeline::PipelineConfig {
                     output_dir: args.output_dir.clone(),
                     split_mode,
@@ -210,7 +217,38 @@ async fn main() -> Result<()> {
                     fasta: args.fasta,
                 };
 
-                let stats = sracha_core::pipeline::run_get(resolved, &pipeline_config).await?;
+                // Await this accession's download (prefetched or fresh).
+                let downloaded = if let Some(handle) = pending_download.take() {
+                    handle.await.context("download task panicked")??
+                } else {
+                    sracha_core::pipeline::download_sra(resolved, &pipeline_config).await?
+                };
+
+                // Start prefetching the next accession's download.
+                if i + 1 < resolved_all.len() {
+                    let next_resolved = resolved_all[i + 1].clone();
+                    let next_config = sracha_core::pipeline::PipelineConfig {
+                        output_dir: args.output_dir.clone(),
+                        split_mode,
+                        compression,
+                        threads: args.threads,
+                        connections: args.connections,
+                        skip_technical: !args.include_technical,
+                        min_read_len: args.min_read_len,
+                        force: args.force,
+                        progress: !args.no_progress,
+                        run_info: next_resolved.run_info.clone(),
+                        fasta: args.fasta,
+                    };
+                    pending_download = Some(tokio::spawn(async move {
+                        sracha_core::pipeline::download_sra(&next_resolved, &next_config).await
+                    }));
+                }
+
+                // Decode (CPU-bound) while the next download runs in the background.
+                let stats = tokio::task::block_in_place(|| {
+                    sracha_core::pipeline::decode_sra(&downloaded, &pipeline_config)
+                })?;
 
                 let pct = if stats.total_sra_size > 0 {
                     stats.bytes_downloaded as f64 / stats.total_sra_size as f64 * 100.0

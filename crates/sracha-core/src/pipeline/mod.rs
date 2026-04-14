@@ -32,6 +32,7 @@ use rayon::prelude::*;
 // ---------------------------------------------------------------------------
 
 /// Configuration for the get pipeline.
+#[derive(Clone)]
 pub struct PipelineConfig {
     /// Directory for output files.
     pub output_dir: PathBuf,
@@ -1726,17 +1727,29 @@ pub fn run_fastq(
     })
 }
 
-/// Run the full get pipeline for a single accession.
+/// Result of the download phase of `run_get`.
+pub struct DownloadedSra {
+    /// Path to the temporary SRA file on disk.
+    pub temp_path: PathBuf,
+    /// Bytes actually downloaded (may be less than total if resumed).
+    pub bytes_downloaded: u64,
+    /// Total SRA file size on the server.
+    pub total_sra_size: u64,
+    /// Whether this is an SRA-lite file.
+    pub is_lite: bool,
+    /// The accession string.
+    pub accession: String,
+}
+
+/// Download an SRA file to a temporary location.
 ///
-/// This is the full-download approach:
-/// 1. Download the complete SRA file to a temporary location
-/// 2. Open as KAR archive, parse SEQUENCE table columns
-/// 3. Decode VDB blobs, format FASTQ, compress output
-/// 4. Delete temporary SRA file
-pub async fn run_get(
+/// This is the download-only phase of `run_get`, separated so that callers
+/// can overlap the download of the next accession with the decode of the
+/// current one.
+pub async fn download_sra(
     resolved: &ResolvedAccession,
     config: &PipelineConfig,
-) -> Result<PipelineStats> {
+) -> Result<DownloadedSra> {
     let accession = &resolved.accession;
     let total_sra_size = resolved.sra_file.size;
     let url = select_mirror(resolved)?;
@@ -1744,20 +1757,18 @@ pub async fn run_get(
 
     tracing::info!("{accession}: starting full download from {url}");
 
-    // --- Phase 1: Download the full SRA file ---
     let temp_filename = format!(".sracha-tmp-{accession}.sra");
     let temp_path = config.output_dir.join(&temp_filename);
 
-    // Ensure output directory exists before downloading.
     tokio::fs::create_dir_all(&config.output_dir).await?;
 
     let dl_config = DownloadConfig {
         connections: config.connections,
-        chunk_size: 0, // adaptive
-        force: false,  // allow resume of interrupted temp download
+        chunk_size: 0,
+        force: false,
         validate: false,
         progress: config.progress,
-        resume: true, // enable resume for temp downloads
+        resume: true,
     };
 
     tracing::info!(
@@ -1775,41 +1786,68 @@ pub async fn run_get(
     )
     .await?;
 
-    let bytes_downloaded = dl_result.size;
-
     tracing::info!(
         "{accession}: download complete ({})",
-        crate::util::format_size(bytes_downloaded),
+        crate::util::format_size(dl_result.size),
     );
 
-    // --- Phase 2: Parse VDB + output FASTQ ---
-    let is_lite = resolved.sra_file.is_lite;
+    Ok(DownloadedSra {
+        temp_path,
+        bytes_downloaded: dl_result.size,
+        total_sra_size,
+        is_lite: resolved.sra_file.is_lite,
+        accession: accession.clone(),
+    })
+}
 
-    let (spots_read, reads_written, output_files) =
-        tokio::task::block_in_place(|| decode_and_write(&temp_path, accession, config, is_lite))?;
+/// Decode a previously downloaded SRA file into FASTQ and clean up the temp file.
+///
+/// This is the decode phase of `run_get`. Call from within
+/// `tokio::task::block_in_place` or a blocking thread.
+pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result<PipelineStats> {
+    let (spots_read, reads_written, output_files) = decode_and_write(
+        &downloaded.temp_path,
+        &downloaded.accession,
+        config,
+        downloaded.is_lite,
+    )?;
 
-    // --- Phase 3: Cleanup ---
-    if let Err(e) = tokio::fs::remove_file(&temp_path).await {
+    // Clean up temp file.
+    if let Err(e) = std::fs::remove_file(&downloaded.temp_path) {
         tracing::warn!(
-            "{accession}: failed to remove temp file {}: {e}",
-            temp_path.display(),
+            "{}: failed to remove temp file {}: {e}",
+            downloaded.accession,
+            downloaded.temp_path.display(),
         );
     }
 
     tracing::info!(
-        "{accession}: done -- {spots_read} spots, {reads_written} reads written, \
+        "{}: done -- {spots_read} spots, {reads_written} reads written, \
          {} downloaded",
-        crate::util::format_size(bytes_downloaded),
+        downloaded.accession,
+        crate::util::format_size(downloaded.bytes_downloaded),
     );
 
     Ok(PipelineStats {
-        accession: accession.clone(),
+        accession: downloaded.accession.clone(),
         spots_read,
         reads_written,
-        bytes_downloaded,
-        total_sra_size,
+        bytes_downloaded: downloaded.bytes_downloaded,
+        total_sra_size: downloaded.total_sra_size,
         output_files,
     })
+}
+
+/// Run the full get pipeline for a single accession.
+///
+/// Convenience wrapper that calls [`download_sra`] then [`decode_sra`].
+/// For multi-accession prefetch, use those functions directly.
+pub async fn run_get(
+    resolved: &ResolvedAccession,
+    config: &PipelineConfig,
+) -> Result<PipelineStats> {
+    let downloaded = download_sra(resolved, config).await?;
+    tokio::task::block_in_place(|| decode_sra(&downloaded, config))
 }
 
 #[cfg(test)]
