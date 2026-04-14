@@ -1242,14 +1242,13 @@ fn nbuf_read(data: &[u8], idx: usize, variant: u32) -> i64 {
     }
 }
 
-/// Unpack an nbuf: expand smaller element types to i64 and add min.
-fn unpack_nbuf(data: &[u8], count: usize, variant: u32, min: i64) -> Vec<i64> {
-    let mut result = Vec::with_capacity(count);
-    for i in 0..count {
-        result.push(nbuf_read(data, i, variant) + min);
-    }
-    result
+/// Read a single element from an nbuf, adding `min`.
+#[inline(always)]
+fn nbuf_read_min(data: &[u8], idx: usize, variant: u32, min: i64) -> i64 {
+    nbuf_read(data, idx, variant).wrapping_add(min)
 }
+
+
 
 /// Decode types bitmap: each bit in `src` maps to one segment type (0=line, 1=outlier).
 fn decode_types(n: usize, src: &[u8]) -> Vec<u8> {
@@ -1338,7 +1337,6 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
                 (diff_raw.len() * 8 / n) as u32
             };
             let diff_var = variant_from_elem_bits(diff_elem_bits)?;
-            let diff = unpack_nbuf(&diff_raw, n, diff_var, iz.min_diff);
 
             // Determine lines and outlier counts.
             let segment_types = if iz.outliers > 0 {
@@ -1356,7 +1354,9 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
             let lines = segment_types.iter().filter(|&&t| t == 0).count();
             let outlier_count = segment_types.iter().filter(|&&t| t != 0).count();
 
-            // Decode length buffer.
+            // Decode raw byte buffers for each component.  The packed values
+            // are read inline during reconstruction via nbuf_read_min(),
+            // avoiding intermediate Vec<i64> allocations.
             let flag_length = flag_extract(iz.data_flags, 2 * FLAG_BITS);
             let total_segs = lines + outlier_count;
             let length_raw = if flag_length == DATA_CONSTANT {
@@ -1370,9 +1370,7 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
                 (length_raw.len() * 8 / total_segs) as u32
             };
             let length_var = variant_from_elem_bits(length_elem_bits)?;
-            let lengths = unpack_nbuf(&length_raw, total_segs, length_var, iz.min_length);
 
-            // Decode dy, dx, a buffers.
             let flag_dy = flag_extract(iz.data_flags, 3 * FLAG_BITS);
             let dy_raw = if flag_dy == DATA_CONSTANT {
                 vec![0u8; lines * 8]
@@ -1385,7 +1383,6 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
                 (dy_raw.len() * 8 / lines) as u32
             };
             let dy_var = variant_from_elem_bits(dy_elem_bits)?;
-            let dy = unpack_nbuf(&dy_raw, lines, dy_var, iz.min_dy);
 
             let flag_dx = flag_extract(iz.data_flags, 4 * FLAG_BITS);
             let dx_raw = if flag_dx == DATA_CONSTANT {
@@ -1399,7 +1396,6 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
                 (dx_raw.len() * 8 / lines) as u32
             };
             let dx_var = variant_from_elem_bits(dx_elem_bits)?;
-            let dx = unpack_nbuf(&dx_raw, lines, dx_var, iz.min_dx);
 
             let flag_a = flag_extract(iz.data_flags, 5 * FLAG_BITS);
             let a_raw = if flag_a == DATA_CONSTANT {
@@ -1413,34 +1409,33 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
                 (a_raw.len() * 8 / lines) as u32
             };
             let a_var = variant_from_elem_bits(a_elem_bits)?;
-            let a_vals = unpack_nbuf(&a_raw, lines, a_var, iz.min_a);
 
-            // Decode outlier buffer.
-            let outlier_vals = if outlier_count > 0 {
+            let (outlier_raw, outlier_var) = if outlier_count > 0 {
                 let flag_outlier = flag_extract(iz.data_flags, 6 * FLAG_BITS);
-                let outlier_raw = if flag_outlier == DATA_CONSTANT {
+                let raw = if flag_outlier == DATA_CONSTANT {
                     vec![0u8; outlier_count * 8]
                 } else {
                     izip_decompress_buf(iz.outlier_data, flag_outlier, outlier_count * 8)?
                 };
-                let outlier_elem_bits = if outlier_raw.is_empty() {
+                let bits = if raw.is_empty() {
                     8
                 } else {
-                    (outlier_raw.len() * 8 / outlier_count) as u32
+                    (raw.len() * 8 / outlier_count) as u32
                 };
-                let outlier_var = variant_from_elem_bits(outlier_elem_bits)?;
-                unpack_nbuf(&outlier_raw, outlier_count, outlier_var, iz.min_outlier)
+                (raw, variant_from_elem_bits(bits)?)
             } else {
-                vec![]
+                (vec![], 4)
             };
 
-            // Reconstruct output.
+            // Reconstruct output, reading packed values inline to avoid
+            // materializing intermediate Vec<i64> buffers.
             let mut k = 0usize; // output element index
             let mut u = 0usize; // line segment index
             let mut v = 0usize; // outlier value index
 
             for seg_idx in 0..iz.segments as usize {
-                let seg_len = lengths[seg_idx] as usize;
+                let seg_len =
+                    nbuf_read_min(&length_raw, seg_idx, length_var, iz.min_length) as usize;
 
                 if segment_types[seg_idx] != 0 {
                     // Outlier segment: copy values directly.
@@ -1448,14 +1443,20 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
                         if k + j >= n {
                             break;
                         }
-                        write_element(&mut output, k + j, outlier_vals[v + j], elem_bits);
+                        let val =
+                            nbuf_read_min(&outlier_raw, v + j, outlier_var, iz.min_outlier);
+                        write_element(&mut output, k + j, val, elem_bits);
                     }
                     k += seg_len;
                     v += seg_len;
                 } else {
                     // Line segment: reconstruct using diff + linear model.
-                    let m = if dx[u] != 0 {
-                        dy[u] as f64 / dx[u] as f64
+                    let dx_val = nbuf_read_min(&dx_raw, u, dx_var, iz.min_dx);
+                    let dy_val = nbuf_read_min(&dy_raw, u, dy_var, iz.min_dy);
+                    let a_val = nbuf_read_min(&a_raw, u, a_var, iz.min_a);
+
+                    let m = if dx_val != 0 {
+                        dy_val as f64 / dx_val as f64
                     } else {
                         0.0
                     };
@@ -1464,8 +1465,10 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
                         if k + j >= n {
                             break;
                         }
-                        let predicted = a_vals[u] as f64 + j as f64 * m;
-                        let val = diff[k + j].wrapping_add(predicted as i64);
+                        let predicted = a_val as f64 + j as f64 * m;
+                        let diff_val =
+                            nbuf_read_min(&diff_raw, k + j, diff_var, iz.min_diff);
+                        let val = diff_val.wrapping_add(predicted as i64);
                         write_element(&mut output, k + j, val, elem_bits);
                     }
                     k += seg_len;
