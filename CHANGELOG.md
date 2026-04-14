@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.1.4 (2026-04-14)
+
+### Performance
+
+- **Gzip backpressure**: `ParGzWriter` now blocks when too many blocks are
+  pending, preventing the decode loop from outrunning compression. Eliminates
+  a multi-second `finish()` stall and reduces overall decode+gzip time by ~47%
+  (19s to 10s on SRR000001).
+
 ## 0.1.3 (2026-04-14)
 
 ### Performance
