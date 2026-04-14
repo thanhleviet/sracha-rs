@@ -144,6 +144,7 @@ async fn main() -> Result<()> {
                     progress: !args.no_progress,
                     run_info: None,
                     fasta: args.fasta,
+                    cancelled: None,
                 };
 
                 let stats = sracha_core::pipeline::run_fastq(sra_path, None, &pipeline_config)?;
@@ -195,6 +196,30 @@ async fn main() -> Result<()> {
                 }
             };
 
+            // -- Ctrl-C signal handling --
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let cancelled = Arc::new(AtomicBool::new(false));
+            {
+                let cancelled = cancelled.clone();
+                tokio::spawn(async move {
+                    tokio::signal::ctrl_c().await.ok();
+                    eprintln!(
+                        "\nInterrupted -- shutting down gracefully. \
+                         Press Ctrl-C again to force quit."
+                    );
+                    cancelled.store(true, Ordering::SeqCst);
+
+                    tokio::signal::ctrl_c().await.ok();
+                    eprintln!("\nForce quit.");
+                    std::process::exit(1);
+                });
+            }
+
+            let mut completed_accessions: Vec<String> = Vec::new();
+            let mut interrupted_accession: Option<String> = None;
+
             // Process accessions with one-ahead download prefetch: while
             // decoding accession N, start downloading accession N+1 so that
             // network and CPU overlap.
@@ -205,6 +230,10 @@ async fn main() -> Result<()> {
             > = None;
 
             for (i, resolved) in resolved_all.iter().enumerate() {
+                if cancelled.load(Ordering::Relaxed) {
+                    break;
+                }
+
                 let pipeline_config = sracha_core::pipeline::PipelineConfig {
                     output_dir: args.output_dir.clone(),
                     split_mode,
@@ -217,17 +246,39 @@ async fn main() -> Result<()> {
                     progress: !args.no_progress,
                     run_info: resolved.run_info.clone(),
                     fasta: args.fasta,
+                    cancelled: Some(cancelled.clone()),
                 };
 
                 // Await this accession's download (prefetched or fresh).
                 let downloaded = if let Some(handle) = pending_download.take() {
-                    handle.await.context("download task panicked")??
+                    match handle.await {
+                        Ok(Ok(d)) => d,
+                        Ok(Err(sracha_core::error::Error::Cancelled { .. })) => {
+                            interrupted_accession = Some(resolved.accession.clone());
+                            break;
+                        }
+                        Ok(Err(e)) => return Err(e.into()),
+                        Err(join_err) => {
+                            if cancelled.load(Ordering::Relaxed) {
+                                interrupted_accession = Some(resolved.accession.clone());
+                                break;
+                            }
+                            return Err(anyhow::anyhow!("download task panicked: {join_err}"));
+                        }
+                    }
                 } else {
-                    sracha_core::pipeline::download_sra(resolved, &pipeline_config).await?
+                    match sracha_core::pipeline::download_sra(resolved, &pipeline_config).await {
+                        Ok(d) => d,
+                        Err(sracha_core::error::Error::Cancelled { .. }) => {
+                            interrupted_accession = Some(resolved.accession.clone());
+                            break;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
                 };
 
                 // Start prefetching the next accession's download.
-                if i + 1 < resolved_all.len() {
+                if i + 1 < resolved_all.len() && !cancelled.load(Ordering::Relaxed) {
                     let next_resolved = resolved_all[i + 1].clone();
                     let next_config = sracha_core::pipeline::PipelineConfig {
                         output_dir: args.output_dir.clone(),
@@ -241,6 +292,7 @@ async fn main() -> Result<()> {
                         progress: !args.no_progress,
                         run_info: next_resolved.run_info.clone(),
                         fasta: args.fasta,
+                        cancelled: Some(cancelled.clone()),
                     };
                     pending_download = Some(tokio::spawn(async move {
                         sracha_core::pipeline::download_sra(&next_resolved, &next_config).await
@@ -248,27 +300,58 @@ async fn main() -> Result<()> {
                 }
 
                 // Decode (CPU-bound) while the next download runs in the background.
-                let stats = tokio::task::block_in_place(|| {
+                match tokio::task::block_in_place(|| {
                     sracha_core::pipeline::decode_sra(&downloaded, &pipeline_config)
-                })?;
-
-                let pct = if stats.total_sra_size > 0 {
-                    stats.bytes_downloaded as f64 / stats.total_sra_size as f64 * 100.0
-                } else {
-                    100.0
-                };
-                eprintln!(
-                    "{}: {} spots, {} reads written, {} downloaded ({} of {})",
-                    style::header(&stats.accession),
-                    style::count(stats.spots_read),
-                    style::count(stats.reads_written),
-                    style::value(format_size(stats.bytes_downloaded)),
-                    style::percentage(format!("{pct:.1}%")),
-                    style::value(format_size(stats.total_sra_size)),
-                );
-                for path in &stats.output_files {
-                    eprintln!("  -> {}", style::path(path.display()));
+                }) {
+                    Ok(stats) => {
+                        let pct = if stats.total_sra_size > 0 {
+                            stats.bytes_downloaded as f64 / stats.total_sra_size as f64 * 100.0
+                        } else {
+                            100.0
+                        };
+                        eprintln!(
+                            "{}: {} spots, {} reads written, {} downloaded ({} of {})",
+                            style::header(&stats.accession),
+                            style::count(stats.spots_read),
+                            style::count(stats.reads_written),
+                            style::value(format_size(stats.bytes_downloaded)),
+                            style::percentage(format!("{pct:.1}%")),
+                            style::value(format_size(stats.total_sra_size)),
+                        );
+                        for path in &stats.output_files {
+                            eprintln!("  -> {}", style::path(path.display()));
+                        }
+                        completed_accessions.push(resolved.accession.clone());
+                    }
+                    Err(sracha_core::error::Error::Cancelled { .. }) => {
+                        interrupted_accession = Some(resolved.accession.clone());
+                        break;
+                    }
+                    Err(e) => return Err(e.into()),
                 }
+            }
+
+            // Abort any in-flight prefetch download.
+            if let Some(handle) = pending_download.take() {
+                handle.abort();
+            }
+
+            // Print summary and exit if interrupted.
+            if cancelled.load(Ordering::Relaxed) {
+                let interrupted = interrupted_accession.as_deref().unwrap_or("unknown");
+                if completed_accessions.is_empty() {
+                    eprintln!(
+                        "Interrupted -- cleaned up partial files for {}.",
+                        style::header(interrupted),
+                    );
+                } else {
+                    eprintln!(
+                        "Interrupted -- cleaned up partial files for {}. Completed: {}",
+                        style::header(interrupted),
+                        completed_accessions.join(", "),
+                    );
+                }
+                std::process::exit(130);
             }
 
             Ok(())

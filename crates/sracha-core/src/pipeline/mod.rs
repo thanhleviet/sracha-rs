@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::compress::{DEFAULT_BLOCK_SIZE, ParGzWriter};
 use crate::download::{DownloadConfig, download_file};
@@ -56,6 +57,8 @@ pub struct PipelineConfig {
     pub run_info: Option<crate::sdl::RunInfo>,
     /// Output FASTA instead of FASTQ (drops quality line).
     pub fasta: bool,
+    /// Flag for graceful cancellation (e.g. Ctrl-C).
+    pub cancelled: Option<Arc<AtomicBool>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1263,6 +1266,12 @@ fn decode_and_write(
         // ---- Decode loop (main thread) ----
         let mut blob_idx: usize = 0;
         while blob_idx < num_blobs {
+            if let Some(ref flag) = config.cancelled
+                && flag.load(Ordering::Relaxed)
+            {
+                break;
+            }
+
             let batch_end = (blob_idx + BATCH_SIZE).min(num_blobs);
             let batch_len = batch_end - blob_idx;
 
@@ -1424,11 +1433,23 @@ fn decode_and_write(
 
     write_result?;
 
+    // If cancelled, drop writers without finalizing and return Cancelled
+    // with the list of partial output files so the caller can delete them.
+    if let Some(ref flag) = config.cancelled
+        && flag.load(Ordering::Relaxed)
+    {
+        if let Some(pb) = decode_pb {
+            pb.finish_and_clear();
+        }
+        drop(writers);
+        return Err(Error::Cancelled { output_files });
+    }
+
     if let Some(pb) = decode_pb {
         pb.finish_and_clear();
     }
 
-    let total_spots = spots_read.load(std::sync::atomic::Ordering::Relaxed);
+    let total_spots = spots_read.load(Ordering::Relaxed);
     tracing::info!(
         "{accession}: streaming decode complete -- {total_spots} spots, {reads_written} reads written",
     );
@@ -1777,14 +1798,26 @@ pub async fn download_sra(
         temp_path.display(),
     );
 
-    let dl_result = download_file(
+    let dl_future = download_file(
         &urls,
         total_sra_size,
         resolved.sra_file.md5.as_deref(),
         &temp_path,
         &dl_config,
-    )
-    .await?;
+    );
+
+    let dl_result = if let Some(ref flag) = config.cancelled {
+        let flag = flag.clone();
+        tokio::select! {
+            result = dl_future => result?,
+            _ = poll_cancelled(flag) => {
+                tracing::info!("{accession}: download cancelled");
+                return Err(Error::Cancelled { output_files: vec![] });
+            }
+        }
+    } else {
+        dl_future.await?
+    };
 
     tracing::info!(
         "{accession}: download complete ({})",
@@ -1800,17 +1833,50 @@ pub async fn download_sra(
     })
 }
 
+/// Poll an `AtomicBool` flag until it becomes `true`.
+async fn poll_cancelled(flag: Arc<AtomicBool>) {
+    loop {
+        if flag.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 /// Decode a previously downloaded SRA file into FASTQ and clean up the temp file.
 ///
 /// This is the decode phase of `run_get`. Call from within
 /// `tokio::task::block_in_place` or a blocking thread.
 pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result<PipelineStats> {
-    let (spots_read, reads_written, output_files) = decode_and_write(
+    let (spots_read, reads_written, output_files) = match decode_and_write(
         &downloaded.temp_path,
         &downloaded.accession,
         config,
         downloaded.is_lite,
-    )?;
+    ) {
+        Ok(result) => result,
+        Err(Error::Cancelled { output_files }) => {
+            // Delete partial FASTQ output files; keep temp SRA for resume.
+            for path in &output_files {
+                if let Err(e) = std::fs::remove_file(path) {
+                    tracing::warn!(
+                        "{}: failed to remove partial file {}: {e}",
+                        downloaded.accession,
+                        path.display(),
+                    );
+                }
+            }
+            tracing::info!(
+                "{}: cancelled, cleaned up {} partial output file(s)",
+                downloaded.accession,
+                output_files.len(),
+            );
+            return Err(Error::Cancelled {
+                output_files: vec![],
+            });
+        }
+        Err(e) => return Err(e),
+    };
 
     // Clean up temp file.
     if let Err(e) = std::fs::remove_file(&downloaded.temp_path) {
