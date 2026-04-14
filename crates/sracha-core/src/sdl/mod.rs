@@ -16,6 +16,49 @@ const EUTILS_EFETCH_URL: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/e
 /// Maximum UIDs per EFetch request to stay within URL length limits.
 const EFETCH_BATCH_SIZE: usize = 500;
 
+/// Maximum retry attempts for HTTP 429 / 5xx responses.
+const MAX_API_RETRIES: u32 = 3;
+
+/// HTTP GET with automatic retry on 429 (Too Many Requests) and 5xx errors.
+///
+/// Uses exponential backoff (1s, 2s, 4s) with random jitter (0-500ms) to
+/// avoid thundering-herd effects when NCBI rate-limits concurrent requests.
+async fn http_get_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+) -> std::result::Result<reqwest::Response, reqwest::Error> {
+    for attempt in 0..=MAX_API_RETRIES {
+        let resp = client.get(url).send().await?;
+        let status = resp.status();
+
+        if (status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
+            && attempt < MAX_API_RETRIES
+        {
+            let base = std::time::Duration::from_secs(1 << attempt);
+            let jitter = std::time::Duration::from_millis(rand_jitter_ms());
+            let delay = base + jitter;
+            tracing::warn!(
+                "HTTP {status} from {url}, retry {}/{MAX_API_RETRIES} in {delay:?}",
+                attempt + 1
+            );
+            tokio::time::sleep(delay).await;
+            continue;
+        }
+
+        return Ok(resp);
+    }
+    unreachable!()
+}
+
+/// Cheap pseudo-random jitter (0-500ms) without pulling in the `rand` crate.
+fn rand_jitter_ms() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    (nanos % 500) as u64
+}
+
 /// A single download mirror for a resolved file.
 #[derive(Debug, Clone)]
 pub struct ResolvedMirror {
@@ -96,9 +139,11 @@ impl SdlClient {
 
         tracing::debug!("SDL request: {url}");
 
-        let resp = self.http.get(url).send().await.map_err(|e| Error::Sdl {
-            message: e.to_string(),
-        })?;
+        let resp = http_get_with_retry(&self.http, url.as_str())
+            .await
+            .map_err(|e| Error::Sdl {
+                message: e.to_string(),
+            })?;
 
         if !resp.status().is_success() {
             return Err(Error::Sdl {
@@ -166,7 +211,7 @@ impl SdlClient {
 
         tracing::debug!("EUtils RunInfo request: {url}");
 
-        let resp = match self.http.get(&url).send().await {
+        let resp = match http_get_with_retry(&self.http, &url).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("{accession}: EUtils RunInfo request failed: {e}");
@@ -212,10 +257,7 @@ impl SdlClient {
             format!("{EUTILS_ESEARCH_URL}?db=sra&term={term}&retmax=10000&retmode=json");
         tracing::debug!("ESearch request: {search_url}");
 
-        let resp = self
-            .http
-            .get(&search_url)
-            .send()
+        let resp = http_get_with_retry(&self.http, &search_url)
             .await
             .map_err(|e| Error::Sdl {
                 message: format!("{accession}: ESearch request failed: {e}"),
@@ -262,10 +304,7 @@ impl SdlClient {
 
             tracing::debug!("EFetch RunInfo batch request ({} UIDs)", chunk.len());
 
-            let resp = self
-                .http
-                .get(&fetch_url)
-                .send()
+            let resp = http_get_with_retry(&self.http, &fetch_url)
                 .await
                 .map_err(|e| Error::Sdl {
                     message: format!("{accession}: EFetch request failed: {e}"),
