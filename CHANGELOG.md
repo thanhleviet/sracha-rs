@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.2 (2026-04-14)
+
 ### Added
 
 - **Direct S3 fetch**: Downloads now probe the NCBI SRA Open Data S3 bucket
