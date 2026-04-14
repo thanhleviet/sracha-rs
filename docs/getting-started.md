@@ -10,7 +10,7 @@ sracha get SRR000001
 
 This will:
 
-1. Resolve the accession via the NCBI SDL API
+1. Resolve the accession via direct S3 URL (with SDL API fallback)
 2. Download the SRA file using parallel chunked HTTP
 3. Parse the VDB format natively
 4. Output compressed FASTQ files (gzipped by default)
@@ -91,18 +91,87 @@ Quality scores will be uniform: Q30 for pass-filter reads, Q3 for rejects.
 | split-spot | `--split split-spot` | single file |
 | interleaved | `--split interleaved` | single file, R1/R2 alternating |
 
+## Compression options
+
+By default, output is gzip-compressed. You can tune this or switch
+to zstd:
+
+```bash
+# Faster gzip (lower ratio)
+sracha get SRR000001 --gzip-level 1
+
+# No compression at all
+sracha get SRR000001 --no-gzip
+
+# Use zstd instead of gzip
+sracha get SRR000001 --zstd
+
+# Zstd with a specific level (1-22)
+sracha get SRR000001 --zstd --zstd-level 10
+```
+
+## FASTA output
+
+To drop quality scores and output FASTA instead of FASTQ:
+
+```bash
+sracha get SRR000001 --fasta
+sracha fastq SRR000001.sra --fasta
+```
+
+## Piping to stdout
+
+Use `-Z` to write interleaved output to stdout, useful for piping
+into other tools:
+
+```bash
+sracha fastq SRR000001.sra --split interleaved -Z | bwa mem -p ref.fa -
+```
+
+## Validating files
+
+After downloading, you can verify that an SRA file is intact:
+
+```bash
+sracha validate SRR000001.sra
+```
+
+This decodes all records and reports any errors. Useful after a
+transfer that may have been interrupted.
+
 ## Performance tuning
 
 ```bash
 # More download connections (default: 8)
 sracha get SRR000001 --connections 12
 
-# More threads for decode (default: 8)
+# More threads for decode and compression (default: 8)
 sracha get SRR000001 --threads 16
+```
 
-# Faster compression (lower ratio)
-sracha get SRR000001 --gzip-level 1
+## Download behavior
 
-# No compression at all
-sracha get SRR000001 --no-gzip
+Downloads are resumable by default — if a transfer is interrupted,
+re-running the same command picks up where it left off. To force
+a fresh download:
+
+```bash
+sracha fetch SRR000001 --no-resume
+```
+
+For very large downloads (>500 GiB), sracha prompts for confirmation.
+Skip it with `-y`:
+
+```bash
+sracha get --accession-list big_list.txt -y
+```
+
+## Verbose logging
+
+Use `-v` for more detail, `-vv` for debug output, or `-q` to suppress
+everything except errors:
+
+```bash
+sracha -vv get SRR000001
+sracha -q get --accession-list SRR_Acc_List.txt
 ```

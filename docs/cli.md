@@ -1,5 +1,16 @@
 # CLI reference
 
+## Global options
+
+These options can be used with any subcommand.
+
+| Option | Description |
+|--------|-------------|
+| `-v, --verbose` | Increase log verbosity (`-v`, `-vv`, `-vvv`) |
+| `-q, --quiet` | Suppress all output except errors |
+| `--version` | Print version |
+| `-h, --help` | Print help |
+
 ## Accession types
 
 sracha accepts three types of accessions:
@@ -45,19 +56,47 @@ sracha get [OPTIONS] [ACCESSION]...
 
 ### Options
 
+**Input / output**
+
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--accession-list` | | Read accessions from a file (one per line) |
-| `-O, --output-dir` | `.` | Output directory |
-| `--format` | `sra` | Preferred format: `sra` or `sralite` |
-| `--split` | `split-3` | Split mode: `split-3`, `split-files`, `split-spot`, `interleaved` |
-| `--no-gzip` | | Disable gzip (compressed by default) |
-| `--gzip-level` | `6` | Compression level (1-9) |
-| `-t, --threads` | `8` | Thread count |
-| `--connections` | `8` | HTTP connections per file |
-| `--min-read-len` | | Minimum read length filter |
-| `--include-technical` | | Include technical reads |
+| `--accession-list <FILE>` | | Read accessions from a file (one per line) |
+| `-O, --output-dir <DIR>` | `.` | Output directory |
+| `--format <FORMAT>` | `sra` | Preferred format: `sra` or `sralite` |
 | `-f, --force` | | Overwrite existing files |
+
+**Sequence output**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--split <MODE>` | `split-3` | Split mode: `split-3`, `split-files`, `split-spot`, `interleaved` |
+| `--fasta` | | Output FASTA instead of FASTQ (drops quality scores) |
+| `--min-read-len <N>` | | Minimum read length filter |
+| `--include-technical` | | Include technical reads (skipped by default) |
+
+**Compression**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--no-gzip` | | Disable gzip compression (compressed by default) |
+| `--gzip-level <N>` | `6` | Gzip compression level (1-9) |
+| `--zstd` | | Use zstd compression instead of gzip |
+| `--zstd-level <N>` | `3` | Zstd compression level (1-22) |
+
+**Performance**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-t, --threads <N>` | `8` | Thread count for decode and compression |
+| `--connections <N>` | `8` | HTTP connections per file |
+
+**Download behavior**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--no-resume` | | Disable download resume (re-download from scratch) |
+| `-y, --yes` | | Skip confirmation prompt for large downloads (>500 GiB) |
+| `--prefer-sdl` | | Skip direct S3 and resolve via the SDL API |
 | `--no-progress` | | Disable progress bar |
 
 ---
@@ -80,19 +119,22 @@ sracha fetch [OPTIONS] [ACCESSION]...
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--accession-list` | | Read accessions from a file (one per line) |
-| `-O, --output-dir` | `.` | Output directory |
-| `--format` | `sra` | Preferred format: `sra` or `sralite` |
-| `--connections` | `8` | HTTP connections per file |
+| `--accession-list <FILE>` | | Read accessions from a file (one per line) |
+| `-O, --output-dir <DIR>` | `.` | Output directory |
+| `--format <FORMAT>` | `sra` | Preferred format: `sra` or `sralite` |
+| `--connections <N>` | `8` | HTTP connections per file |
 | `--validate` | | Verify MD5 after download |
 | `-f, --force` | | Overwrite existing files |
+| `--no-resume` | | Disable download resume (re-download from scratch) |
+| `-y, --yes` | | Skip confirmation prompt for large downloads (>500 GiB) |
+| `--prefer-sdl` | | Skip direct S3 and resolve via the SDL API |
 | `--no-progress` | | Disable progress bar |
 
 ---
 
 ## sracha fastq
 
-Convert local SRA files to FASTQ.
+Convert SRA files to FASTQ (or FASTA).
 
 ```
 sracha fastq [OPTIONS] <INPUT>...
@@ -102,20 +144,35 @@ sracha fastq [OPTIONS] <INPUT>...
 
 | Argument | Description |
 |----------|-------------|
-| `INPUT` | Local `.sra` file path(s) |
+| `INPUT` | SRA accession(s) or local `.sra` file path(s) |
 
 ### Options
 
+**Sequence output**
+
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--split` | `split-3` | Split mode |
-| `--no-gzip` | | Disable gzip |
-| `--gzip-level` | `6` | Compression level (1-9) |
-| `-t, --threads` | `8` | Thread count |
-| `--min-read-len` | | Minimum read length filter |
-| `--include-technical` | | Include technical reads |
-| `-Z, --stdout` | | Write to stdout |
-| `-O, --output-dir` | `.` | Output directory |
+| `--split <MODE>` | `split-3` | Split mode: `split-3`, `split-files`, `split-spot`, `interleaved` |
+| `--fasta` | | Output FASTA instead of FASTQ (drops quality scores) |
+| `--min-read-len <N>` | | Minimum read length filter |
+| `--include-technical` | | Include technical reads (skipped by default) |
+| `-Z, --stdout` | | Write to stdout (implies `--no-progress`) |
+
+**Compression**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--no-gzip` | | Disable gzip compression (compressed by default) |
+| `--gzip-level <N>` | `6` | Gzip compression level (1-9) |
+| `--zstd` | | Use zstd compression instead of gzip |
+| `--zstd-level <N>` | `3` | Zstd compression level (1-22) |
+
+**Other**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-t, --threads <N>` | `8` | Thread count for decode and compression |
+| `-O, --output-dir <DIR>` | `.` | Output directory |
 | `-f, --force` | | Overwrite existing files |
 | `--no-progress` | | Disable progress bar |
 
@@ -139,8 +196,31 @@ sracha info [OPTIONS] [ACCESSION]...
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--accession-list` | | Read accessions from a file (one per line) |
+| `--accession-list <FILE>` | | Read accessions from a file (one per line) |
 
 Displays file sizes, available formats, download mirrors, and quality
 information for each accession. Study and BioProject accessions are
 resolved to runs first.
+
+---
+
+## sracha validate
+
+Validate SRA file integrity by decoding all records and checking for errors.
+
+```
+sracha validate [OPTIONS] <INPUT>...
+```
+
+### Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `INPUT` | SRA file(s) to validate |
+
+### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-t, --threads <N>` | `8` | Thread count for decode |
+| `--no-progress` | | Disable progress bar |

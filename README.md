@@ -9,9 +9,12 @@ Fast SRA downloader and FASTQ converter, written in pure Rust.
 - **Integrated pipeline** -- download, convert, and compress in one command
 - **Project-level accessions** -- pass a BioProject (PRJNA) or study (SRP) to download all runs
 - **Accession lists** -- batch download from a file with `--accession-list`
-- **Parallel gzip** -- pigz-style block compression via rayon
+- **Parallel gzip or zstd** -- pigz-style block compression via rayon
+- **FASTA output** -- drop quality scores with `--fasta`
 - **SRA and SRA-lite** -- full quality or simplified quality scores
 - **Split modes** -- split-3, split-files, split-spot, interleaved
+- **Resumable downloads** -- picks up where it left off on interruption
+- **File validation** -- verify SRA file integrity
 
 ## Quick start
 
@@ -33,37 +36,24 @@ sracha fastq SRR000001.sra
 
 # Show accession info
 sracha info SRR000001
+
+# Validate a downloaded file
+sracha validate SRR000001.sra
 ```
 
-## Building
+## Installation
 
-Requires Rust 1.92+.
+Download pre-built binaries from the
+[releases page](https://github.com/rnabioco/sracha-rs/releases),
+or install from source:
 
 ```bash
-cargo build --release
+cargo install --git https://github.com/rnabioco/sracha-rs sracha
 ```
 
-Or with pixi:
+## Documentation
 
-```bash
-pixi run release
-```
-
-## Architecture
-
-```mermaid
-flowchart TD
-    A[sracha get SRR000001] --> B[SDL Resolve]
-    B -->|mirror URLs| C[Parallel Download]
-    C -->|".sra file"| D[KAR Archive Parse]
-    D --> E[VDB Column Decode]
-    E -->|"READ, QUALITY,\nREAD_LEN, NAME"| F[FASTQ Format]
-    F --> G[Parallel gzip]
-    G --> H["_1.fastq.gz\n_2.fastq.gz"]
-
-    style A fill:#4a9eff,color:#fff
-    style H fill:#2ecc71,color:#fff
-```
+Full CLI reference and usage guide: <https://rnabioco.github.io/sracha-rs/>
 
 ## License
 

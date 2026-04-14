@@ -9,22 +9,21 @@ Fast SRA downloader and FASTQ converter, written in pure Rust.
 - **Integrated pipeline** -- download, convert, and compress in one command
 - **Project-level accessions** -- pass a BioProject (PRJNA) or study (SRP) to download all runs
 - **Accession lists** -- batch download from a file with `--accession-list`
-- **Parallel gzip** -- pigz-style block compression via rayon
+- **Parallel gzip or zstd** -- pigz-style block compression via rayon
+- **FASTA output** -- drop quality scores with `--fasta`
 - **SRA and SRA-lite** -- full quality or simplified quality scores
 - **Split modes** -- split-3, split-files, split-spot, interleaved
+- **Resumable downloads** -- automatically resumes interrupted transfers
+- **File validation** -- verify SRA file integrity with `sracha validate`
 
-## Architecture
+## How it works
 
-``` mermaid
-graph LR
-  A["sracha get SRR..."] --> B["SDL Resolve"]
-  B --> C["Parallel Download"]
-  C --> D["KAR Archive Parse"]
-  D --> E["VDB Column Decode"]
-  E --> F["FASTQ Format"]
-  F --> G["Parallel Gzip"]
-  G --> H["*.fastq.gz"]
-```
+`sracha get` runs the full pipeline in one command:
+
+1. **Resolve** -- looks up the accession via direct S3 URL (with SDL API fallback)
+2. **Download** -- fetches the `.sra` file with parallel chunked HTTP Range requests
+3. **Parse** -- reads the KAR archive and decodes VDB columns (READ, QUALITY, READ_LEN, NAME)
+4. **Output** -- formats FASTQ (or FASTA) records and compresses with parallel gzip/zstd
 
 ## Quick start
 
@@ -46,7 +45,13 @@ sracha fastq SRR000001.sra
 
 # Show accession info
 sracha info SRR000001
+
+# Validate a downloaded file
+sracha validate SRR000001.sra
 ```
+
+See the [Getting Started](getting-started.md) guide for more examples, or
+the [CLI Reference](cli.md) for all options.
 
 ## Installation
 
@@ -56,6 +61,8 @@ Download pre-built binaries from the
 [releases page](https://github.com/rnabioco/sracha-rs/releases).
 
 ### From source
+
+Requires Rust 1.92+.
 
 ```bash
 cargo install --git https://github.com/rnabioco/sracha-rs sracha
