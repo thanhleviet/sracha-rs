@@ -17,9 +17,9 @@ sracha accepts three types of accessions:
 
 | Type | Prefixes | Example | Description |
 |------|----------|---------|-------------|
-| Run | SRR, ERR, DRR | `SRR1234567` | Single sequencing run (directly downloadable) |
+| Run | SRR, ERR, DRR | `SRR2584863` | Single sequencing run (directly downloadable) |
 | Study | SRP, ERP, DRP | `SRP123456` | Study containing multiple runs |
-| BioProject | PRJNA, PRJEB, PRJDB | `PRJNA123456` | BioProject containing multiple runs |
+| BioProject | PRJNA, PRJEB, PRJDB | `PRJNA675068` | BioProject containing multiple runs |
 
 Study and BioProject accessions are automatically resolved to their
 constituent run accessions via the NCBI EUtils API.

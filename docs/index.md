@@ -32,7 +32,7 @@ Fast SRA downloader and FASTQ converter, written in pure Rust.
 sracha get SRR000001
 
 # Download all runs from a BioProject
-sracha get PRJNA123456
+sracha get PRJNA675068
 
 # Batch download from an accession list
 sracha get --accession-list SRR_Acc_List.txt

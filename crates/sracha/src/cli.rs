@@ -18,24 +18,24 @@ const STYLES: Styles = Styles::styled()
     after_help = "\
 Examples:
   Download and convert to FASTQ in one shot:
-    sracha get SRR1234567
+    sracha get SRR2584863
 
   Download all runs from a BioProject or study:
-    sracha get PRJNA123456
+    sracha get PRJNA675068
     sracha get SRP123456
 
   Download from an accession list file:
     sracha get --accession-list SRR_Acc_List.txt
 
   Fetch SRA file, then convert separately:
-    sracha fetch SRR1234567
-    sracha fastq SRR1234567.sra
+    sracha fetch SRR2584863
+    sracha fastq SRR2584863.sra
 
   Interleaved paired-end output to stdout:
-    sracha fastq SRR1234567.sra --split interleaved -Z
+    sracha fastq SRR2584863.sra --split interleaved -Z
 
   Show accession metadata:
-    sracha info SRR1234567
+    sracha info SRR2584863
 
 Documentation:
   https://rnabioco.github.io/sracha-rs/"

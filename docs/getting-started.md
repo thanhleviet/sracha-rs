@@ -23,7 +23,7 @@ You can pass a BioProject or study accession to download all runs at once:
 
 ```bash
 # Download all runs in a BioProject
-sracha get PRJNA123456
+sracha get PRJNA675068
 
 # Download all runs in a study
 sracha get SRP123456
@@ -38,9 +38,9 @@ For batch downloads, create a text file with one accession per line:
 
 ```bash
 # SRR_Acc_List.txt
-SRR1234567
-SRR1234568
-SRR1234569
+SRR2584863
+SRR2584866
+SRR2589044
 ```
 
 Then pass it with `--accession-list`:

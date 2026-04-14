@@ -77,7 +77,7 @@
 
 ### Added
 
-- **Project-level accessions**: `sracha get PRJNA123456` and `sracha get SRP123456`
+- **Project-level accessions**: `sracha get PRJNA675068` and `sracha get SRP123456`
   resolve study/BioProject accessions to constituent runs via NCBI EUtils API.
 - **Accession list input**: `--accession-list` flag on `get`, `fetch`, and `info`
   reads accessions from a file (one per line, `#` comments supported).
