@@ -5,7 +5,16 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::EnvFilter;
+
+struct LocalTimer;
+
+impl FormatTime for LocalTimer {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        write!(w, "{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z"))
+    }
+}
 
 use cli::{Cli, Command};
 use sracha_core::accession::{self, InputAccession};
@@ -26,6 +35,7 @@ async fn main() -> Result<()> {
         _ => "trace",
     };
     tracing_subscriber::fmt()
+        .with_timer(LocalTimer)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter)),
         )

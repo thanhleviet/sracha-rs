@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 sracha-core.workspace = true
+chrono.workspace = true
 clap.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
