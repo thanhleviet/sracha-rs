@@ -404,39 +404,8 @@ fn page_map_deserialize_v1(data: &[u8], row_count: u64) -> Result<PageMap> {
         decompressed.extend_from_slice(&body);
     }
 
-    // Now deserialize as v0 with the full decompressed data.
-    tracing::debug!(
-        "page_map_v1: variant={variant}, hsize={hsize}, decompressed_len={}, first_20_bytes={:02x?}",
-        decompressed.len(),
-        &decompressed[..decompressed.len().min(20)],
-    );
-    let result = page_map_deserialize_v0(&decompressed, row_count);
-    if let Ok(ref pm) = result {
-        let bad = pm.lengths.iter().filter(|&&v| v > 1000).count();
-        if bad > 0 {
-            let first_bad_idx = pm.lengths.iter().position(|&v| v > 100_000).unwrap_or(0);
-            tracing::warn!(
-                "page_map: {bad} of {} lengths > 100K. First bad at [{first_bad_idx}]={}, context: {:?}",
-                pm.lengths.len(),
-                pm.lengths[first_bad_idx],
-                &pm.lengths
-                    [first_bad_idx.saturating_sub(2)..pm.lengths.len().min(first_bad_idx + 3)],
-            );
-            // Show raw bytes around where the bad value was decoded from
-            // v0 variant 2: header = byte[0] + vlen(leng_recs), then data
-            let v0_variant = decompressed[0] & 3;
-            if v0_variant == 2 && decompressed.len() > 3 {
-                let (lr, lr_sz) = vlen_decode_u64(&decompressed[1..]).unwrap_or((0, 1));
-                let body_start = 1 + lr_sz;
-                tracing::warn!(
-                    "v0 variant=2, leng_recs={lr}, body_start={body_start}, decompressed_len={}, body bytes[0..20]={:02x?}",
-                    decompressed.len(),
-                    &decompressed[body_start..decompressed.len().min(body_start + 20)],
-                );
-            }
-        }
-    }
-    result
+    // Deserialize as v0 with the full decompressed data.
+    page_map_deserialize_v0(&decompressed, row_count)
 }
 
 // ---------------------------------------------------------------------------
@@ -632,24 +601,15 @@ fn decode_blob_v2(data: &[u8]) -> Result<BlobEnvelope> {
             if data.len() < 6 {
                 return Err(Error::Vdb("blob v2.2: too short".into()));
             }
-            let ms = u32::from(data[2])
-                | (u32::from(data[3]) << 8)
-                | (u32::from(data[4]) << 16)
-                | (u32::from(data[5]) << 24);
+            let ms = u32::from_le_bytes(data[2..6].try_into().unwrap());
             (u32::from(data[1]), ms, 6)
         }
         3 => {
             if data.len() < 9 {
                 return Err(Error::Vdb("blob v2.3: too short".into()));
             }
-            let hs = u32::from(data[1])
-                | (u32::from(data[2]) << 8)
-                | (u32::from(data[3]) << 16)
-                | (u32::from(data[4]) << 24);
-            let ms = u32::from(data[5])
-                | (u32::from(data[6]) << 8)
-                | (u32::from(data[7]) << 16)
-                | (u32::from(data[8]) << 24);
+            let hs = u32::from_le_bytes(data[1..5].try_into().unwrap());
+            let ms = u32::from_le_bytes(data[5..9].try_into().unwrap());
             (hs, ms, 9)
         }
         _ => {
@@ -810,99 +770,6 @@ pub fn decode_blob(
 // ---------------------------------------------------------------------------
 // Bit unpacking
 // ---------------------------------------------------------------------------
-
-/// Unpack bit-packed elements to their natural byte-aligned size.
-///
-/// `packed_bits` is the number of bits per packed element (e.g. 2 for 2na DNA).
-/// `unpacked_bits` is the target element size in bits (must be 8, 16, 32, or 64).
-/// `src` is the packed byte stream (big-endian bit order).
-/// `num_elements` is the number of elements to unpack.
-///
-/// Returns a byte vector with `num_elements * (unpacked_bits / 8)` bytes.
-pub fn unpack(
-    packed_bits: u32,
-    unpacked_bits: u32,
-    src: &[u8],
-    num_elements: u32,
-) -> Result<Vec<u8>> {
-    if packed_bits == 0 || unpacked_bits == 0 {
-        return Err(Error::Vdb("unpack: zero bit width".into()));
-    }
-    if packed_bits > unpacked_bits {
-        return Err(Error::Vdb(format!(
-            "unpack: packed_bits ({packed_bits}) > unpacked_bits ({unpacked_bits})"
-        )));
-    }
-    if !matches!(unpacked_bits, 8 | 16 | 32 | 64) {
-        return Err(Error::Vdb(format!(
-            "unpack: unpacked_bits must be 8/16/32/64, got {unpacked_bits}"
-        )));
-    }
-
-    if num_elements == 0 {
-        return Ok(vec![]);
-    }
-
-    // Trivial case: no packing needed.
-    if packed_bits == unpacked_bits && unpacked_bits == 8 {
-        let count = num_elements as usize;
-        if src.len() < count {
-            return Err(Error::Vdb("unpack: source too short".into()));
-        }
-        return Ok(src[..count].to_vec());
-    }
-
-    let out_bytes = (unpacked_bits / 8) as usize;
-    let mut result = vec![0u8; num_elements as usize * out_bytes];
-
-    // Read packed elements from the big-endian bit stream.
-    let mut bit_offset: u64 = 0;
-    for i in 0..num_elements as usize {
-        let value = read_bits_be(src, bit_offset, packed_bits)?;
-        bit_offset += packed_bits as u64;
-
-        // Write as little-endian (native x86).
-        let dst_offset = i * out_bytes;
-        match unpacked_bits {
-            8 => {
-                result[dst_offset] = value as u8;
-            }
-            16 => {
-                let bytes = (value as u16).to_le_bytes();
-                result[dst_offset..dst_offset + 2].copy_from_slice(&bytes);
-            }
-            32 => {
-                let bytes = (value as u32).to_le_bytes();
-                result[dst_offset..dst_offset + 4].copy_from_slice(&bytes);
-            }
-            64 => {
-                let bytes = value.to_le_bytes();
-                result[dst_offset..dst_offset + 8].copy_from_slice(&bytes);
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    Ok(result)
-}
-
-/// Read `n_bits` (up to 64) from a big-endian bit stream starting at `bit_offset`.
-fn read_bits_be(src: &[u8], bit_offset: u64, n_bits: u32) -> Result<u64> {
-    let mut value: u64 = 0;
-    for bit in 0..n_bits {
-        let abs_bit = bit_offset + bit as u64;
-        let byte_idx = (abs_bit / 8) as usize;
-        let bit_in_byte = 7 - (abs_bit % 8); // MSB first
-
-        if byte_idx >= src.len() {
-            return Err(Error::Vdb("read_bits_be: out of bounds".into()));
-        }
-
-        let bit_val = (src[byte_idx] >> bit_in_byte) & 1;
-        value = (value << 1) | u64::from(bit_val);
-    }
-    Ok(value)
-}
 
 // ---------------------------------------------------------------------------
 // izip (integer compression) decoder
@@ -1758,6 +1625,71 @@ pub fn irzip_decode(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Test-only helpers (not used in production pipeline)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+fn read_bits_be(src: &[u8], bit_offset: u64, n_bits: u32) -> Result<u64> {
+    let mut value: u64 = 0;
+    for bit in 0..n_bits {
+        let abs_bit = bit_offset + bit as u64;
+        let byte_idx = (abs_bit / 8) as usize;
+        let bit_in_byte = 7 - (abs_bit % 8);
+
+        if byte_idx >= src.len() {
+            return Err(Error::Vdb("read_bits_be: out of bounds".into()));
+        }
+
+        let bit_val = (src[byte_idx] >> bit_in_byte) & 1;
+        value = (value << 1) | u64::from(bit_val);
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+fn unpack(packed_bits: u32, unpacked_bits: u32, src: &[u8], num_elements: u32) -> Result<Vec<u8>> {
+    if packed_bits == 0 || unpacked_bits == 0 {
+        return Err(Error::Vdb("unpack: zero bit width".into()));
+    }
+    if packed_bits > unpacked_bits {
+        return Err(Error::Vdb(format!(
+            "unpack: packed_bits ({packed_bits}) > unpacked_bits ({unpacked_bits})"
+        )));
+    }
+    if !matches!(unpacked_bits, 8 | 16 | 32 | 64) {
+        return Err(Error::Vdb(format!(
+            "unpack: unpacked_bits must be 8/16/32/64, got {unpacked_bits}"
+        )));
+    }
+    if num_elements == 0 {
+        return Ok(vec![]);
+    }
+    if packed_bits == unpacked_bits && unpacked_bits == 8 {
+        let count = num_elements as usize;
+        if src.len() < count {
+            return Err(Error::Vdb("unpack: source too short".into()));
+        }
+        return Ok(src[..count].to_vec());
+    }
+    let out_bytes = (unpacked_bits / 8) as usize;
+    let mut result = vec![0u8; num_elements as usize * out_bytes];
+    let mut bit_offset: u64 = 0;
+    for i in 0..num_elements as usize {
+        let value = read_bits_be(src, bit_offset, packed_bits)?;
+        bit_offset += packed_bits as u64;
+        let dst_offset = i * out_bytes;
+        match unpacked_bits {
+            8 => result[dst_offset] = value as u8,
+            16 => result[dst_offset..dst_offset + 2].copy_from_slice(&(value as u16).to_le_bytes()),
+            32 => result[dst_offset..dst_offset + 4].copy_from_slice(&(value as u32).to_le_bytes()),
+            64 => result[dst_offset..dst_offset + 8].copy_from_slice(&value.to_le_bytes()),
+            _ => unreachable!(),
+        }
+    }
+    Ok(result)
+}
 
 #[cfg(test)]
 mod tests {

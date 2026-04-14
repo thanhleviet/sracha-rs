@@ -10,7 +10,7 @@
 //!
 //! The [`ColumnReader`] loads index files into memory and reads column data
 //! lazily from disk, providing row-level access via
-//! [`read_blob_for_row`](ColumnReader::read_blob_for_row).
+//! [`read_raw_blob_slice`](ColumnReader::read_raw_blob_slice).
 //!
 //! ## idx1/idx2 block index format
 //!
@@ -430,118 +430,97 @@ fn parse_idx2_block(idx2_slice: &[u8], block: &BlockLoc) -> Result<Vec<BlobLoc>>
         )));
     }
 
-    // Helper closures to read arrays from the slice.
     let read_u32_at = |off: usize| -> u32 { LittleEndian::read_u32(&idx2_slice[off..off + 4]) };
     let read_u64_at = |off: usize| -> u64 { LittleEndian::read_u64(&idx2_slice[off..off + 8]) };
 
-    // --- Decode row ID info for each blob ---
-    let mut blob_start_ids: Vec<i64> = Vec::with_capacity(count);
-    let mut blob_id_ranges: Vec<u32> = Vec::with_capacity(count);
+    // Build BlobLocs directly — fill id fields first, then pg fields.
+    let mut blobs: Vec<BlobLoc> = Vec::with_capacity(count);
 
+    // --- Fill start_id and id_range ---
     match block.id_type {
         BlockType::Random => {
-            // d[i] = start_id, s[i] = id_range
             for i in 0..count {
-                let sid = read_u64_at(id_d_off + i * 8) as i64;
-                let rng = read_u32_at(id_s_off + i * 4);
-                blob_start_ids.push(sid);
-                blob_id_ranges.push(rng);
+                blobs.push(BlobLoc {
+                    start_id: read_u64_at(id_d_off + i * 8) as i64,
+                    id_range: read_u32_at(id_s_off + i * 4),
+                    pg: 0,
+                    size: 0,
+                });
             }
         }
         BlockType::Uniform => {
-            // h.span[0] = uniform id_range, d[i] = start_id
             let uniform_range = read_u32_at(id_h_off);
             for i in 0..count {
-                let sid = read_u64_at(id_d_off + i * 8) as i64;
-                blob_start_ids.push(sid);
-                blob_id_ranges.push(uniform_range);
+                blobs.push(BlobLoc {
+                    start_id: read_u64_at(id_d_off + i * 8) as i64,
+                    id_range: uniform_range,
+                    pg: 0,
+                    size: 0,
+                });
             }
         }
         BlockType::Magnitude => {
-            // h.first[0] = first_id (u64), s[i] = id_ranges (deltas).
-            // Start IDs are cumulative: id[0] = first_id, id[i+1] = id[i] + s[i].
-            let first_id = read_u64_at(id_h_off) as i64;
-            let mut cur_id = first_id;
+            let mut cur_id = read_u64_at(id_h_off) as i64;
             for i in 0..count {
                 let rng = read_u32_at(id_s_off + i * 4);
-                blob_start_ids.push(cur_id);
-                blob_id_ranges.push(rng);
+                blobs.push(BlobLoc {
+                    start_id: cur_id,
+                    id_range: rng,
+                    pg: 0,
+                    size: 0,
+                });
                 cur_id += rng as i64;
             }
         }
         BlockType::Predictable => {
-            // Sequential: ids_per = block.id_range / count.
-            // Blob i starts at block.start_id + i * ids_per.
-            let ids_per = if count > 0 && block.id_range as usize == count {
+            let ids_per = if block.id_range as usize == count {
                 1u32
-            } else if count > 0 {
-                block.id_range / count as u32
             } else {
-                0
+                block.id_range / count as u32
             };
             for i in 0..count {
-                let sid = block.start_id + (i as u32 * ids_per) as i64;
-                blob_start_ids.push(sid);
-                blob_id_ranges.push(ids_per);
+                blobs.push(BlobLoc {
+                    start_id: block.start_id + (i as u32 * ids_per) as i64,
+                    id_range: ids_per,
+                    pg: 0,
+                    size: 0,
+                });
             }
         }
     }
 
-    // --- Decode page (pg) and size info for each blob ---
-    let mut blob_pgs: Vec<u64> = Vec::with_capacity(count);
-    let mut blob_sizes: Vec<u32> = Vec::with_capacity(count);
-
+    // --- Fill pg and size ---
     match block.pg_type {
         BlockType::Random => {
-            // d[i] = pg, s[i] = size
-            for i in 0..count {
-                let pg = read_u64_at(pg_d_off + i * 8);
-                let sz = read_u32_at(pg_s_off + i * 4);
-                blob_pgs.push(pg);
-                blob_sizes.push(sz);
+            for (i, b) in blobs.iter_mut().enumerate() {
+                b.pg = read_u64_at(pg_d_off + i * 8);
+                b.size = read_u32_at(pg_s_off + i * 4);
             }
         }
         BlockType::Uniform => {
-            // h.span[0] = uniform size, d[i] = pg
             let uniform_size = read_u32_at(pg_h_off);
-            for i in 0..count {
-                let pg = read_u64_at(pg_d_off + i * 8);
-                blob_pgs.push(pg);
-                blob_sizes.push(uniform_size);
+            for (i, b) in blobs.iter_mut().enumerate() {
+                b.pg = read_u64_at(pg_d_off + i * 8);
+                b.size = uniform_size;
             }
         }
         BlockType::Magnitude => {
-            // h.first[0] = first_pg (u64), s[i] = sizes.
-            // Pages are cumulative: pg[0] = first_pg, pg[i+1] = pg[i] + s[i].
-            let first_pg = read_u64_at(pg_h_off);
-            let mut cur_pg = first_pg;
-            for i in 0..count {
+            let mut cur_pg = read_u64_at(pg_h_off);
+            for (i, b) in blobs.iter_mut().enumerate() {
                 let sz = read_u32_at(pg_s_off + i * 4);
-                blob_pgs.push(cur_pg);
-                blob_sizes.push(sz);
+                b.pg = cur_pg;
+                b.size = sz;
                 cur_pg += sz as u64;
             }
         }
         BlockType::Predictable => {
-            // h.pred = { pg: u64, sz: u32 }. Blob i at pg + sz*i, size = sz.
             let pred_pg = read_u64_at(pg_h_off);
             let pred_sz = read_u32_at(pg_h_off + 8);
-            for i in 0..count {
-                blob_pgs.push(pred_pg + pred_sz as u64 * i as u64);
-                blob_sizes.push(pred_sz);
+            for (i, b) in blobs.iter_mut().enumerate() {
+                b.pg = pred_pg + pred_sz as u64 * i as u64;
+                b.size = pred_sz;
             }
         }
-    }
-
-    // --- Combine into BlobLoc entries ---
-    let mut blobs = Vec::with_capacity(count);
-    for i in 0..count {
-        blobs.push(BlobLoc {
-            pg: blob_pgs[i],
-            size: blob_sizes[i],
-            id_range: blob_id_ranges[i],
-            start_id: blob_start_ids[i],
-        });
     }
 
     Ok(blobs)
@@ -643,36 +622,25 @@ fn parse_idx0(buf: &[u8]) -> Result<Vec<BlobLoc>> {
     Ok(blobs)
 }
 
-/// Try to decompress `data` as zlib. Returns decompressed bytes on success,
-/// or `None` if the data does not appear to be zlib-compressed.
+/// Create a synthetic single-blob locator covering all column data.
 ///
-/// Uses libdeflate for speed, with flate2 streaming fallback when the
-/// output size is not known in advance.
-fn try_zlib_decompress(data: &[u8]) -> Option<Vec<u8>> {
-    use crate::vdb::blob;
-
-    if data.is_empty() {
-        return None;
+/// Used when no blob locators are found in the index files.
+fn synthetic_single_blob(meta: &ColumnMeta, data_len: u64) -> BlobLoc {
+    let data_size = if meta.data_eof > 0 {
+        meta.data_eof.min(data_len) as u32
+    } else {
+        data_len as u32
+    };
+    tracing::debug!(
+        "creating single-blob column: {data_size} bytes of data (v{})",
+        meta.version,
+    );
+    BlobLoc {
+        pg: 0,
+        size: data_size,
+        id_range: 0,
+        start_id: 1,
     }
-
-    // Estimate output size: 4× input is a reasonable heuristic for VDB data.
-    let estimated = data.len() * 4;
-
-    // Try zlib format first (0x78 header).
-    if let Ok(out) = blob::zlib_decompress(data, estimated)
-        && !out.is_empty()
-    {
-        return Some(out);
-    }
-
-    // Try raw deflate (no header — VDB uses inflateInit2 with -15).
-    if let Ok(out) = blob::deflate_decompress(data, estimated)
-        && !out.is_empty()
-    {
-        return Some(out);
-    }
-
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -767,22 +735,7 @@ impl ColumnReader {
         // When no blob locators are available at all, create a single
         // synthetic blob covering all data.
         if blobs.is_empty() && !data_bytes.is_empty() {
-            let data_size = if meta.data_eof > 0 {
-                meta.data_eof.min(data_bytes.len() as u64) as u32
-            } else {
-                data_bytes.len() as u32
-            };
-            tracing::debug!(
-                "creating single-blob column: {} bytes of data (v{})",
-                data_size,
-                meta.version,
-            );
-            blobs.push(BlobLoc {
-                pg: 0,
-                size: data_size,
-                id_range: 0, // will be determined later
-                start_id: 1,
-            });
+            blobs.push(synthetic_single_blob(&meta, data_bytes.len() as u64));
         }
 
         Ok(Self {
@@ -839,22 +792,9 @@ impl ColumnReader {
             // synthetic blob because data_bytes was empty), create one
             // now using the on-disk file size.
             if reader.blobs.is_empty() && file_size > 0 {
-                let data_size = if reader.meta.data_eof > 0 {
-                    reader.meta.data_eof.min(file_size) as u32
-                } else {
-                    file_size as u32
-                };
-                tracing::debug!(
-                    "creating single-blob column: {} bytes of data on disk (v{})",
-                    data_size,
-                    reader.meta.version,
-                );
-                reader.blobs.push(BlobLoc {
-                    pg: 0,
-                    size: data_size,
-                    id_range: 0,
-                    start_id: 1,
-                });
+                reader
+                    .blobs
+                    .push(synthetic_single_blob(&reader.meta, file_size));
             }
 
             let file = std::fs::File::open(sra_path)?;
@@ -874,23 +814,10 @@ impl ColumnReader {
         Ok(reader)
     }
 
-    /// Read the (potentially decompressed) data for the blob that contains
-    /// `row_id`.
-    ///
-    /// For multi-row blobs this returns the entire blob's data; the caller is
-    /// responsible for splitting it by row within the blob.
-    pub fn read_blob_for_row(&self, row_id: i64) -> Result<Vec<u8>> {
-        let raw = self.read_raw_blob_for_row(row_id)?;
-
-        // Try zlib decompression; fall back to raw bytes.
-        Ok(try_zlib_decompress(&raw).unwrap_or(raw))
-    }
-
     /// Read the raw (unprocessed) blob bytes for a given row ID.
     ///
-    /// Unlike [`read_blob_for_row`], this does NOT attempt decompression.
-    /// The caller should use [`crate::vdb::blob::decode_blob`] for proper
-    /// envelope parsing, CRC validation, and decompression.
+    /// Does NOT attempt decompression. Use [`crate::vdb::blob::decode_blob`]
+    /// for proper envelope parsing, CRC validation, and decompression.
     pub fn read_raw_blob_for_row(&self, row_id: i64) -> Result<Vec<u8>> {
         self.read_raw_blob_slice(row_id).map(|s| s.to_vec())
     }
@@ -1040,6 +967,37 @@ pub(crate) mod test_helpers {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// Test-only convenience method: decompress + read in one call.
+// Production code uses read_raw_blob_slice() + decode_blob() instead.
+#[cfg(test)]
+fn try_zlib_decompress(data: &[u8]) -> Option<Vec<u8>> {
+    use crate::vdb::blob;
+
+    if data.is_empty() {
+        return None;
+    }
+    let estimated = data.len() * 4;
+    if let Ok(out) = blob::zlib_decompress(data, estimated)
+        && !out.is_empty()
+    {
+        return Some(out);
+    }
+    if let Ok(out) = blob::deflate_decompress(data, estimated)
+        && !out.is_empty()
+    {
+        return Some(out);
+    }
+    None
+}
+
+#[cfg(test)]
+impl ColumnReader {
+    pub fn read_blob_for_row(&self, row_id: i64) -> Result<Vec<u8>> {
+        let raw = self.read_raw_blob_for_row(row_id)?;
+        Ok(try_zlib_decompress(&raw).unwrap_or(raw))
+    }
+}
 
 #[cfg(test)]
 mod tests {

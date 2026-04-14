@@ -209,7 +209,10 @@ impl SdlClient {
     /// The outer `Result` fails if the SDL batch request itself fails.
     /// Individual per-accession failures (404, missing SRA file) are returned
     /// as `Err` entries in the inner `Vec`.
-    pub async fn resolve_many(&self, accessions: &[String]) -> Result<Vec<Result<ResolvedAccession>>> {
+    pub async fn resolve_many(
+        &self,
+        accessions: &[String],
+    ) -> Result<Vec<Result<ResolvedAccession>>> {
         if accessions.is_empty() {
             return Ok(Vec::new());
         }
@@ -278,8 +281,7 @@ impl SdlClient {
 
         for chunk in accessions.chunks(EFETCH_BATCH_SIZE) {
             let ids = chunk.join(",");
-            let url =
-                format!("{EUTILS_EFETCH_URL}?db=sra&id={ids}&rettype=runinfo&retmode=text");
+            let url = format!("{EUTILS_EFETCH_URL}?db=sra&id={ids}&rettype=runinfo&retmode=text");
 
             tracing::debug!("EUtils RunInfo batch request ({} accessions)", chunk.len());
 

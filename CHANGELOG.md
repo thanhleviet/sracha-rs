@@ -4,6 +4,12 @@
 
 ### Changed
 
+- **Simplify KAR/VDB parsing**: Unified duplicated PBSTree parsers across
+  `kar.rs` and `metadata.rs` into a single shared implementation. Removed dead
+  code (unused metadata children parsing, leftover debug logging), eliminated
+  unnecessary temporary allocations in idx2 block decoding, and moved test-only
+  functions (`unpack`, `read_blob_for_row`) behind `#[cfg(test)]`. Net reduction
+  of ~220 lines with identical output.
 - **Batch API calls for `info` and `get`**: Multi-accession and project queries
   now resolve all runs in 2 HTTP requests (1 SDL + 1 EUtils) instead of 2N
   sequential calls. Significantly faster for projects with many runs.

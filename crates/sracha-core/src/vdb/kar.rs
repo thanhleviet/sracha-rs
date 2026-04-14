@@ -86,15 +86,10 @@ pub enum KarEntry {
 }
 
 // ---------------------------------------------------------------------------
-// PBSTree parsing
+// PBSTree parsing (shared by KAR TOC and VDB metadata)
 // ---------------------------------------------------------------------------
 
-/// A single node's raw data from the PBSTree serialization.
-struct PbsNode<'a> {
-    data: &'a [u8],
-}
-
-/// Parse a PBSTree blob into a sequence of nodes.
+/// Parse a PBSTree blob into a sequence of raw node data slices.
 ///
 /// PBSTree binary format (from ncbi-vdb `P_BSTree`):
 /// ```text
@@ -105,9 +100,9 @@ struct PbsNode<'a> {
 /// data[]           — concatenated node payloads (data_size bytes total)
 /// ```
 ///
-/// Node `i` (1-based in the C code, 0-based here) spans from
-/// `data[idx[i]]` to `data[idx[i+1]]` (or `data[data_size]` for the last).
-fn parse_pbstree(buf: &[u8]) -> Result<Vec<PbsNode<'_>>> {
+/// Node `i` spans from `data[idx[i]]` to `data[idx[i+1]]` (or
+/// `data[data_size]` for the last).
+pub(crate) fn parse_pbstree_slices(buf: &[u8]) -> Result<Vec<&[u8]>> {
     if buf.len() < 4 {
         return Err(Error::InvalidKar("PBSTree too short for header".into()));
     }
@@ -124,7 +119,6 @@ fn parse_pbstree(buf: &[u8]) -> Result<Vec<PbsNode<'_>>> {
     }
     let data_size = LittleEndian::read_u32(&buf[4..8]) as usize;
 
-    // Determine index element width based on data_size.
     let idx_elem_size = if data_size <= 256 {
         1usize
     } else if data_size <= 65536 {
@@ -133,7 +127,7 @@ fn parse_pbstree(buf: &[u8]) -> Result<Vec<PbsNode<'_>>> {
         4
     };
 
-    let idx_start = 8usize; // right after num_nodes + data_size
+    let idx_start = 8usize;
     let idx_bytes = num_nodes * idx_elem_size;
     let data_start = idx_start + idx_bytes;
 
@@ -145,24 +139,22 @@ fn parse_pbstree(buf: &[u8]) -> Result<Vec<PbsNode<'_>>> {
         )));
     }
 
-    // Read the offset array.
     let idx_buf = &buf[idx_start..idx_start + idx_bytes];
     let data_buf = &buf[data_start..data_start + data_size];
 
-    let mut nodes = Vec::with_capacity(num_nodes);
-    for i in 0..num_nodes {
-        let off = match idx_elem_size {
+    let read_idx = |i: usize| -> usize {
+        match idx_elem_size {
             1 => idx_buf[i] as usize,
             2 => LittleEndian::read_u16(&idx_buf[i * 2..i * 2 + 2]) as usize,
             _ => LittleEndian::read_u32(&idx_buf[i * 4..i * 4 + 4]) as usize,
-        };
+        }
+    };
 
+    let mut nodes = Vec::with_capacity(num_nodes);
+    for i in 0..num_nodes {
+        let off = read_idx(i);
         let end = if i + 1 < num_nodes {
-            match idx_elem_size {
-                1 => idx_buf[i + 1] as usize,
-                2 => LittleEndian::read_u16(&idx_buf[(i + 1) * 2..(i + 1) * 2 + 2]) as usize,
-                _ => LittleEndian::read_u32(&idx_buf[(i + 1) * 4..(i + 1) * 4 + 4]) as usize,
-            }
+            read_idx(i + 1)
         } else {
             data_size
         };
@@ -173,30 +165,59 @@ fn parse_pbstree(buf: &[u8]) -> Result<Vec<PbsNode<'_>>> {
             )));
         }
 
-        nodes.push(PbsNode {
-            data: &data_buf[off..end],
-        });
+        nodes.push(&data_buf[off..end]);
     }
 
     Ok(nodes)
+}
+
+/// Compute the total byte size of a serialized PBSTree without parsing nodes.
+///
+/// Returns `None` if the buffer is too short or malformed.
+pub(crate) fn pbstree_byte_size(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 4 {
+        return None;
+    }
+
+    let num_nodes = LittleEndian::read_u32(&buf[..4]) as usize;
+    if num_nodes == 0 {
+        return Some(4);
+    }
+
+    if buf.len() < 8 {
+        return None;
+    }
+
+    let data_size = LittleEndian::read_u32(&buf[4..8]) as usize;
+    let idx_elem_size = if data_size <= 256 {
+        1usize
+    } else if data_size <= 65536 {
+        2
+    } else {
+        4
+    };
+
+    Some(8 + num_nodes * idx_elem_size + data_size)
 }
 
 // ---------------------------------------------------------------------------
 // TOC node inflation
 // ---------------------------------------------------------------------------
 
-/// Read from a byte slice at a given offset, returning the new offset.
-/// Mimics the C `toc_data_copy` helper.
-fn toc_read(dst: &mut [u8], src: &[u8], offset: usize) -> Result<usize> {
-    let end = offset + dst.len();
-    if end > src.len() {
+/// Read a `T`-sized little-endian value from `data` at `offset`, returning
+/// the value and advancing `offset`.
+fn toc_get<const N: usize>(data: &[u8], offset: &mut usize) -> Result<[u8; N]> {
+    let end = *offset + N;
+    if end > data.len() {
         return Err(Error::InvalidKar(format!(
             "TOC read out of bounds: need {end}, have {}",
-            src.len()
+            data.len()
         )));
     }
-    dst.copy_from_slice(&src[offset..end]);
-    Ok(end)
+    let mut buf = [0u8; N];
+    buf.copy_from_slice(&data[*offset..end]);
+    *offset = end;
+    Ok(buf)
 }
 
 /// Inflate a single PBSTree node into a `(name, KarEntry)` pair.
@@ -204,12 +225,8 @@ fn toc_read(dst: &mut [u8], src: &[u8], offset: usize) -> Result<usize> {
 fn inflate_node(data: &[u8], prefix: &str) -> Result<Vec<(String, KarEntry)>> {
     let mut offset = 0usize;
 
-    // name_len (u16)
-    let mut buf2 = [0u8; 2];
-    offset = toc_read(&mut buf2, data, offset)?;
-    let name_len = LittleEndian::read_u16(&buf2) as usize;
-
-    // name bytes
+    // name_len (u16) + name bytes
+    let name_len = LittleEndian::read_u16(&toc_get::<2>(data, &mut offset)?) as usize;
     if offset + name_len > data.len() {
         return Err(Error::InvalidKar("TOC node name extends past data".into()));
     }
@@ -218,20 +235,16 @@ fn inflate_node(data: &[u8], prefix: &str) -> Result<Vec<(String, KarEntry)>> {
         .to_owned();
     offset += name_len;
 
-    // mod_time (u64) — we read but don't store it
-    let mut buf8 = [0u8; 8];
-    offset = toc_read(&mut buf8, data, offset)?;
-    // let _mod_time = LittleEndian::read_u64(&buf8);
-
-    // access_mode (u32) — we read but don't store it
-    let mut buf4 = [0u8; 4];
-    offset = toc_read(&mut buf4, data, offset)?;
-    // let _access_mode = LittleEndian::read_u32(&buf4);
+    // Skip mod_time (u64) + access_mode (u32) — not needed.
+    if offset + 12 > data.len() {
+        return Err(Error::InvalidKar(
+            "TOC node truncated at mod_time/access_mode".into(),
+        ));
+    }
+    offset += 12;
 
     // type_code (u8)
-    let mut buf1 = [0u8; 1];
-    offset = toc_read(&mut buf1, data, offset)?;
-    let type_code = buf1[0];
+    let type_code = toc_get::<1>(data, &mut offset)?[0];
 
     let full_path = if prefix.is_empty() {
         name.clone()
@@ -243,13 +256,8 @@ fn inflate_node(data: &[u8], prefix: &str) -> Result<Vec<(String, KarEntry)>> {
 
     match type_code {
         TOC_TYPE_FILE | TOC_TYPE_CHUNKED => {
-            // byte_offset (u64)
-            offset = toc_read(&mut buf8, data, offset)?;
-            let byte_offset = LittleEndian::read_u64(&buf8);
-
-            // byte_size (u64)
-            toc_read(&mut buf8, data, offset)?;
-            let byte_size = LittleEndian::read_u64(&buf8);
+            let byte_offset = LittleEndian::read_u64(&toc_get::<8>(data, &mut offset)?);
+            let byte_size = LittleEndian::read_u64(&toc_get::<8>(data, &mut offset)?);
 
             results.push((
                 full_path,
@@ -265,21 +273,18 @@ fn inflate_node(data: &[u8], prefix: &str) -> Result<Vec<(String, KarEntry)>> {
         }
 
         TOC_TYPE_DIR => {
-            // The remaining bytes are a nested PBSTree
             let subtree_data = &data[offset..];
             results.push((full_path.clone(), KarEntry::Directory));
 
-            let child_nodes = parse_pbstree(subtree_data)?;
+            let child_nodes = parse_pbstree_slices(subtree_data)?;
             for child in &child_nodes {
-                let mut children = inflate_node(child.data, &full_path)?;
+                let mut children = inflate_node(child, &full_path)?;
                 results.append(&mut children);
             }
         }
 
         TOC_TYPE_SOFTLINK => {
-            // link_len (u16)
-            offset = toc_read(&mut buf2, data, offset)?;
-            let link_len = LittleEndian::read_u16(&buf2) as usize;
+            let link_len = LittleEndian::read_u16(&toc_get::<2>(data, &mut offset)?) as usize;
 
             if offset + link_len > data.len() {
                 return Err(Error::InvalidKar(
@@ -515,12 +520,12 @@ impl<R: Read + Seek> KarArchive<R> {
         reader.read_exact(&mut toc_buf)?;
 
         // Parse the top-level PBSTree
-        let nodes = parse_pbstree(&toc_buf)?;
+        let nodes = parse_pbstree_slices(&toc_buf)?;
 
         // Inflate each node recursively
         let mut entries = BTreeMap::new();
         for node in &nodes {
-            let inflated = inflate_node(node.data, "")?;
+            let inflated = inflate_node(node, "")?;
             for (path, entry) in inflated {
                 entries.insert(path, entry);
             }
@@ -919,7 +924,7 @@ mod tests {
     #[test]
     fn test_pbstree_parse_empty() {
         let buf = build_pbstree(&[]);
-        let nodes = parse_pbstree(&buf).unwrap();
+        let nodes = parse_pbstree_slices(&buf).unwrap();
         assert!(nodes.is_empty());
     }
 
@@ -927,7 +932,7 @@ mod tests {
     fn test_pbstree_parse_truncated() {
         // Just 2 bytes — not enough for node_count
         let buf = [0u8; 2];
-        assert!(parse_pbstree(&buf).is_err());
+        assert!(parse_pbstree_slices(&buf).is_err());
     }
 
     #[test]
@@ -938,7 +943,7 @@ mod tests {
         buf.extend_from_slice(&100u32.to_le_bytes()); // data_size
         // Need 1 byte idx + 100 bytes data = 101 bytes, but provide only 4
         buf.extend_from_slice(&[0u8; 4]);
-        assert!(parse_pbstree(&buf).is_err());
+        assert!(parse_pbstree_slices(&buf).is_err());
     }
 
     #[test]
