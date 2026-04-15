@@ -1,5 +1,12 @@
 # Getting started
 
+## Supported platforms
+
+sracha supports modern sequencing platforms: Illumina, BGISEQ/DNBSEQ,
+Element, Ultima, PacBio, and Oxford Nanopore. Legacy platforms (454,
+SOLiD, Ion Torrent, Helicos) are not supported and will produce a
+clear error message.
+
 ## Basic usage
 
 The simplest way to get FASTQ files from an SRA accession:

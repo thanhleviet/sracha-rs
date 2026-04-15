@@ -73,8 +73,8 @@ pub struct PipelineStats {
     pub spots_read: u64,
     /// Number of FASTQ reads written (after filtering).
     pub reads_written: u64,
-    /// Total bytes downloaded via HTTP Range requests.
-    pub bytes_downloaded: u64,
+    /// Bytes actually transferred over the network this session.
+    pub bytes_transferred: u64,
     /// Total size of the full SRA file on the server.
     pub total_sra_size: u64,
     /// Paths of all output files created.
@@ -188,6 +188,15 @@ impl OutputWriter {
 // ---------------------------------------------------------------------------
 // Mirror selection
 // ---------------------------------------------------------------------------
+
+/// Legacy sequencing platforms with complex read structures that sracha
+/// does not support. Modern short-read (Illumina, BGISEQ, DNBSEQ, Element,
+/// Ultima) and long-read (PacBio, Nanopore) platforms are allowed.
+pub const UNSUPPORTED_PLATFORMS: &[&str] = &["LS454", "ABI_SOLID", "ION_TORRENT", "HELICOS", "CAPILLARY"];
+
+pub fn is_unsupported_platform(platform: &str) -> bool {
+    UNSUPPORTED_PLATFORMS.iter().any(|&p| p == platform)
+}
 
 /// Select the best mirror URL for downloading.
 ///
@@ -1043,6 +1052,15 @@ fn decode_and_write(
     let mut archive = KarArchive::open(std::io::BufReader::new(file))?;
     let cursor = VdbCursor::open(&mut archive, sra_path)?;
 
+    // Check platform — reject legacy platforms with complex read structures.
+    if let Some(platform) = cursor.platform() {
+        if is_unsupported_platform(platform) {
+            return Err(Error::UnsupportedPlatform {
+                platform: platform.to_string(),
+            });
+        }
+    }
+
     // Load Illumina name format templates from skey index.
     let (name_templates, name_spot_starts): (Vec<Vec<u8>>, Vec<i64>) =
         if cursor.has_illumina_name_parts() {
@@ -1752,8 +1770,8 @@ pub fn run_fastq(
 pub struct DownloadedSra {
     /// Path to the temporary SRA file on disk.
     pub temp_path: PathBuf,
-    /// Bytes actually downloaded (may be less than total if resumed).
-    pub bytes_downloaded: u64,
+    /// Bytes actually transferred over the network this session.
+    pub bytes_transferred: u64,
     /// Total SRA file size on the server.
     pub total_sra_size: u64,
     /// Whether this is an SRA-lite file.
@@ -1826,7 +1844,7 @@ pub async fn download_sra(
 
     Ok(DownloadedSra {
         temp_path,
-        bytes_downloaded: dl_result.size,
+        bytes_transferred: dl_result.bytes_transferred,
         total_sra_size,
         is_lite: resolved.sra_file.is_lite,
         accession: accession.clone(),
@@ -1889,16 +1907,16 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
 
     tracing::info!(
         "{}: done -- {spots_read} spots, {reads_written} reads written, \
-         {} downloaded",
+         {} transferred",
         downloaded.accession,
-        crate::util::format_size(downloaded.bytes_downloaded),
+        crate::util::format_size(downloaded.bytes_transferred),
     );
 
     Ok(PipelineStats {
         accession: downloaded.accession.clone(),
         spots_read,
         reads_written,
-        bytes_downloaded: downloaded.bytes_downloaded,
+        bytes_transferred: downloaded.bytes_transferred,
         total_sra_size: downloaded.total_sra_size,
         output_files,
     })

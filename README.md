@@ -13,6 +13,7 @@ Fast SRA downloader and FASTQ converter, written in pure Rust.
 - **FASTA output** -- drop quality scores with `--fasta`
 - **SRA and SRA-lite** -- full quality or simplified quality scores
 - **Split modes** -- split-3, split-files, split-spot, interleaved
+- **Platform support** -- Illumina, BGISEQ/DNBSEQ, Element, Ultima, PacBio, Nanopore (legacy platforms like 454 and Ion Torrent are not supported)
 - **Resumable downloads** -- picks up where it left off on interruption
 - **File validation** -- verify SRA file integrity
 

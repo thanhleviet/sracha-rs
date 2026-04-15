@@ -194,6 +194,21 @@ async fn main() -> Result<()> {
                 resolve_accessions(&run_accessions, &sdl_client, args.prefer_sdl, true).await?;
             check_download_size(&resolved_all, args.yes)?;
 
+            // Check platform — reject legacy platforms with complex read structures.
+            for resolved in &resolved_all {
+                if let Some(ref ri) = resolved.run_info {
+                    if let Some(ref platform) = ri.platform {
+                        if sracha_core::pipeline::is_unsupported_platform(platform) {
+                            anyhow::bail!(
+                                "{}: unsupported platform '{}' — sracha does not support legacy sequencing platforms",
+                                resolved.accession,
+                                platform
+                            );
+                        }
+                    }
+                }
+            }
+
             let format_label = if args.fasta { "FASTA" } else { "FASTQ" };
             tracing::info!(
                 "get {} run accession(s) -> {format_label}",

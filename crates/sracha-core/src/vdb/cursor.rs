@@ -55,6 +55,8 @@ pub struct VdbCursor {
     /// Reads per spot inferred from table metadata (used when READ_LEN
     /// column is absent, e.g. SRA-lite files).
     metadata_reads_per_spot: Option<usize>,
+    /// Sequencing platform detected from VDB schema metadata.
+    platform: Option<String>,
 }
 
 impl VdbCursor {
@@ -72,9 +74,9 @@ impl VdbCursor {
     ) -> Result<Self> {
         let seq_col_base = find_sequence_col_base(archive)?;
 
-        // Parse table metadata (md/cur) to extract reads_per_spot for
-        // SRA-lite files that lack physical READ_LEN/NREADS columns.
-        let metadata_reads_per_spot = Self::detect_reads_per_spot(archive);
+        // Parse table metadata (md/cur) to extract reads_per_spot and
+        // platform for SRA-lite files that lack physical READ_LEN/NREADS columns.
+        let (metadata_reads_per_spot, platform) = Self::detect_metadata(archive);
 
         // READ is required.
         let read_col = ColumnReader::open(archive, &format!("{seq_col_base}/{COL_READ}"), sra_path)
@@ -155,6 +157,7 @@ impl VdbCursor {
             first_row,
             row_count,
             metadata_reads_per_spot,
+            platform,
         })
     }
 
@@ -237,6 +240,11 @@ impl VdbCursor {
     /// doesn't provide enough info to determine the read structure.
     pub fn metadata_reads_per_spot(&self) -> Option<usize> {
         self.metadata_reads_per_spot
+    }
+
+    /// Sequencing platform detected from VDB schema metadata.
+    pub fn platform(&self) -> Option<&str> {
+        self.platform.as_deref()
     }
 
     /// Load NAME_FMT templates from the skey index.
@@ -459,14 +467,10 @@ impl VdbCursor {
         (templates, starts)
     }
 
-    /// Detect reads_per_spot from the table metadata (`md/cur`).
-    ///
-    /// Strategy:
-    /// 1. Try `READ_0`/`READ_1` metadata nodes (pipe-delimited descriptors).
-    /// 2. Look for NREADS value in the STATS metadata tree.
-    /// 3. Detect schema table name — if it contains "Illumina", the data
-    ///    is almost certainly paired-end (nreads=2).
-    fn detect_reads_per_spot<R: Read + Seek>(archive: &mut KarArchive<R>) -> Option<usize> {
+    /// Detect reads_per_spot and platform from the table metadata (`md/cur`).
+    fn detect_metadata<R: Read + Seek>(
+        archive: &mut KarArchive<R>,
+    ) -> (Option<usize>, Option<String>) {
         // Try table-level metadata first, then database-level.
         let md_bytes = match archive.read_file("md/cur") {
             Ok(b) => b,
@@ -474,18 +478,19 @@ impl VdbCursor {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::debug!("no md/cur found: {e}");
-                    return None;
+                    return (None, None);
                 }
             },
         };
 
         if md_bytes.len() < 8 {
-            return None;
+            return (None, None);
         }
 
         // Skip 8-byte KDBHdr (endian + version).
         let tree_data = &md_bytes[8..];
-        match crate::vdb::metadata::parse_read_structure(tree_data) {
+
+        let rps = match crate::vdb::metadata::parse_read_structure(tree_data) {
             Ok(descs) => {
                 let rps = descs.len();
                 tracing::debug!("metadata: detected {rps} reads per spot");
@@ -495,7 +500,14 @@ impl VdbCursor {
                 tracing::debug!("metadata: could not determine read structure: {e}");
                 None
             }
+        };
+
+        let platform = crate::vdb::metadata::detect_platform(tree_data);
+        if let Some(ref p) = platform {
+            tracing::debug!("metadata: detected platform {p}");
         }
+
+        (rps, platform)
     }
 }
 

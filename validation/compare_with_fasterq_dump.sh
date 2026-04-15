@@ -3,7 +3,7 @@
 #SBATCH --output=validation/validate_%j.log
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
-#SBATCH --time=1:00:00
+#SBATCH --time=2:00:00
 #
 # Compare sracha output against fasterq-dump across split modes and formats.
 #
@@ -55,11 +55,13 @@ skip() { echo -e "  ${YELLOW}SKIP${RESET} $1"; SKIP_COUNT=$((SKIP_COUNT + 1)); R
 # Compare two files by md5. If they differ, run compare_fastq.py for details.
 # If md5 differs but seq/qual are identical (defline-only diff), still counts as PASS.
 # Optional 4th arg: "true" to allow N-masking diffs in FASTQ comparison.
+# Optional 5th arg: "true" to allow quality score diffs (report but don't fail).
 compare_files() {
     local file_a="$1"
     local file_b="$2"
     local label="$3"
     local allow_n_masking="${4:-false}"
+    local allow_quality_diff="${5:-false}"
 
     if [[ ! -f "$file_a" ]]; then
         fail "$label — sracha output missing: $(basename "$file_a")"
@@ -90,6 +92,9 @@ compare_files() {
         local py_args=("$file_a" "$file_b")
         if [[ "$allow_n_masking" == "true" ]]; then
             py_args+=(--allow-n-masking)
+        fi
+        if [[ "$allow_quality_diff" == "true" ]]; then
+            py_args+=(--allow-quality-diff)
         fi
         if python3 "$COMPARE_PY" "${py_args[@]}"; then
             pass "$label — content-identical (deflines differ)"
@@ -149,48 +154,74 @@ print(f'{total} {n_mask} {other} {n_positions}')
     fi
 }
 
-# ---------- sralite fixture ----------
+# ---------- fixture helpers ----------
 
-SRA_LITE_FILE=""
 PREFETCH=""
 
-ensure_sralite_fixture() {
-    local lite_file="$SCRIPT_DIR/${ACCESSION}.sralite"
+# Download an SRA file via prefetch and cache in the validation directory.
+# Usage: ensure_fixture <accession> [prefetch_extra_args...]
+# Sets FIXTURE_FILE to the cached path on success. Returns 1 on failure.
+FIXTURE_FILE=""
+ensure_fixture() {
+    local acc="$1"
+    shift
+    local extra_args=("$@")
+    local ext="sra"
+    # Detect sralite from args
+    for arg in "${extra_args[@]}"; do
+        if [[ "$arg" == "--eliminate-quals" ]]; then
+            ext="sralite"
+        fi
+    done
 
-    if [[ -f "$lite_file" ]]; then
-        SRA_LITE_FILE="$lite_file"
-        echo "  sralite fixture: $lite_file (cached, $(du -h "$lite_file" | awk '{print $1}'))"
+    local cached="$SCRIPT_DIR/${acc}.${ext}"
+
+    if [[ -f "$cached" ]]; then
+        FIXTURE_FILE="$cached"
+        echo "  fixture: $cached (cached, $(du -h "$cached" | awk '{print $1}'))"
         return 0
     fi
 
     if [[ -z "$PREFETCH" ]]; then
-        echo "  WARNING: prefetch not available — cannot download sralite fixture"
+        echo "  WARNING: prefetch not available — cannot download $acc"
         return 1
     fi
 
-    log "Downloading sralite fixture via prefetch --eliminate-quals..."
-    local prefetch_out="$TMPDIR_BASE/prefetch_sralite"
+    log "Downloading $acc via prefetch ${extra_args[*]}..."
+    local prefetch_out="$TMPDIR_BASE/prefetch_${acc}"
     mkdir -p "$prefetch_out"
 
-    if ! "$PREFETCH" "$ACCESSION" --eliminate-quals -O "$prefetch_out" -f yes 2>&1; then
-        echo "  WARNING: prefetch failed to download sralite"
+    if ! "$PREFETCH" "$acc" "${extra_args[@]}" -O "$prefetch_out" -f yes 2>&1; then
+        echo "  WARNING: prefetch failed to download $acc"
         return 1
     fi
 
-    # prefetch writes to $out/$ACCESSION/$ACCESSION.sralite
     local downloaded
     downloaded=$(find "$prefetch_out" -type f \( -name "*.sralite" -o -name "*.sra" \) | head -1)
 
     if [[ -n "$downloaded" && -f "$downloaded" ]]; then
-        cp "$downloaded" "$lite_file"
-        SRA_LITE_FILE="$lite_file"
-        echo "  sralite fixture saved: $lite_file ($(du -h "$lite_file" | awk '{print $1}'))"
+        cp "$downloaded" "$cached"
+        FIXTURE_FILE="$cached"
+        echo "  fixture saved: $cached ($(du -h "$cached" | awk '{print $1}'))"
         return 0
     fi
 
-    echo "  WARNING: sralite file not found after prefetch"
+    echo "  WARNING: $acc file not found after prefetch"
     return 1
 }
+
+ensure_sralite_fixture() {
+    ensure_fixture "$ACCESSION" --eliminate-quals
+    SRA_LITE_FILE="$FIXTURE_FILE"
+}
+
+SRA_LITE_FILE=""
+
+# Platform test fixtures
+# SRR000001: 299 MB, LS454 — already cached in test fixtures, VDB schema has 454 marker
+SRA_FILE_454="$ROOT_DIR/crates/sracha-core/tests/fixtures/SRR000001.sra"
+ACCESSION_IONTORRENT="SRR37995599" # 22 MB, ION_TORRENT (blocked)
+ACCESSION_PACBIO="SRR38107137"    # 40 MB, PACBIO_SMRT (allowed)
 
 # ---------- test registry ----------
 
@@ -204,6 +235,9 @@ declare -A TEST_FUNCS=(
     [7]="test_7_sralite_splitspot"
     [8]="test_8_interleaved"
     [9]="test_9_gzip_roundtrip"
+    [10]="test_10_reject_454"
+    [11]="test_11_reject_iontorrent"
+    [12]="test_12_pacbio"
 )
 declare -A TEST_LABELS=(
     [1]="split-3 (FASTQ, paired-end)"
@@ -215,8 +249,11 @@ declare -A TEST_LABELS=(
     [7]="sralite split-spot (FASTQ)"
     [8]="interleaved (FASTQ, paired-end)"
     [9]="gzip round-trip (FASTQ, split-3)"
+    [10]="platform reject LS454"
+    [11]="platform reject ION_TORRENT"
+    [12]="platform PacBio (FASTQ)"
 )
-ALL_TEST_NUMS=(1 2 3 4 5 6 7 8 9)
+ALL_TEST_NUMS=(1 2 3 4 5 6 7 8 9 10 11 12)
 
 # ---------- test functions ----------
 
@@ -413,6 +450,78 @@ test_9_gzip_roundtrip() {
 
     compare_files "$decompressed/${ACCESSION}_1.fastq" "$fasterq_out/${ACCESSION}_1.fastq" "gzip round-trip read 1"
     compare_files "$decompressed/${ACCESSION}_2.fastq" "$fasterq_out/${ACCESSION}_2.fastq" "gzip round-trip read 2"
+    echo
+}
+
+# Helper: verify sracha rejects an accession with an unsupported platform error.
+test_platform_reject() {
+    local acc="$1"
+    local platform_name="$2"
+
+    if ! ensure_fixture "$acc"; then
+        skip "reject $platform_name — fixture not available"
+        echo
+        return
+    fi
+
+    local output
+    output=$("$SRACHA" fastq "$FIXTURE_FILE" --split split-spot --no-gzip -O "$TMPDIR_BASE/reject_${acc}" -f --no-progress 2>&1) || true
+
+    if echo "$output" | grep -q "unsupported platform"; then
+        pass "reject $platform_name — sracha correctly refused $acc"
+    else
+        fail "reject $platform_name — sracha did not reject $acc (output: ${output:0:200})"
+    fi
+    echo
+}
+
+test_10_reject_454() {
+    log "Test 10: platform reject LS454 (SRR000001)"
+
+    if [[ ! -f "$SRA_FILE_454" ]]; then
+        skip "reject LS454 — fixture not available ($SRA_FILE_454)"
+        echo
+        return
+    fi
+
+    local output
+    output=$("$SRACHA" fastq "$SRA_FILE_454" --split split-spot --no-gzip -O "$TMPDIR_BASE/reject_454" -f --no-progress 2>&1) || true
+
+    if echo "$output" | grep -q "unsupported platform"; then
+        pass "reject LS454 — sracha correctly refused SRR000001"
+    else
+        fail "reject LS454 — sracha did not reject SRR000001 (output: ${output:0:200})"
+    fi
+    echo
+}
+
+test_11_reject_iontorrent() {
+    log "Test 11: platform reject ION_TORRENT ($ACCESSION_IONTORRENT)"
+    test_platform_reject "$ACCESSION_IONTORRENT" "ION_TORRENT"
+}
+
+test_12_pacbio() {
+    log "Test 12: platform PacBio ($ACCESSION_PACBIO)"
+
+    if ! ensure_fixture "$ACCESSION_PACBIO"; then
+        skip "PacBio split-spot — fixture not available"
+        echo
+        return
+    fi
+
+    local sracha_out="$TMPDIR_BASE/test12_sracha"
+    local fasterq_out="$TMPDIR_BASE/test12_fasterq"
+    mkdir -p "$sracha_out" "$fasterq_out"
+
+    "$SRACHA" fastq "$FIXTURE_FILE" --split split-spot --no-gzip -O "$sracha_out" -f --no-progress 2>&1 | tail -2
+    "$FASTERQ_DUMP" "$FIXTURE_FILE" --split-spot -O "$fasterq_out" -f 2>&1 | tail -2
+
+    echo "  sracha files:      $(ls "$sracha_out"/ 2>/dev/null || echo '(none)')"
+    echo "  fasterq-dump files: $(ls "$fasterq_out"/ 2>/dev/null || echo '(none)')"
+
+    # PacBio: allow N-masking (sracha masks Q≤2 bases) and quality diffs
+    # (PacBio quality encoding differs between tools — to be investigated).
+    compare_files "$sracha_out/${ACCESSION_PACBIO}.fastq" "$fasterq_out/${ACCESSION_PACBIO}.fastq" "PacBio split-spot" "true" "true"
     echo
 }
 

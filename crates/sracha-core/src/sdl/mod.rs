@@ -95,6 +95,8 @@ pub struct RunInfo {
     pub avg_read_len: Vec<u32>,
     /// Total bases per spot (sum of `avg_read_len`).
     pub spot_len: u32,
+    /// Sequencing platform (e.g. "ILLUMINA", "LS454", "OXFORD_NANOPORE").
+    pub platform: Option<String>,
 }
 
 /// Resolved download information for a single accession.
@@ -442,6 +444,7 @@ fn parse_run_info_csv_multi(body: &str) -> HashMap<String, RunInfo> {
         return result;
     };
     let run_idx = col("Run");
+    let platform_idx = col("Platform");
 
     for data in lines {
         let values: Vec<&str> = data.split(',').collect();
@@ -487,9 +490,14 @@ fn parse_run_info_csv_multi(body: &str) -> HashMap<String, RunInfo> {
             *last += avg_length - used;
         }
 
+        let platform = platform_idx
+            .and_then(|i| values.get(i).copied())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+
         tracing::debug!(
             "{accession}: EUtils RunInfo: layout={layout}, avgLength={avg_length}, \
-             nreads={nreads}, per_read_len={avg_read_len:?}",
+             nreads={nreads}, per_read_len={avg_read_len:?}, platform={platform:?}",
         );
 
         result.insert(
@@ -498,6 +506,7 @@ fn parse_run_info_csv_multi(body: &str) -> HashMap<String, RunInfo> {
                 nreads,
                 avg_read_len,
                 spot_len: avg_length,
+                platform,
             },
         );
     }

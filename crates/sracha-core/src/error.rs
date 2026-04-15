@@ -29,6 +29,9 @@ pub enum Error {
     #[error("unsupported encoding: {0}")]
     UnsupportedEncoding(String),
 
+    #[error("unsupported platform: {platform} — sracha does not support legacy sequencing platforms")]
+    UnsupportedPlatform { platform: String },
+
     #[error("file not found: {0}")]
     FileNotFound(PathBuf),
 

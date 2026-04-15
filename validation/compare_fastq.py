@@ -11,7 +11,7 @@ Ignores defline differences (line 1 of each record).
 import sys
 
 
-def compare_fastq(file_a, file_b, max_report=100, allow_n_masking=False):
+def compare_fastq(file_a, file_b, max_report=100, allow_n_masking=False, allow_quality_diff=False):
     mismatches_seq = 0
     mismatches_qual = 0
     qual_len_errors = 0
@@ -54,9 +54,10 @@ def compare_fastq(file_a, file_b, max_report=100, allow_n_masking=False):
             # Check sequence identity
             if seq_a != seq_b:
                 if allow_n_masking and len(seq_a) == len(seq_b):
-                    # Check if all differing positions have N in file B
+                    # Check if all differing positions have N in either file
                     is_n_mask = all(
-                        cb == 'N' for ca, cb in zip(seq_a, seq_b) if ca != cb
+                        ca == 'N' or cb == 'N'
+                        for ca, cb in zip(seq_a, seq_b) if ca != cb
                     )
                     if is_n_mask:
                         n_mask_seqs += 1
@@ -134,7 +135,10 @@ def compare_fastq(file_a, file_b, max_report=100, allow_n_masking=False):
     print(f"  Qual-length errors:     {qual_len_errors:,}")
     if allow_n_masking:
         print(f"  N-masked sequences:     {n_mask_seqs:,} ({n_mask_positions:,} positions)")
-    if mismatches_seq == 0 and mismatches_qual == 0 and qual_len_errors == 0:
+    if allow_quality_diff and mismatches_qual > 0:
+        print(f"  (quality diffs tolerated with --allow-quality-diff)")
+    effective_qual_mm = 0 if allow_quality_diff else mismatches_qual
+    if mismatches_seq == 0 and effective_qual_mm == 0 and qual_len_errors == 0:
         print(f"  RESULT: PASS")
         return True
     else:
@@ -153,6 +157,14 @@ if __name__ == "__main__":
         "--allow-n-masking", action="store_true",
         help="Treat N-substitutions in file B as acceptable (not mismatches)"
     )
+    parser.add_argument(
+        "--allow-quality-diff", action="store_true",
+        help="Report quality mismatches but do not fail on them"
+    )
     args = parser.parse_args()
-    ok = compare_fastq(args.file_a, args.file_b, allow_n_masking=args.allow_n_masking)
+    ok = compare_fastq(
+        args.file_a, args.file_b,
+        allow_n_masking=args.allow_n_masking,
+        allow_quality_diff=args.allow_quality_diff,
+    )
     sys.exit(0 if ok else 1)

@@ -87,11 +87,56 @@ pub fn parse_read_structure(tree_data: &[u8]) -> Result<Vec<ReadDescriptor>, Str
     ))
 }
 
+/// Extract the sequencing platform from the schema table name.
+///
+/// NCBI VDB schema names follow the pattern `NCBI:SRA:<Platform>:tbl:...`.
+/// Known platforms: Illumina, _454_, ABI (SOLiD), Helicos, PacBio, Nanopore, IonTorrent.
+pub fn detect_platform_from_schema(schema_text: &str) -> Option<String> {
+    let platforms = [
+        ("Illumina", "ILLUMINA"),
+        ("_454_", "LS454"),
+        ("ABI", "ABI_SOLID"),
+        ("Helicos", "HELICOS"),
+        ("PacBio", "PACBIO_SMRT"),
+        ("Nanopore", "OXFORD_NANOPORE"),
+        ("IonTorrent", "ION_TORRENT"),
+    ];
+    for (schema_name, platform_name) in &platforms {
+        if schema_text.contains(schema_name) {
+            return Some(platform_name.to_string());
+        }
+    }
+    None
+}
+
 /// Infer reads-per-spot from the schema table name.
 fn infer_nreads_from_schema(schema_text: &str) -> Option<usize> {
     if schema_text.contains("Illumina") {
         tracing::debug!("metadata: schema indicates Illumina platform, assuming nreads=2");
         return Some(2);
+    }
+    None
+}
+
+/// Detect the sequencing platform from VDB metadata.
+///
+/// Examines the schema node for platform-identifying strings.
+/// Returns `None` if the platform cannot be determined.
+pub fn detect_platform(tree_data: &[u8]) -> Option<String> {
+    let nodes = parse_meta_nodes(tree_data).ok()?;
+    for node in &nodes {
+        if node.name == "schema" {
+            for (_, attr_val) in &node.attrs {
+                let attr_text = String::from_utf8_lossy(attr_val);
+                if let Some(platform) = detect_platform_from_schema(&attr_text) {
+                    return Some(platform);
+                }
+            }
+            let schema_text = String::from_utf8_lossy(&node.value);
+            if let Some(platform) = detect_platform_from_schema(&schema_text) {
+                return Some(platform);
+            }
+        }
     }
     None
 }
