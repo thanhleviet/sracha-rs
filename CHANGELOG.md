@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## 0.1.6 (2026-04-15)
+
+### Added
+
+- **Dev version strings**: Non-release builds now show git SHA and dirty flag
+  (e.g. `0.1.6-dev+abc1234.dirty`) via a build script.
+- **cSRA rejection**: Detect aligned SRA (cSRA) archives and return an
+  actionable error pointing users to fasterq-dump.
+
+### Changed
+
+- **Benchmarks**: Updated README benchmarks to 8-core results with v0.1.5.
+- **Integration tests**: Switched from LS454 fixture (SRR000001) to Illumina
+  (SRR28588231) after adding legacy platform rejection.
+
+### Fixed
+
+- **Clippy**: Fixed collapsible-if and manual-contains warnings from Rust 1.94.
+- **PacBio quality decode**: Expand page map data_runs for variable-length rows.
+
 ## 0.1.5 (2026-04-14)
 
 ### Added
