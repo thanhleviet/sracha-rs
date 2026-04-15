@@ -23,43 +23,6 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
-/// Ensure the SRR000001 fixture exists, downloading it if necessary.
-///
-/// Uses a `Once` guard so concurrent tests don't race.  The fixture is
-/// ~5.5 MiB and hosted on a public S3 bucket (no auth required).
-fn ensure_srr000001() -> PathBuf {
-    static DOWNLOAD: Once = Once::new();
-    let path = fixtures_dir().join("SRR000001.sra");
-
-    DOWNLOAD.call_once(|| {
-        if path.exists() {
-            return;
-        }
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-
-        let url = "https://sra-pub-run-odp.s3.amazonaws.com/sra/SRR000001/SRR000001";
-        eprintln!("downloading SRR000001 fixture from {url} ...");
-
-        let resp = reqwest::blocking::get(url)
-            .unwrap_or_else(|e| panic!("failed to download SRR000001: {e}"));
-        assert!(
-            resp.status().is_success(),
-            "HTTP {} downloading fixture",
-            resp.status()
-        );
-        let bytes = resp.bytes().unwrap();
-        std::fs::write(&path, &bytes).unwrap();
-        eprintln!(
-            "fixture saved to {} ({} bytes)",
-            path.display(),
-            bytes.len()
-        );
-    });
-
-    assert!(path.exists(), "fixture not found at {}", path.display());
-    path
-}
-
 /// Ensure the SRR28588231 fixture (Illumina paired-end, 23 MiB).
 ///
 /// This accession exercises: tile boundary detection (skey id2ord),
@@ -161,11 +124,11 @@ fn assert_valid_fastq(data: &[u8]) {
 #[ignore] // requires network on first run; cached thereafter
 #[test]
 fn run_fastq_split3() {
-    let sra_path = ensure_srr000001();
+    let sra_path = ensure_srr28588231();
     let tmp = tempfile::tempdir().unwrap();
     let config = test_config(tmp.path(), SplitMode::Split3, CompressionMode::None);
 
-    let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR000001"), &config).unwrap();
+    let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR28588231"), &config).unwrap();
 
     assert!(stats.spots_read > 0, "should read at least one spot");
     assert!(stats.reads_written > 0, "should write at least one read");
@@ -174,8 +137,6 @@ fn run_fastq_split3() {
         "should produce output files"
     );
 
-    // SRR000001 has single-end reads, so split3 produces an unpaired _0 file.
-    // Paired-end accessions would produce _1 and _2 files instead.
     let names: Vec<String> = stats
         .output_files
         .iter()
@@ -197,11 +158,11 @@ fn run_fastq_split3() {
 #[ignore]
 #[test]
 fn run_fastq_split_spot() {
-    let sra_path = ensure_srr000001();
+    let sra_path = ensure_srr28588231();
     let tmp = tempfile::tempdir().unwrap();
     let config = test_config(tmp.path(), SplitMode::SplitSpot, CompressionMode::None);
 
-    let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR000001"), &config).unwrap();
+    let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR28588231"), &config).unwrap();
 
     assert!(stats.spots_read > 0);
     assert_eq!(
@@ -217,7 +178,7 @@ fn run_fastq_split_spot() {
 #[ignore]
 #[test]
 fn run_fastq_gzip() {
-    let sra_path = ensure_srr000001();
+    let sra_path = ensure_srr28588231();
     let tmp = tempfile::tempdir().unwrap();
     let config = test_config(
         tmp.path(),
@@ -225,7 +186,7 @@ fn run_fastq_gzip() {
         CompressionMode::Gzip { level: 1 },
     );
 
-    let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR000001"), &config).unwrap();
+    let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR28588231"), &config).unwrap();
 
     assert!(stats.spots_read > 0);
     for path in &stats.output_files {
@@ -247,15 +208,17 @@ fn run_fastq_gzip() {
 #[ignore]
 #[test]
 fn run_fastq_deterministic() {
-    let sra_path = ensure_srr000001();
+    let sra_path = ensure_srr28588231();
 
     let tmp1 = tempfile::tempdir().unwrap();
     let config1 = test_config(tmp1.path(), SplitMode::SplitSpot, CompressionMode::None);
-    let stats1 = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR000001"), &config1).unwrap();
+    let stats1 =
+        sracha_core::pipeline::run_fastq(&sra_path, Some("SRR28588231"), &config1).unwrap();
 
     let tmp2 = tempfile::tempdir().unwrap();
     let config2 = test_config(tmp2.path(), SplitMode::SplitSpot, CompressionMode::None);
-    let stats2 = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR000001"), &config2).unwrap();
+    let stats2 =
+        sracha_core::pipeline::run_fastq(&sra_path, Some("SRR28588231"), &config2).unwrap();
 
     assert_eq!(stats1.spots_read, stats2.spots_read);
     assert_eq!(stats1.reads_written, stats2.reads_written);
