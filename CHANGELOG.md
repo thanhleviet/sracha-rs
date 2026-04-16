@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## 0.1.8 (2026-04-15)
+
+### Changed
+
+- **Project downloads require confirmation**: Downloads from project accessions
+  (SRP/ERP/DRP/PRJNA/PRJEB/PRJDB) now always require `--yes` / `-y` to proceed,
+  preventing surprise multi-hundred-GiB downloads. The info table is shown for
+  all project downloads so users can review what they're about to download.
+- **Lower size confirmation threshold**: The size gate for non-project downloads
+  was lowered from 500 GiB to 100 GiB.
+
+### Added
+
+- **Disk space check**: Downloads now check available disk space in the target
+  directory before starting and bail with a clear error if there isn't enough
+  room.
+
 ## 0.1.7 (2026-04-15)
 
 ### Fixed
