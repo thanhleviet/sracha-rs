@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## 0.1.9 (2026-04-16)
+
+### Added
+
+- **Stdout streaming**: New `-Z` flag streams FASTQ output to stdout for
+  piping into downstream tools. (#7)
+- **75 new tests**: Unit and integration tests covering previously untested
+  modules.
+- **Acknowledgments**: Added acknowledgments for NCBI and SRA Toolkit team.
+- **Alignment docs page**: New documentation page covering alignment topics.
+
+### Changed
+
+- **VDB metadata read structure**: Read structure (count, lengths, platform)
+  is now derived from VDB table metadata, making the EUtils RunInfo fetch
+  optional and improving reliability for accessions with missing RunInfo.
+- **Tabled output**: `info` and `validate` commands now use `tabled` for
+  formatted table output.
+- **Remove dead `--format` flag**: Removed unused `--format` argument; wired
+  up `--no-resume` for the `get` command.
+
+### Fixed
+
+- **Interleaved output routing**: Fixed a bug in interleaved split mode
+  output routing and corrected the `min_read_len` test.
+
 ## 0.1.8 (2026-04-15)
 
 ### Changed
