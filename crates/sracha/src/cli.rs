@@ -108,7 +108,7 @@ pub struct FetchArgs {
     #[arg(long)]
     pub no_resume: bool,
 
-    /// Skip confirmation prompt for large downloads (>500 GiB)
+    /// Confirm project downloads and large downloads (>100 GiB)
     #[arg(short, long)]
     pub yes: bool,
 
@@ -245,7 +245,7 @@ pub struct GetArgs {
     #[arg(long)]
     pub no_resume: bool,
 
-    /// Skip confirmation prompt for large downloads (>500 GiB)
+    /// Confirm project downloads and large downloads (>100 GiB)
     #[arg(short, long)]
     pub yes: bool,
 

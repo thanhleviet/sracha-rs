@@ -70,14 +70,14 @@ async fn main() -> Result<()> {
         Command::Fetch(args) => {
             let raw = collect_accessions(&args.accessions, args.accession_list.as_deref())?;
             let client = SdlClient::new();
-            let run_accessions = resolve_to_runs(&raw, &client).await?;
+            let (run_accessions, has_projects) = resolve_to_runs(&raw, &client).await?;
             eprintln!(
                 "Resolving {} accession(s)...",
                 style::count(run_accessions.len()),
             );
             let resolved_all =
                 resolve_accessions(&run_accessions, &client, args.prefer_sdl, false).await?;
-            check_download_size(&resolved_all, args.yes)?;
+            check_download_confirmation(&resolved_all, args.yes, has_projects)?;
 
             tokio::fs::create_dir_all(&args.output_dir).await?;
             for resolved in &resolved_all {
@@ -193,14 +193,14 @@ async fn main() -> Result<()> {
         Command::Get(args) => {
             let raw = collect_accessions(&args.accessions, args.accession_list.as_deref())?;
             let sdl_client = SdlClient::new();
-            let run_accessions = resolve_to_runs(&raw, &sdl_client).await?;
+            let (run_accessions, has_projects) = resolve_to_runs(&raw, &sdl_client).await?;
             eprintln!(
                 "Resolving {} accession(s)...",
                 style::count(run_accessions.len()),
             );
             let resolved_all =
                 resolve_accessions(&run_accessions, &sdl_client, args.prefer_sdl, true).await?;
-            check_download_size(&resolved_all, args.yes)?;
+            check_download_confirmation(&resolved_all, args.yes, has_projects)?;
 
             // Check platform — reject legacy platforms with complex read structures.
             for resolved in &resolved_all {
@@ -416,7 +416,7 @@ async fn main() -> Result<()> {
         Command::Info(args) => {
             let raw = collect_accessions(&args.accessions, args.accession_list.as_deref())?;
             let client = SdlClient::new();
-            let run_accessions = resolve_to_runs(&raw, &client).await?;
+            let (run_accessions, _has_projects) = resolve_to_runs(&raw, &client).await?;
 
             let mut resolved_all = Vec::new();
             for result in client.resolve_many(&run_accessions).await? {
@@ -517,8 +517,9 @@ fn collect_accessions(positional: &[String], list_file: Option<&Path>) -> Result
 /// Run accessions (SRR/ERR/DRR) pass through unchanged.
 /// Study (SRP/ERP/DRP) and BioProject (PRJNA/PRJEB/PRJDB) accessions are
 /// resolved to their constituent runs via the NCBI EUtils API.
-async fn resolve_to_runs(inputs: &[String], client: &SdlClient) -> Result<Vec<String>> {
+async fn resolve_to_runs(inputs: &[String], client: &SdlClient) -> Result<(Vec<String>, bool)> {
     let mut run_accessions = Vec::new();
+    let mut has_projects = false;
 
     for input in inputs {
         let parsed = accession::parse_input(input)?;
@@ -527,6 +528,7 @@ async fn resolve_to_runs(inputs: &[String], client: &SdlClient) -> Result<Vec<St
                 run_accessions.push(acc.to_string());
             }
             InputAccession::Project(proj) => {
+                has_projects = true;
                 eprintln!(
                     "{}: resolving project to run accessions...",
                     style::header(&proj),
@@ -542,7 +544,7 @@ async fn resolve_to_runs(inputs: &[String], client: &SdlClient) -> Result<Vec<St
         }
     }
 
-    Ok(run_accessions)
+    Ok((run_accessions, has_projects))
 }
 
 fn print_resolved(resolved: &ResolvedAccession) {
@@ -636,7 +638,7 @@ fn print_info_table(resolved: &[ResolvedAccession]) {
 }
 
 /// Size threshold (in bytes) above which downloads require `--yes` confirmation.
-const LARGE_DOWNLOAD_THRESHOLD: u64 = 500 * 1024 * 1024 * 1024; // 500 GiB
+const LARGE_DOWNLOAD_THRESHOLD: u64 = 100 * 1024 * 1024 * 1024; // 100 GiB
 
 /// Resolve accessions with direct S3 probing, falling back to SDL per-accession.
 ///
@@ -724,18 +726,42 @@ async fn resolve_accessions(
     Ok(resolved)
 }
 
-/// Check total download size and prompt for confirmation if above threshold.
-fn check_download_size(resolved: &[ResolvedAccession], yes: bool) -> Result<()> {
+/// Check whether confirmation is needed before downloading.
+///
+/// Project downloads (SRP/PRJNA/etc.) always require `--yes` confirmation.
+/// Non-project downloads require `--yes` only when the total exceeds 500 GiB.
+fn check_download_confirmation(
+    resolved: &[ResolvedAccession],
+    yes: bool,
+    has_projects: bool,
+) -> Result<()> {
     let total_size: u64 = resolved.iter().map(|r| r.sra_file.size).sum();
+
+    if has_projects && !yes {
+        eprintln!();
+        print_info_table(resolved);
+        eprintln!();
+        anyhow::bail!(
+            "project downloads require confirmation -- rerun with --yes / -y to proceed ({})",
+            format_size(total_size),
+        );
+    }
 
     if total_size > LARGE_DOWNLOAD_THRESHOLD && !yes {
         eprintln!();
         print_info_table(resolved);
         eprintln!();
         anyhow::bail!(
-            "total download size {} exceeds 500 GiB -- rerun with --yes / -y to confirm",
+            "total download size {} exceeds 100 GiB -- rerun with --yes / -y to confirm",
             format_size(total_size),
         );
+    }
+
+    // For confirmed project downloads, still show the table for visibility.
+    if has_projects {
+        eprintln!();
+        print_info_table(resolved);
+        eprintln!();
     }
 
     Ok(())
