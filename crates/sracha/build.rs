@@ -4,7 +4,15 @@ fn main() {
     let version = std::env::var("CARGO_PKG_VERSION").unwrap();
     let profile = std::env::var("PROFILE").unwrap_or_default();
 
-    let sracha_version = if profile == "release" {
+    // Check if HEAD is an exact release tag — if so, use the plain version.
+    let is_tagged = Command::new("git")
+        .args(["describe", "--tags", "--exact-match", "HEAD"])
+        .output()
+        .ok()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    let sracha_version = if is_tagged {
         version
     } else {
         let git_sha = Command::new("git")
@@ -26,20 +34,28 @@ fn main() {
                     .map(|s| !s.success())
                     .unwrap_or(false);
 
+                let dev = if profile != "release" { "-dev" } else { "" };
                 if dirty {
-                    format!("{version}-dev+{sha}.dirty")
+                    format!("{version}{dev}+{sha}.dirty")
                 } else {
-                    format!("{version}-dev+{sha}")
+                    format!("{version}{dev}+{sha}")
                 }
             }
-            None => format!("{version}-dev"),
+            None => {
+                if profile != "release" {
+                    format!("{version}-dev")
+                } else {
+                    version
+                }
+            }
         }
     };
 
     println!("cargo:rustc-env=SRACHA_VERSION={sracha_version}");
 
-    // Rerun when git state changes (branch switch, commit, staging).
+    // Rerun when git state changes (branch switch, commit, staging, new tags).
     // Paths are relative to the crate manifest directory (crates/sracha/).
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/index");
+    println!("cargo:rerun-if-changed=../../.git/refs/tags");
 }
