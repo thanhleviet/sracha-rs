@@ -199,8 +199,13 @@ async fn main() -> Result<()> {
                 "Resolving {} accession(s)...",
                 style::count(run_accessions.len()),
             );
-            let resolved_all =
-                resolve_accessions(&run_accessions, &sdl_client, args.prefer_sdl, !args.no_runinfo).await?;
+            let resolved_all = resolve_accessions(
+                &run_accessions,
+                &sdl_client,
+                args.prefer_sdl,
+                !args.no_runinfo,
+            )
+            .await?;
             check_download_confirmation(&resolved_all, args.yes, has_projects)?;
             check_disk_space(&resolved_all, &args.output_dir)?;
 
@@ -882,4 +887,153 @@ fn available_space(path: &Path) -> Option<u64> {
 #[cfg(not(unix))]
 fn available_space(_path: &Path) -> Option<u64> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sracha_core::sdl::{ResolvedFile, ResolvedMirror};
+    use std::io::Write;
+
+    fn make_resolved_acc(accession: &str, size: u64) -> ResolvedAccession {
+        ResolvedAccession {
+            accession: accession.into(),
+            sra_file: ResolvedFile {
+                mirrors: vec![ResolvedMirror {
+                    url: "https://example.com/f".into(),
+                    service: "s3".into(),
+                }],
+                size,
+                md5: None,
+                is_lite: false,
+            },
+            vdbcache_file: None,
+            run_info: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // collect_accessions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn collect_from_positional_only() {
+        let args = vec!["SRR000001".to_string(), "SRR000002".to_string()];
+        let result = collect_accessions(&args, None).unwrap();
+        assert_eq!(result, vec!["SRR000001", "SRR000002"]);
+    }
+
+    #[test]
+    fn collect_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("accessions.txt");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        writeln!(f, "SRR000001").unwrap();
+        writeln!(f, "  SRR000002  ").unwrap();
+        writeln!(f, "# comment").unwrap();
+        writeln!(f).unwrap();
+        writeln!(f, "SRR000003").unwrap();
+
+        let result = collect_accessions(&[], Some(&file_path)).unwrap();
+        assert_eq!(result, vec!["SRR000001", "SRR000002", "SRR000003"]);
+    }
+
+    #[test]
+    fn collect_merges_positional_and_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("list.txt");
+        std::fs::write(&file_path, "SRR000002\n").unwrap();
+
+        let args = vec!["SRR000001".to_string()];
+        let result = collect_accessions(&args, Some(&file_path)).unwrap();
+        assert_eq!(result, vec!["SRR000001", "SRR000002"]);
+    }
+
+    #[test]
+    fn collect_empty_errors() {
+        let result = collect_accessions(&[], None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn collect_file_all_comments_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("empty.txt");
+        std::fs::write(&file_path, "# comment\n\n").unwrap();
+
+        let result = collect_accessions(&[], Some(&file_path));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn collect_nonexistent_file_errors() {
+        let result = collect_accessions(&[], Some(Path::new("/nonexistent/list.txt")));
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // check_download_confirmation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn confirmation_ok_with_yes_flag() {
+        let resolved = vec![make_resolved_acc("SRR1", 200 * 1024 * 1024 * 1024)];
+        assert!(check_download_confirmation(&resolved, true, true).is_ok());
+    }
+
+    #[test]
+    fn confirmation_required_for_projects() {
+        let resolved = vec![make_resolved_acc("SRR1", 1000)];
+        assert!(check_download_confirmation(&resolved, false, true).is_err());
+    }
+
+    #[test]
+    fn confirmation_required_for_large_downloads() {
+        let resolved = vec![make_resolved_acc("SRR1", 200 * 1024 * 1024 * 1024)];
+        assert!(check_download_confirmation(&resolved, false, false).is_err());
+    }
+
+    #[test]
+    fn confirmation_ok_for_small_non_project() {
+        let resolved = vec![make_resolved_acc("SRR1", 1000)];
+        assert!(check_download_confirmation(&resolved, false, false).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // check_disk_space
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn disk_space_ok_when_sufficient() {
+        let resolved = vec![make_resolved_acc("SRR1", 1024)];
+        let dir = tempfile::tempdir().unwrap();
+        // Real directory — should have some space available.
+        assert!(check_disk_space(&resolved, dir.path()).is_ok());
+    }
+
+    #[test]
+    fn disk_space_walks_to_existing_ancestor() {
+        let resolved = vec![make_resolved_acc("SRR1", 1024)];
+        let dir = tempfile::tempdir().unwrap();
+        let deep_path = dir.path().join("a/b/c/d/e");
+        // The directory doesn't exist, but check_disk_space should walk up.
+        assert!(check_disk_space(&resolved, &deep_path).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // available_space
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn available_space_returns_some_for_real_path() {
+        let space = available_space(Path::new("/tmp"));
+        assert!(space.is_some());
+        assert!(space.unwrap() > 0);
+    }
+
+    #[test]
+    fn available_space_returns_none_for_nonexistent() {
+        let space = available_space(Path::new("/nonexistent/path/that/does/not/exist"));
+        assert!(space.is_none());
+    }
 }

@@ -303,6 +303,145 @@ fn illumina_paired_spot_count() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Additional mode coverage tests
+// ---------------------------------------------------------------------------
+
+#[ignore]
+#[test]
+fn run_fasta_split3() {
+    let sra_path = ensure_srr28588231();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = test_config(tmp.path(), SplitMode::Split3, CompressionMode::None);
+    config.fasta = true;
+
+    let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR28588231"), &config).unwrap();
+
+    assert!(stats.spots_read > 0);
+    assert!(stats.reads_written > 0);
+
+    for path in &stats.output_files {
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.ends_with(".fasta"),
+            "fasta output should end with .fasta, got {name}"
+        );
+        let data = std::fs::read_to_string(path).unwrap();
+        // FASTA: 2-line records starting with '>'
+        let lines: Vec<&str> = data.lines().collect();
+        assert!(lines.len() >= 2, "need at least 2 lines");
+        assert!(
+            lines[0].starts_with('>'),
+            "first line should start with '>', got {:?}",
+            &lines[0][..lines[0].len().min(40)]
+        );
+        assert!(!lines[1].is_empty(), "sequence line should not be empty");
+    }
+}
+
+#[ignore]
+#[test]
+fn run_fastq_zstd() {
+    let sra_path = ensure_srr28588231();
+    let tmp = tempfile::tempdir().unwrap();
+    let config = test_config(
+        tmp.path(),
+        SplitMode::SplitSpot,
+        CompressionMode::Zstd {
+            level: 1,
+            threads: 2,
+        },
+    );
+
+    let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR28588231"), &config).unwrap();
+
+    assert!(stats.spots_read > 0);
+    for path in &stats.output_files {
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.ends_with(".fastq.zst"),
+            "zstd output should end with .fastq.zst, got {name}"
+        );
+
+        // Decompress and verify FASTQ content.
+        let file = std::fs::File::open(path).unwrap();
+        let mut decoder = zstd::stream::Decoder::new(file).unwrap();
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).unwrap();
+        assert_valid_fastq(&decompressed);
+    }
+}
+
+#[ignore]
+#[test]
+fn run_fastq_interleaved() {
+    let sra_path = ensure_srr28588231();
+    let tmp = tempfile::tempdir().unwrap();
+    let config = test_config(tmp.path(), SplitMode::Interleaved, CompressionMode::None);
+
+    let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR28588231"), &config).unwrap();
+
+    assert!(stats.spots_read > 0);
+    assert_eq!(
+        stats.output_files.len(),
+        1,
+        "interleaved should produce exactly one file"
+    );
+
+    let data = std::fs::read(&stats.output_files[0]).unwrap();
+    assert_valid_fastq(&data);
+
+    // Interleaved: both reads in one file, so reads_written should equal 2 * spots_read.
+    assert_eq!(
+        stats.reads_written,
+        stats.spots_read * 2,
+        "interleaved should write R1+R2 alternating"
+    );
+}
+
+#[ignore]
+#[test]
+fn run_fastq_split_files() {
+    let sra_path = ensure_srr28588231();
+    let tmp = tempfile::tempdir().unwrap();
+    let config = test_config(tmp.path(), SplitMode::SplitFiles, CompressionMode::None);
+
+    let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR28588231"), &config).unwrap();
+
+    assert!(stats.spots_read > 0);
+    assert_eq!(
+        stats.output_files.len(),
+        2,
+        "split-files on paired data should produce 2 files"
+    );
+
+    for path in &stats.output_files {
+        let data = std::fs::read(path).unwrap();
+        assert_valid_fastq(&data);
+    }
+}
+
+#[ignore]
+#[test]
+fn run_fastq_min_read_len_filter() {
+    let sra_path = ensure_srr28588231();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = test_config(tmp.path(), SplitMode::SplitSpot, CompressionMode::None);
+    // SRR28588231 has 151bp reads. Setting min_read_len to 200 should filter all.
+    config.min_read_len = Some(200);
+
+    let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR28588231"), &config).unwrap();
+
+    assert_eq!(
+        stats.reads_written, 0,
+        "min_read_len=200 should filter all 151bp reads"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Byte identity regression tests
+// ---------------------------------------------------------------------------
+
 #[ignore] // requires network on first run
 #[test]
 fn illumina_paired_byte_identity() {

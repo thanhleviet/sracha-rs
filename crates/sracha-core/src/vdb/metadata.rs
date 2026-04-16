@@ -239,3 +239,415 @@ fn parse_attr_nodes(buf: &[u8]) -> Vec<(String, Vec<u8>)> {
     }
     attrs
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // PBSTree builder helpers for synthetic test data
+    // -----------------------------------------------------------------------
+
+    /// Serialize a list of node byte slices into a PBSTree.
+    fn build_pbstree(node_data: &[&[u8]]) -> Vec<u8> {
+        if node_data.is_empty() {
+            return vec![0, 0, 0, 0];
+        }
+
+        let mut data_section = Vec::new();
+        let mut offsets = Vec::new();
+        for nd in node_data {
+            offsets.push(data_section.len());
+            data_section.extend_from_slice(nd);
+        }
+
+        let data_size = data_section.len();
+        let num_nodes = node_data.len();
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(num_nodes as u32).to_le_bytes());
+        buf.extend_from_slice(&(data_size as u32).to_le_bytes());
+
+        // Index entries: 1 byte each for data_size <= 256, 2 for <= 65536, else 4.
+        if data_size <= 256 {
+            for &off in &offsets {
+                buf.push(off as u8);
+            }
+        } else if data_size <= 65536 {
+            for &off in &offsets {
+                buf.extend_from_slice(&(off as u16).to_le_bytes());
+            }
+        } else {
+            for &off in &offsets {
+                buf.extend_from_slice(&(off as u32).to_le_bytes());
+            }
+        }
+
+        buf.extend_from_slice(&data_section);
+        buf
+    }
+
+    /// Build a serialized metadata node.
+    ///
+    /// Encodes: `bits | name | [attrs_pbstree] | value`
+    /// where `bits = (name_len - 1) << 2 | has_children << 1 | has_attrs`.
+    fn build_meta_node(name: &str, value: &[u8], attrs: Option<&[u8]>) -> Vec<u8> {
+        let name_bytes = name.as_bytes();
+        let name_len = name_bytes.len();
+        assert!(
+            (1..=64).contains(&name_len),
+            "name_len must be 1..=64, got {name_len}"
+        );
+
+        let has_attrs = attrs.is_some();
+        let bits: u8 = ((name_len - 1) as u8) << 2 | u8::from(has_attrs);
+
+        let mut buf = Vec::new();
+        buf.push(bits);
+        buf.extend_from_slice(name_bytes);
+        if let Some(attr_data) = attrs {
+            buf.extend_from_slice(attr_data);
+        }
+        buf.extend_from_slice(value);
+        buf
+    }
+
+    /// Build an attribute PBSTree from `(name, value)` pairs.
+    ///
+    /// Each attribute node is serialized as `name\0value`.
+    fn build_attrs_pbstree(attrs: &[(&str, &[u8])]) -> Vec<u8> {
+        let nodes: Vec<Vec<u8>> = attrs
+            .iter()
+            .map(|(name, val)| {
+                let mut node = Vec::new();
+                node.extend_from_slice(name.as_bytes());
+                node.push(0);
+                node.extend_from_slice(val);
+                node
+            })
+            .collect();
+        let refs: Vec<&[u8]> = nodes.iter().map(|n| n.as_slice()).collect();
+        build_pbstree(&refs)
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_read_desc_string
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_desc_biological() {
+        let d = parse_read_desc_string("B|151|").unwrap();
+        assert_eq!(d.read_type, b'B');
+        assert_eq!(d.read_len, 151);
+    }
+
+    #[test]
+    fn read_desc_technical() {
+        let d = parse_read_desc_string("T|50|").unwrap();
+        assert_eq!(d.read_type, b'T');
+        assert_eq!(d.read_len, 50);
+    }
+
+    #[test]
+    fn read_desc_zero_length() {
+        let d = parse_read_desc_string("B|0|").unwrap();
+        assert_eq!(d.read_type, b'B');
+        assert_eq!(d.read_len, 0);
+    }
+
+    #[test]
+    fn read_desc_no_trailing_pipe() {
+        let d = parse_read_desc_string("B|151").unwrap();
+        assert_eq!(d.read_len, 151);
+    }
+
+    #[test]
+    fn read_desc_empty_string() {
+        assert!(parse_read_desc_string("").is_none());
+    }
+
+    #[test]
+    fn read_desc_invalid_type() {
+        assert!(parse_read_desc_string("X|100|").is_none());
+    }
+
+    #[test]
+    fn read_desc_empty_type() {
+        assert!(parse_read_desc_string("|151|").is_none());
+    }
+
+    #[test]
+    fn read_desc_empty_length() {
+        assert!(parse_read_desc_string("B||").is_none());
+    }
+
+    #[test]
+    fn read_desc_non_numeric_length() {
+        assert!(parse_read_desc_string("B|abc|").is_none());
+    }
+
+    #[test]
+    fn read_desc_no_pipe() {
+        assert!(parse_read_desc_string("B").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // detect_platform_from_schema
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn platform_illumina() {
+        assert_eq!(
+            detect_platform_from_schema("NCBI:SRA:Illumina:tbl:phred:v2#1.0.4"),
+            Some("ILLUMINA".into())
+        );
+    }
+
+    #[test]
+    fn platform_454() {
+        assert_eq!(
+            detect_platform_from_schema("NCBI:SRA:_454_:tbl:v2"),
+            Some("LS454".into())
+        );
+    }
+
+    #[test]
+    fn platform_abi_solid() {
+        assert_eq!(
+            detect_platform_from_schema("NCBI:SRA:ABI:tbl:v2"),
+            Some("ABI_SOLID".into())
+        );
+    }
+
+    #[test]
+    fn platform_helicos() {
+        assert_eq!(
+            detect_platform_from_schema("NCBI:SRA:Helicos:tbl:v2"),
+            Some("HELICOS".into())
+        );
+    }
+
+    #[test]
+    fn platform_pacbio() {
+        assert_eq!(
+            detect_platform_from_schema("NCBI:SRA:PacBio:tbl:v2"),
+            Some("PACBIO_SMRT".into())
+        );
+    }
+
+    #[test]
+    fn platform_nanopore() {
+        assert_eq!(
+            detect_platform_from_schema("NCBI:SRA:Nanopore:tbl:v2"),
+            Some("OXFORD_NANOPORE".into())
+        );
+    }
+
+    #[test]
+    fn platform_iontorrent() {
+        assert_eq!(
+            detect_platform_from_schema("NCBI:SRA:IonTorrent:tbl:v2"),
+            Some("ION_TORRENT".into())
+        );
+    }
+
+    #[test]
+    fn platform_unknown_schema() {
+        assert_eq!(detect_platform_from_schema("NCBI:SRA:Unknown:tbl:v2"), None);
+    }
+
+    #[test]
+    fn platform_empty_string() {
+        assert_eq!(detect_platform_from_schema(""), None);
+    }
+
+    #[test]
+    fn platform_case_sensitive() {
+        assert_eq!(detect_platform_from_schema("illumina"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // infer_nreads_from_schema
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn infer_nreads_illumina() {
+        assert_eq!(
+            infer_nreads_from_schema("NCBI:SRA:Illumina:tbl:phred:v2"),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn infer_nreads_non_illumina() {
+        assert_eq!(infer_nreads_from_schema("NCBI:SRA:PacBio:tbl:v2"), None);
+    }
+
+    #[test]
+    fn infer_nreads_empty() {
+        assert_eq!(infer_nreads_from_schema(""), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_meta_node
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn meta_node_simple() {
+        let data = build_meta_node("test", b"hello", None);
+        let node = parse_meta_node(&data).unwrap();
+        assert_eq!(node.name, "test");
+        assert_eq!(node.value, b"hello");
+        assert!(node.attrs.is_empty());
+    }
+
+    #[test]
+    fn meta_node_empty_value() {
+        let data = build_meta_node("x", b"", None);
+        let node = parse_meta_node(&data).unwrap();
+        assert_eq!(node.name, "x");
+        assert!(node.value.is_empty());
+    }
+
+    #[test]
+    fn meta_node_with_attrs() {
+        let attrs = build_attrs_pbstree(&[("key", b"val")]);
+        let data = build_meta_node("n", b"body", Some(&attrs));
+        let node = parse_meta_node(&data).unwrap();
+        assert_eq!(node.name, "n");
+        assert_eq!(node.value, b"body");
+        assert_eq!(node.attrs.len(), 1);
+        assert_eq!(node.attrs[0].0, "key");
+        assert_eq!(node.attrs[0].1, b"val");
+    }
+
+    #[test]
+    fn meta_node_empty_buf() {
+        assert!(parse_meta_node(&[]).is_none());
+    }
+
+    #[test]
+    fn meta_node_truncated_name() {
+        // bits says name_len = 4 but only 2 bytes follow
+        assert!(parse_meta_node(&[0x0C, b'a', b'b']).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_read_structure (end-to-end with synthetic PBSTree)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_structure_from_read_nodes() {
+        let r0 = build_meta_node("READ_0", b"B|151|", None);
+        let r1 = build_meta_node("READ_1", b"B|151|", None);
+        let tree = build_pbstree(&[&r0, &r1]);
+
+        let descs = parse_read_structure(&tree).unwrap();
+        assert_eq!(descs.len(), 2);
+        assert_eq!(descs[0].read_type, b'B');
+        assert_eq!(descs[0].read_len, 151);
+        assert_eq!(descs[1].read_type, b'B');
+        assert_eq!(descs[1].read_len, 151);
+    }
+
+    #[test]
+    fn read_structure_sorts_by_index() {
+        // READ_1 appears before READ_0 in the tree — output should be sorted.
+        let r1 = build_meta_node("READ_1", b"T|50|", None);
+        let r0 = build_meta_node("READ_0", b"B|151|", None);
+        let tree = build_pbstree(&[&r1, &r0]);
+
+        let descs = parse_read_structure(&tree).unwrap();
+        assert_eq!(descs.len(), 2);
+        assert_eq!(descs[0].read_type, b'B');
+        assert_eq!(descs[0].read_len, 151);
+        assert_eq!(descs[1].read_type, b'T');
+        assert_eq!(descs[1].read_len, 50);
+    }
+
+    #[test]
+    fn read_structure_from_schema_attr() {
+        let attrs = build_attrs_pbstree(&[("name", b"NCBI:SRA:Illumina:tbl:phred:v2#1.0.4")]);
+        let schema = build_meta_node("schema", b"", Some(&attrs));
+        let tree = build_pbstree(&[&schema]);
+
+        let descs = parse_read_structure(&tree).unwrap();
+        assert_eq!(descs.len(), 2);
+        assert_eq!(descs[0].read_type, b'B');
+        assert_eq!(descs[0].read_len, 0);
+    }
+
+    #[test]
+    fn read_structure_from_schema_value() {
+        let schema = build_meta_node("schema", b"NCBI:SRA:Illumina:tbl:phred:v2#1.0.4", None);
+        let tree = build_pbstree(&[&schema]);
+
+        let descs = parse_read_structure(&tree).unwrap();
+        assert_eq!(descs.len(), 2);
+    }
+
+    #[test]
+    fn read_structure_prefers_read_nodes_over_schema() {
+        let r0 = build_meta_node("READ_0", b"B|100|", None);
+        let attrs = build_attrs_pbstree(&[("name", b"NCBI:SRA:Illumina:tbl:phred:v2")]);
+        let schema = build_meta_node("schema", b"", Some(&attrs));
+        let tree = build_pbstree(&[&r0, &schema]);
+
+        let descs = parse_read_structure(&tree).unwrap();
+        // Strategy 1 (READ_ nodes) should win over Strategy 2 (schema).
+        assert_eq!(descs.len(), 1);
+        assert_eq!(descs[0].read_len, 100);
+    }
+
+    #[test]
+    fn read_structure_no_info_errors() {
+        let other = build_meta_node("other", b"stuff", None);
+        let tree = build_pbstree(&[&other]);
+        assert!(parse_read_structure(&tree).is_err());
+    }
+
+    #[test]
+    fn read_structure_empty_tree_errors() {
+        let tree = build_pbstree(&[]);
+        assert!(parse_read_structure(&tree).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // detect_platform (end-to-end with synthetic PBSTree)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn detect_platform_from_schema_attr() {
+        let attrs = build_attrs_pbstree(&[("name", b"NCBI:SRA:Illumina:tbl:phred:v2#1.0.4")]);
+        let schema = build_meta_node("schema", b"", Some(&attrs));
+        let tree = build_pbstree(&[&schema]);
+        assert_eq!(detect_platform(&tree), Some("ILLUMINA".into()));
+    }
+
+    #[test]
+    fn detect_platform_from_schema_value() {
+        let schema = build_meta_node("schema", b"NCBI:SRA:PacBio:tbl:v2", None);
+        let tree = build_pbstree(&[&schema]);
+        assert_eq!(detect_platform(&tree), Some("PACBIO_SMRT".into()));
+    }
+
+    #[test]
+    fn detect_platform_no_schema_node() {
+        let other = build_meta_node("other", b"data", None);
+        let tree = build_pbstree(&[&other]);
+        assert_eq!(detect_platform(&tree), None);
+    }
+
+    #[test]
+    fn detect_platform_empty_tree() {
+        let tree = build_pbstree(&[]);
+        assert_eq!(detect_platform(&tree), None);
+    }
+
+    #[test]
+    fn detect_platform_unknown_platform() {
+        let schema = build_meta_node("schema", b"some_unknown_schema", None);
+        let tree = build_pbstree(&[&schema]);
+        assert_eq!(detect_platform(&tree), None);
+    }
+}

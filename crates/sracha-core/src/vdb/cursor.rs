@@ -743,4 +743,221 @@ mod tests {
         assert!(cursor.spot_group_col().is_none());
         let _ = std::fs::remove_file(&sra_path);
     }
+
+    #[test]
+    fn has_illumina_name_parts_false_in_minimal_archive() {
+        let archive_bytes = build_minimal_sra_archive();
+        let sra_path = write_temp_sra(&archive_bytes);
+        let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
+        let cursor = VdbCursor::open(&mut archive, &sra_path).unwrap();
+        assert!(!cursor.has_illumina_name_parts());
+        let _ = std::fs::remove_file(&sra_path);
+    }
+
+    #[test]
+    fn metadata_none_without_md_cur() {
+        let archive_bytes = build_minimal_sra_archive();
+        let sra_path = write_temp_sra(&archive_bytes);
+        let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
+        let cursor = VdbCursor::open(&mut archive, &sra_path).unwrap();
+        assert!(cursor.metadata_reads_per_spot().is_none());
+        assert!(cursor.metadata_read_lengths().is_none());
+        assert!(cursor.platform().is_none());
+        let _ = std::fs::remove_file(&sra_path);
+    }
+
+    /// Build a metadata PBSTree (for md/cur) with READ_ nodes and/or schema.
+    fn build_metadata_bytes(read_descs: &[(&str, &[u8])], schema_value: Option<&[u8]>) -> Vec<u8> {
+        // Build meta nodes. Each metadata node is:
+        //   bits(1) | name(N) | value(...)
+        // where bits = (name_len - 1) << 2 | has_children << 1 | has_attrs
+        let mut nodes: Vec<Vec<u8>> = Vec::new();
+        for (name, value) in read_descs {
+            let name_bytes = name.as_bytes();
+            let bits: u8 = ((name_bytes.len() - 1) as u8) << 2;
+            let mut node = vec![bits];
+            node.extend_from_slice(name_bytes);
+            node.extend_from_slice(value);
+            nodes.push(node);
+        }
+        if let Some(sv) = schema_value {
+            let name = b"schema";
+            let bits: u8 = ((name.len() - 1) as u8) << 2;
+            let mut node = vec![bits];
+            node.extend_from_slice(name);
+            node.extend_from_slice(sv);
+            nodes.push(node);
+        }
+        let refs: Vec<&[u8]> = nodes.iter().map(|v| v.as_slice()).collect();
+        let tree = crate::vdb::kar::test_helpers::build_pbstree(&refs);
+
+        // Prepend 8-byte KDBHdr (endian tag + version).
+        let mut md = Vec::new();
+        md.extend_from_slice(&0x05031988u32.to_le_bytes()); // endian
+        md.extend_from_slice(&1u32.to_le_bytes()); // version
+        md.extend_from_slice(&tree);
+        md
+    }
+
+    /// Build a KAR archive with SEQUENCE table + optional md/cur metadata.
+    ///
+    /// Uses `tbl/SEQUENCE/...` layout directly (no accession root wrapper)
+    /// so that `detect_metadata` finds `tbl/SEQUENCE/md/cur` at the expected path.
+    fn build_sra_archive_with_metadata(md_bytes: Option<&[u8]>) -> Vec<u8> {
+        let col_data = b"ACGTN";
+        let idx1 = build_idx1_v1(col_data.len() as u64, 1, 0);
+        let idx0 = build_kdb_blob_loc(0, 5, 1, 1);
+
+        let mut data_section = Vec::new();
+        let idx1_off = 0u64;
+        data_section.extend_from_slice(&idx1);
+        let idx0_off = data_section.len() as u64;
+        data_section.extend_from_slice(&idx0);
+        let data_off = data_section.len() as u64;
+        data_section.extend_from_slice(col_data);
+
+        let md_off = data_section.len() as u64;
+        let md_len = md_bytes.map(|b| {
+            data_section.extend_from_slice(b);
+            b.len() as u64
+        });
+
+        let idx1_node = build_file_node("idx1", idx1_off, idx1.len() as u64);
+        let idx0_node = build_file_node("idx0", idx0_off, idx0.len() as u64);
+        let data_node = build_file_node("data", data_off, col_data.len() as u64);
+
+        let read_dir = build_dir_node("READ", &[&data_node, &idx0_node, &idx1_node]);
+        let col_dir = build_dir_node("col", &[&read_dir]);
+        let seq_dir = if let Some(ml) = md_len {
+            let md_file = build_file_node("cur", md_off, ml);
+            let md_dir = build_dir_node("md", &[&md_file]);
+            build_dir_node("SEQUENCE", &[&col_dir, &md_dir])
+        } else {
+            build_dir_node("SEQUENCE", &[&col_dir])
+        };
+        let tbl_dir = build_dir_node("tbl", &[&seq_dir]);
+
+        build_kar_archive(&[&tbl_dir], &data_section)
+    }
+
+    #[test]
+    fn metadata_from_read_nodes() {
+        let md = build_metadata_bytes(&[("READ_0", b"B|151|"), ("READ_1", b"B|151|")], None);
+        let archive_bytes = build_sra_archive_with_metadata(Some(&md));
+        let sra_path = write_temp_sra(&archive_bytes);
+        let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
+        let cursor = VdbCursor::open(&mut archive, &sra_path).unwrap();
+
+        assert_eq!(cursor.metadata_reads_per_spot(), Some(2));
+        assert_eq!(cursor.metadata_read_lengths(), Some(vec![151, 151]));
+        let _ = std::fs::remove_file(&sra_path);
+    }
+
+    #[test]
+    fn metadata_read_lengths_none_when_zero() {
+        // READ_ nodes with len=0 → metadata_read_lengths returns None.
+        let md = build_metadata_bytes(&[("READ_0", b"B|0|"), ("READ_1", b"B|0|")], None);
+        let archive_bytes = build_sra_archive_with_metadata(Some(&md));
+        let sra_path = write_temp_sra(&archive_bytes);
+        let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
+        let cursor = VdbCursor::open(&mut archive, &sra_path).unwrap();
+
+        assert_eq!(cursor.metadata_reads_per_spot(), Some(2));
+        assert_eq!(cursor.metadata_read_lengths(), None);
+        let _ = std::fs::remove_file(&sra_path);
+    }
+
+    #[test]
+    fn platform_detected_from_schema_value() {
+        let md = build_metadata_bytes(&[], Some(b"NCBI:SRA:Illumina:tbl:phred:v2#1.0.4"));
+        let archive_bytes = build_sra_archive_with_metadata(Some(&md));
+        let sra_path = write_temp_sra(&archive_bytes);
+        let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
+        let cursor = VdbCursor::open(&mut archive, &sra_path).unwrap();
+
+        assert_eq!(cursor.platform(), Some("ILLUMINA"));
+        let _ = std::fs::remove_file(&sra_path);
+    }
+
+    #[test]
+    fn reject_csra_with_cmp_read() {
+        // Build archive with CMP_READ column (cSRA indicator).
+        let col_data = b"ACGTN";
+        let idx1 = build_idx1_v1(col_data.len() as u64, 1, 0);
+        let idx0 = build_kdb_blob_loc(0, 5, 1, 1);
+
+        let mut data_section = Vec::new();
+        let idx1_off = 0u64;
+        data_section.extend_from_slice(&idx1);
+        let idx0_off = data_section.len() as u64;
+        data_section.extend_from_slice(&idx0);
+        let data_off = data_section.len() as u64;
+        data_section.extend_from_slice(col_data);
+
+        let idx1_node = build_file_node("idx1", idx1_off, idx1.len() as u64);
+        let idx0_node = build_file_node("idx0", idx0_off, idx0.len() as u64);
+        let data_node = build_file_node("data", data_off, col_data.len() as u64);
+
+        let read_dir = build_dir_node("READ", &[&data_node, &idx0_node, &idx1_node]);
+        // Add a CMP_READ column directory.
+        let cmp_data_node = build_file_node("data", data_off, col_data.len() as u64);
+        let cmp_read_dir = build_dir_node("CMP_READ", &[&cmp_data_node]);
+        let col_dir = build_dir_node("col", &[&read_dir, &cmp_read_dir]);
+        let seq_dir = build_dir_node("SEQUENCE", &[&col_dir]);
+        let tbl_dir = build_dir_node("tbl", &[&seq_dir]);
+        let root_dir = build_dir_node("SRR28588231", &[&tbl_dir]);
+
+        let archive_bytes = build_kar_archive(&[&root_dir], &data_section);
+        let sra_path = write_temp_sra(&archive_bytes);
+        let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
+        let result = VdbCursor::open(&mut archive, &sra_path);
+        let err = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected cSRA rejection error"),
+        };
+        assert!(
+            err.contains("aligned SRA") || err.contains("cSRA"),
+            "expected cSRA error, got: {err}"
+        );
+        let _ = std::fs::remove_file(&sra_path);
+    }
+
+    #[test]
+    fn flat_table_layout_detected() {
+        // Build a flat-table layout: col/READ/{idx0,idx1,data} (no tbl/ or SEQUENCE/).
+        let col_data = b"ACGTN";
+        let idx1 = build_idx1_v1(col_data.len() as u64, 1, 0);
+        let idx0 = build_kdb_blob_loc(0, 5, 1, 1);
+
+        let mut data_section = Vec::new();
+        let idx1_off = 0u64;
+        data_section.extend_from_slice(&idx1);
+        let idx0_off = data_section.len() as u64;
+        data_section.extend_from_slice(&idx0);
+        let data_off = data_section.len() as u64;
+        data_section.extend_from_slice(col_data);
+
+        let idx1_node = build_file_node("idx1", idx1_off, idx1.len() as u64);
+        let idx0_node = build_file_node("idx0", idx0_off, idx0.len() as u64);
+        let data_node = build_file_node("data", data_off, col_data.len() as u64);
+
+        let read_dir = build_dir_node("READ", &[&data_node, &idx0_node, &idx1_node]);
+        let col_dir = build_dir_node("col", &[&read_dir]);
+
+        let archive_bytes = build_kar_archive(&[&col_dir], &data_section);
+        let sra_path = write_temp_sra(&archive_bytes);
+        let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
+        let cursor = VdbCursor::open(&mut archive, &sra_path).unwrap();
+        assert_eq!(cursor.spot_count(), 1);
+        let _ = std::fs::remove_file(&sra_path);
+    }
+
+    #[test]
+    fn load_name_templates_empty_on_no_skey() {
+        let archive_bytes = build_minimal_sra_archive();
+        let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
+        let (templates, starts) = VdbCursor::load_name_templates(&mut archive);
+        assert!(templates.is_empty());
+        assert!(starts.is_empty());
+    }
 }
