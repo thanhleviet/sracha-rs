@@ -78,6 +78,7 @@ async fn main() -> Result<()> {
             let resolved_all =
                 resolve_accessions(&run_accessions, &client, args.prefer_sdl, false).await?;
             check_download_confirmation(&resolved_all, args.yes, has_projects)?;
+            check_disk_space(&resolved_all, &args.output_dir)?;
 
             tokio::fs::create_dir_all(&args.output_dir).await?;
             for resolved in &resolved_all {
@@ -201,6 +202,7 @@ async fn main() -> Result<()> {
             let resolved_all =
                 resolve_accessions(&run_accessions, &sdl_client, args.prefer_sdl, true).await?;
             check_download_confirmation(&resolved_all, args.yes, has_projects)?;
+            check_disk_space(&resolved_all, &args.output_dir)?;
 
             // Check platform — reject legacy platforms with complex read structures.
             for resolved in &resolved_all {
@@ -765,4 +767,61 @@ fn check_download_confirmation(
     }
 
     Ok(())
+}
+
+/// Check that the target directory has enough free disk space for the download.
+///
+/// Uses `statvfs` to query available space. Falls back silently if the check
+/// fails (e.g. the directory doesn't exist yet or the filesystem doesn't
+/// support `statvfs`).
+fn check_disk_space(resolved: &[ResolvedAccession], output_dir: &Path) -> Result<()> {
+    let total_size: u64 = resolved.iter().map(|r| r.sra_file.size).sum();
+
+    // Find the nearest existing ancestor to stat (output_dir may not exist yet).
+    let stat_path = {
+        let mut p = output_dir.to_path_buf();
+        while !p.exists() {
+            if !p.pop() {
+                // Can't find any existing ancestor — skip the check.
+                return Ok(());
+            }
+        }
+        p
+    };
+
+    let available = available_space(&stat_path);
+    let Some(available) = available else {
+        return Ok(());
+    };
+
+    if total_size > available {
+        anyhow::bail!(
+            "not enough disk space: download requires {} but only {} available in {}",
+            format_size(total_size),
+            format_size(available),
+            output_dir.display(),
+        );
+    }
+
+    Ok(())
+}
+
+/// Query available disk space via `statvfs`.
+#[cfg(unix)]
+fn available_space(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if ret != 0 {
+        return None;
+    }
+    Some(stat.f_bavail * stat.f_frsize)
+}
+
+#[cfg(not(unix))]
+fn available_space(_path: &Path) -> Option<u64> {
+    None
 }
