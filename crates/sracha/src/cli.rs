@@ -55,14 +55,14 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Download, convert, and compress in one shot
+    Get(GetArgs),
+
     /// Download SRA/SRA-lite files
     Fetch(FetchArgs),
 
     /// Convert SRA file(s) to FASTQ
     Fastq(FastqArgs),
-
-    /// Download, convert, and compress in one shot
-    Get(GetArgs),
 
     /// Show accession metadata
     Info(InfoArgs),
@@ -73,6 +73,7 @@ pub enum Command {
 
 #[derive(Args)]
 pub struct FetchArgs {
+
     /// SRA accession(s) to download (run, study, or BioProject)
     pub accessions: Vec<String>,
 
@@ -81,95 +82,96 @@ pub struct FetchArgs {
     pub accession_list: Option<PathBuf>,
 
     /// Output directory
-    #[arg(short = 'O', long, default_value = ".")]
+    #[arg(short = 'O', long, default_value = ".", help_heading = "Output")]
     pub output_dir: PathBuf,
 
     /// Download format
-    #[arg(long, default_value = "sra")]
+    #[arg(long, default_value = "sra", help_heading = "Output")]
     pub format: SraFormat,
+
+    /// Overwrite existing files
+    #[arg(short, long, help_heading = "Output")]
+    pub force: bool,
 
     /// HTTP connections per file
     #[arg(long, default_value_t = 8)]
     pub connections: usize,
 
-    /// Overwrite existing files
+    /// Confirm project downloads and large downloads (>100 GiB)
     #[arg(short, long)]
-    pub force: bool,
+    pub yes: bool,
 
     /// Disable progress bar
     #[arg(long)]
     pub no_progress: bool,
 
     /// Verify MD5 after download
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced")]
     pub validate: bool,
 
     /// Disable download resume (re-download from scratch)
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced")]
     pub no_resume: bool,
 
-    /// Confirm project downloads and large downloads (>100 GiB)
-    #[arg(short, long)]
-    pub yes: bool,
-
     /// Skip direct S3 and resolve via the SDL API
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced")]
     pub prefer_sdl: bool,
 }
 
 #[derive(Args)]
 pub struct FastqArgs {
+
     /// SRA file path(s) (.sra files from `sracha fetch`)
     #[arg(required = true)]
     pub inputs: Vec<String>,
 
+    /// Output directory
+    #[arg(short = 'O', long, default_value = ".", help_heading = "Output")]
+    pub output_dir: PathBuf,
+
+    /// Write to stdout
+    #[arg(short = 'Z', long, help_heading = "Output")]
+    pub stdout: bool,
+
     /// Split mode
-    #[arg(long, default_value = "split-3")]
+    #[arg(long, default_value = "split-3", help_heading = "Output")]
     pub split: SplitMode,
 
+    /// Output FASTA instead of FASTQ (drops quality scores)
+    #[arg(long, help_heading = "Output")]
+    pub fasta: bool,
+
+    /// Overwrite existing files
+    #[arg(short, long, help_heading = "Output")]
+    pub force: bool,
+
     /// Disable gzip compression (compressed by default)
-    #[arg(long, conflicts_with = "zstd")]
+    #[arg(long, conflicts_with = "zstd", help_heading = "Compression")]
     pub no_gzip: bool,
 
     /// Gzip compression level
-    #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u32).range(1..=9))]
+    #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u32).range(1..=9), help_heading = "Compression")]
     pub gzip_level: u32,
 
     /// Use zstd compression instead of gzip
-    #[arg(long, conflicts_with = "no_gzip")]
+    #[arg(long, conflicts_with = "no_gzip", help_heading = "Compression")]
     pub zstd: bool,
 
     /// Zstd compression level (1-22)
-    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(i32).range(1..=22))]
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(i32).range(1..=22), help_heading = "Compression")]
     pub zstd_level: i32,
 
-    /// Output FASTA instead of FASTQ (drops quality scores)
-    #[arg(long)]
-    pub fasta: bool,
+    /// Minimum read length
+    #[arg(long, help_heading = "Filtering")]
+    pub min_read_len: Option<u32>,
+
+    /// Include technical reads (skipped by default)
+    #[arg(long, help_heading = "Filtering")]
+    pub include_technical: bool,
 
     /// Number of threads for decode [default: 8]
     #[arg(short, long, default_value_t = 8)]
     pub threads: usize,
-
-    /// Minimum read length
-    #[arg(long)]
-    pub min_read_len: Option<u32>,
-
-    /// Include technical reads (skipped by default)
-    #[arg(long)]
-    pub include_technical: bool,
-
-    /// Write to stdout
-    #[arg(short = 'Z', long)]
-    pub stdout: bool,
-
-    /// Output directory
-    #[arg(short = 'O', long, default_value = ".")]
-    pub output_dir: PathBuf,
-
-    /// Overwrite existing files
-    #[arg(short, long)]
-    pub force: bool,
 
     /// Disable progress bar
     #[arg(long)]
@@ -178,6 +180,7 @@ pub struct FastqArgs {
 
 #[derive(Args)]
 pub struct GetArgs {
+
     /// SRA accession(s) to download and convert (run, study, or BioProject)
     pub accessions: Vec<String>,
 
@@ -186,36 +189,48 @@ pub struct GetArgs {
     pub accession_list: Option<PathBuf>,
 
     /// Output directory
-    #[arg(short = 'O', long, default_value = ".")]
+    #[arg(short = 'O', long, default_value = ".", help_heading = "Output")]
     pub output_dir: PathBuf,
 
-    /// Download format
-    #[arg(long, default_value = "sra")]
-    pub format: SraFormat,
+    /// Write to stdout (stream interleaved FASTQ, auto-delete temp SRA)
+    #[arg(short = 'Z', long, help_heading = "Output")]
+    pub stdout: bool,
 
     /// Split mode
-    #[arg(long, default_value = "split-3")]
+    #[arg(long, default_value = "split-3", help_heading = "Output")]
     pub split: SplitMode,
 
+    /// Output FASTA instead of FASTQ (drops quality scores)
+    #[arg(long, help_heading = "Output")]
+    pub fasta: bool,
+
+    /// Overwrite existing files
+    #[arg(short, long, help_heading = "Output")]
+    pub force: bool,
+
     /// Disable gzip compression (compressed by default)
-    #[arg(long, conflicts_with = "zstd")]
+    #[arg(long, conflicts_with = "zstd", help_heading = "Compression")]
     pub no_gzip: bool,
 
     /// Gzip compression level
-    #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u32).range(1..=9))]
+    #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u32).range(1..=9), help_heading = "Compression")]
     pub gzip_level: u32,
 
     /// Use zstd compression instead of gzip
-    #[arg(long, conflicts_with = "no_gzip")]
+    #[arg(long, conflicts_with = "no_gzip", help_heading = "Compression")]
     pub zstd: bool,
 
     /// Zstd compression level (1-22)
-    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(i32).range(1..=22))]
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(i32).range(1..=22), help_heading = "Compression")]
     pub zstd_level: i32,
 
-    /// Output FASTA instead of FASTQ (drops quality scores)
-    #[arg(long)]
-    pub fasta: bool,
+    /// Minimum read length
+    #[arg(long, help_heading = "Filtering")]
+    pub min_read_len: Option<u32>,
+
+    /// Include technical reads (skipped by default)
+    #[arg(long, help_heading = "Filtering")]
+    pub include_technical: bool,
 
     /// Number of threads for decode [default: 8]
     #[arg(short, long, default_value_t = 8)]
@@ -225,42 +240,30 @@ pub struct GetArgs {
     #[arg(long, default_value_t = 8)]
     pub connections: usize,
 
-    /// Minimum read length
-    #[arg(long)]
-    pub min_read_len: Option<u32>,
-
-    /// Include technical reads (skipped by default)
-    #[arg(long)]
-    pub include_technical: bool,
-
-    /// Write to stdout (stream interleaved FASTQ, auto-delete temp SRA)
-    #[arg(short = 'Z', long)]
-    pub stdout: bool,
-
-    /// Overwrite existing files
+    /// Confirm project downloads and large downloads (>100 GiB)
     #[arg(short, long)]
-    pub force: bool,
+    pub yes: bool,
 
     /// Disable progress bar
     #[arg(long)]
     pub no_progress: bool,
 
+    /// Download format
+    #[arg(long, default_value = "sra", help_heading = "Advanced")]
+    pub format: SraFormat,
+
     /// Disable download resume (re-download from scratch)
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced")]
     pub no_resume: bool,
-
-    /// Confirm project downloads and large downloads (>100 GiB)
-    #[arg(short, long)]
-    pub yes: bool,
-
-    /// Skip direct S3 and resolve via the SDL API
-    #[arg(long)]
-    pub prefer_sdl: bool,
 
     /// Skip the EUtils RunInfo API call (read structure will be derived
     /// from VDB file metadata instead).
-    #[arg(long)]
+    #[arg(long, help_heading = "Advanced")]
     pub no_runinfo: bool,
+
+    /// Skip direct S3 and resolve via the SDL API
+    #[arg(long, help_heading = "Advanced")]
+    pub prefer_sdl: bool,
 }
 
 #[derive(Args)]
