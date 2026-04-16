@@ -320,7 +320,7 @@ struct DownloadProgress {
 }
 
 /// Compute the path of the progress sidecar file.
-fn progress_path(output_path: &Path) -> PathBuf {
+pub(crate) fn progress_path(output_path: &Path) -> PathBuf {
     let filename = output_path
         .file_name()
         .map(|f| f.to_string_lossy().to_string())

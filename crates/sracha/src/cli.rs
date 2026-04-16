@@ -84,6 +84,10 @@ pub struct FetchArgs {
     #[arg(short = 'O', long, default_value = ".")]
     pub output_dir: PathBuf,
 
+    /// Download format
+    #[arg(long, default_value = "sra")]
+    pub format: SraFormat,
+
     /// HTTP connections per file
     #[arg(long, default_value_t = 8)]
     pub connections: usize,
@@ -185,6 +189,10 @@ pub struct GetArgs {
     #[arg(short = 'O', long, default_value = ".")]
     pub output_dir: PathBuf,
 
+    /// Download format
+    #[arg(long, default_value = "sra")]
+    pub format: SraFormat,
+
     /// Split mode
     #[arg(long, default_value = "split-3")]
     pub split: SplitMode,
@@ -278,6 +286,14 @@ pub struct ValidateArgs {
     /// Disable progress bar
     #[arg(long)]
     pub no_progress: bool,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum SraFormat {
+    /// Full quality scores
+    Sra,
+    /// Simplified quality scores (smaller files)
+    Sralite,
 }
 
 #[derive(Clone, Copy, ValueEnum)]

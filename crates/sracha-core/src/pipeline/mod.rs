@@ -1927,6 +1927,9 @@ pub async fn download_sra(
             result = dl_future => result?,
             _ = poll_cancelled(flag) => {
                 tracing::info!("{accession}: download cancelled");
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                let sidecar = crate::download::progress_path(&temp_path);
+                let _ = tokio::fs::remove_file(&sidecar).await;
                 return Err(Error::Cancelled { output_files: vec![] });
             }
         }

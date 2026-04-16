@@ -61,6 +61,23 @@ fn rand_jitter_ms() -> u64 {
     (nanos % 500) as u64
 }
 
+/// Format preference for SRA downloads.
+///
+/// Controls the `capability` query parameter sent to the SDL API:
+/// - `Sra` (default): no capability parameter, returns SRA Normalized from S3 ODP.
+/// - `Sralite`: sends `capability=zqa:z`, returns SRA-lite from NCBI servers.
+///
+/// SRA-lite files are 2-10x smaller but use simplified quality scores
+/// (Q30 pass-filter, Q3 reject).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FormatPreference {
+    /// SRA Normalized (full quality scores). Default.
+    #[default]
+    Sra,
+    /// SRA-lite (simplified quality scores, smaller files).
+    Sralite,
+}
+
 /// A single download mirror for a resolved file.
 #[derive(Debug, Clone)]
 pub struct ResolvedMirror {
@@ -135,10 +152,20 @@ impl SdlClient {
     /// Resolve one or more accessions to download locations via the SDL API.
     ///
     /// Uses GET with query parameters: `?acc=SRR000001&acc=SRR000002`
-    pub async fn resolve(&self, accessions: &[String]) -> Result<SdlResponse> {
+    /// When `format` is `Sralite`, appends `capability=zqa:z` to request
+    /// SRA-lite files from the SDL API.
+    pub async fn resolve(
+        &self,
+        accessions: &[String],
+        format: FormatPreference,
+    ) -> Result<SdlResponse> {
         let mut url = reqwest::Url::parse(SDL_URL).expect("invalid SDL URL");
         for acc in accessions {
             url.query_pairs_mut().append_pair("acc", acc);
+        }
+        if format == FormatPreference::Sralite {
+            url.query_pairs_mut()
+                .append_pair("capability", "zqa:z");
         }
 
         tracing::debug!("SDL request: {url}");
@@ -169,8 +196,12 @@ impl SdlClient {
     /// Also queries the NCBI EUtils API for read structure metadata (nreads,
     /// per-read lengths). This is used as the authoritative source for
     /// splitting paired-end reads when the SRA file lacks a `READ_LEN` column.
-    pub async fn resolve_one(&self, accession: &str) -> Result<ResolvedAccession> {
-        let response = self.resolve(&[accession.to_string()]).await?;
+    pub async fn resolve_one(
+        &self,
+        accession: &str,
+        format: FormatPreference,
+    ) -> Result<ResolvedAccession> {
+        let response = self.resolve(&[accession.to_string()], format).await?;
 
         let result = response
             .find_result(accession)
@@ -214,13 +245,14 @@ impl SdlClient {
     pub async fn resolve_many(
         &self,
         accessions: &[String],
+        format: FormatPreference,
     ) -> Result<Vec<Result<ResolvedAccession>>> {
         if accessions.is_empty() {
             return Ok(Vec::new());
         }
 
         // Single batched SDL call.
-        let sdl_response = self.resolve(accessions).await?;
+        let sdl_response = self.resolve(accessions, format).await?;
 
         // Single batched EUtils RunInfo call (non-fatal).
         let run_info_map = self.fetch_run_info_batch(accessions).await;

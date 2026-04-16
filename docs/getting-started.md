@@ -89,6 +89,14 @@ sracha get SRR28588231 --format sralite
 
 Quality scores will be uniform: Q30 for pass-filter reads, Q3 for rejects.
 
+!!! note
+    sracha's parallel downloads and streaming decode are typically
+    3-7.5x faster than sra-tools. This speed gain may reduce the need
+    for SRA-lite, since the download bottleneck that motivated smaller
+    files is largely eliminated. Use `--format sralite` when quality
+    scores genuinely aren't needed for your analysis (e.g., alignment-only
+    workflows).
+
 ## Split modes
 
 | Mode | Flag | Output |

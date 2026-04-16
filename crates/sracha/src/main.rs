@@ -43,7 +43,7 @@ where
 use cli::{Cli, Command};
 use sracha_core::accession::{self, InputAccession};
 use sracha_core::fastq::CompressionMode;
-use sracha_core::sdl::{ResolvedAccession, SdlClient};
+use sracha_core::sdl::{FormatPreference, ResolvedAccession, SdlClient};
 use sracha_core::util::format_size;
 
 #[tokio::main]
@@ -82,8 +82,10 @@ async fn main() -> Result<()> {
                 "Resolving {} accession(s)...",
                 style::count(run_accessions.len()),
             );
+            let format = format_preference(args.format);
             let resolved_all =
-                resolve_accessions(&run_accessions, &client, args.prefer_sdl, false).await?;
+                resolve_accessions(&run_accessions, &client, args.prefer_sdl, false, format)
+                    .await?;
             check_download_confirmation(&resolved_all, args.yes, has_projects)?;
             check_disk_space(&resolved_all, &args.output_dir)?;
 
@@ -224,11 +226,13 @@ async fn main() -> Result<()> {
                 "Resolving {} accession(s)...",
                 style::count(run_accessions.len()),
             );
+            let format = format_preference(args.format);
             let resolved_all = resolve_accessions(
                 &run_accessions,
                 &sdl_client,
                 args.prefer_sdl,
                 !args.no_runinfo,
+                format,
             )
             .await?;
             check_download_confirmation(&resolved_all, args.yes, has_projects)?;
@@ -434,9 +438,10 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Abort any in-flight prefetch download.
+            // Let any in-flight prefetch download detect the cancellation flag
+            // and clean up its temp file gracefully (~100ms).
             if let Some(handle) = pending_download.take() {
-                handle.abort();
+                let _ = handle.await;
             }
 
             // Print summary and exit if interrupted.
@@ -465,7 +470,10 @@ async fn main() -> Result<()> {
             let (run_accessions, _has_projects) = resolve_to_runs(&raw, &client).await?;
 
             let mut resolved_all = Vec::new();
-            for result in client.resolve_many(&run_accessions).await? {
+            for result in client
+                .resolve_many(&run_accessions, Default::default())
+                .await?
+            {
                 match result {
                     Ok(resolved) => resolved_all.push(resolved),
                     Err(e) => eprintln!("{} {e}", style::error_label("error:")),
@@ -740,6 +748,14 @@ fn print_info_table(resolved: &[ResolvedAccession]) {
     println!("{table}");
 }
 
+/// Convert CLI format enum to core format preference.
+fn format_preference(format: cli::SraFormat) -> FormatPreference {
+    match format {
+        cli::SraFormat::Sra => FormatPreference::Sra,
+        cli::SraFormat::Sralite => FormatPreference::Sralite,
+    }
+}
+
 /// Size threshold (in bytes) above which downloads require `--yes` confirmation.
 const LARGE_DOWNLOAD_THRESHOLD: u64 = 100 * 1024 * 1024 * 1024; // 100 GiB
 
@@ -748,16 +764,23 @@ const LARGE_DOWNLOAD_THRESHOLD: u64 = 100 * 1024 * 1024 * 1024; // 100 GiB
 /// When `prefer_sdl` is `true`, skips S3 and uses SDL directly (current behavior).
 /// When `need_run_info` is `true`, fetches read structure metadata via EUtils
 /// for FASTQ conversion (needed by the `get` command).
+/// When `format` is `Sralite`, skips S3 (SRA-lite files are not on the ODP bucket).
 async fn resolve_accessions(
     run_accessions: &[String],
     client: &SdlClient,
     prefer_sdl: bool,
     need_run_info: bool,
+    format: sracha_core::sdl::FormatPreference,
 ) -> Result<Vec<ResolvedAccession>> {
-    if prefer_sdl {
-        tracing::info!("using SDL for all accessions (--prefer-sdl)");
+    // SRA-lite files are not on the free S3 ODP bucket, so we must use SDL.
+    if prefer_sdl || format == sracha_core::sdl::FormatPreference::Sralite {
+        if prefer_sdl {
+            tracing::info!("using SDL for all accessions (--prefer-sdl)");
+        } else {
+            tracing::info!("using SDL for all accessions (--format sralite)");
+        }
         let resolved: Vec<ResolvedAccession> = client
-            .resolve_many(run_accessions)
+            .resolve_many(run_accessions, format)
             .await?
             .into_iter()
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -798,7 +821,7 @@ async fn resolve_accessions(
     if !sdl_needed.is_empty() {
         let sdl_accs: Vec<String> = sdl_needed.iter().map(|(_, a)| a.clone()).collect();
         tracing::info!("falling back to SDL for {} accession(s)", sdl_accs.len());
-        let sdl_results = client.resolve_many(&sdl_accs).await?;
+        let sdl_results = client.resolve_many(&sdl_accs, format).await?;
 
         for ((i, acc), result) in sdl_needed.into_iter().zip(sdl_results) {
             match result {
