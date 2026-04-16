@@ -2,7 +2,7 @@
 Output docs/images/info.gif
 
 Set Shell "bash"
-Set FontFamily "FiraCode Nerd Font Mono"
+Set FontFamily "Fira Code"
 Set FontSize 16
 Set Width 1000
 Set Height 500
