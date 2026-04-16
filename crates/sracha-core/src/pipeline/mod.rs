@@ -57,6 +57,8 @@ pub struct PipelineConfig {
     pub run_info: Option<crate::sdl::RunInfo>,
     /// Output FASTA instead of FASTQ (drops quality line).
     pub fasta: bool,
+    /// Allow resuming partial downloads.
+    pub resume: bool,
     /// Flag for graceful cancellation (e.g. Ctrl-C).
     pub cancelled: Option<Arc<AtomicBool>>,
 }
@@ -1870,7 +1872,7 @@ pub async fn download_sra(
         force: false,
         validate: false,
         progress: config.progress,
-        resume: true,
+        resume: config.resume,
     };
 
     tracing::info!(

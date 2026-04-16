@@ -79,6 +79,7 @@ fn test_config(
         progress: false,
         run_info: None,
         fasta: false,
+        resume: true,
         cancelled: None,
     }
 }

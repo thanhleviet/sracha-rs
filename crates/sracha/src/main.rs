@@ -173,6 +173,7 @@ async fn main() -> Result<()> {
                     progress: !args.no_progress,
                     run_info: None,
                     fasta: args.fasta,
+                    resume: true,
                     cancelled: None,
                 };
 
@@ -299,6 +300,7 @@ async fn main() -> Result<()> {
                     progress: !args.no_progress,
                     run_info: resolved.run_info.clone(),
                     fasta: args.fasta,
+                    resume: !args.no_resume,
                     cancelled: Some(cancelled.clone()),
                 };
 
@@ -345,6 +347,7 @@ async fn main() -> Result<()> {
                         progress: !args.no_progress,
                         run_info: next_resolved.run_info.clone(),
                         fasta: args.fasta,
+                        resume: !args.no_resume,
                         cancelled: Some(cancelled.clone()),
                     };
                     pending_download = Some(tokio::spawn(async move {

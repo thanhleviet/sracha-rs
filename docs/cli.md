@@ -62,7 +62,6 @@ sracha get [OPTIONS] [ACCESSION]...
 |--------|---------|-------------|
 | `--accession-list <FILE>` | | Read accessions from a file (one per line) |
 | `-O, --output-dir <DIR>` | `.` | Output directory |
-| `--format <FORMAT>` | `sra` | Preferred format: `sra` or `sralite` |
 | `-f, --force` | | Overwrite existing files |
 
 **Sequence output**
@@ -121,7 +120,6 @@ sracha fetch [OPTIONS] [ACCESSION]...
 |--------|---------|-------------|
 | `--accession-list <FILE>` | | Read accessions from a file (one per line) |
 | `-O, --output-dir <DIR>` | `.` | Output directory |
-| `--format <FORMAT>` | `sra` | Preferred format: `sra` or `sralite` |
 | `--connections <N>` | `8` | HTTP connections per file |
 | `--validate` | | Verify MD5 after download |
 | `-f, --force` | | Overwrite existing files |
