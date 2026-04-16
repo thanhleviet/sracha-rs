@@ -447,16 +447,21 @@ async fn main() -> Result<()> {
             // Print summary and exit if interrupted.
             if cancelled.load(Ordering::Relaxed) {
                 let interrupted = interrupted_accession.as_deref().unwrap_or("unknown");
-                if completed_accessions.is_empty() {
+                let suffix = if completed_accessions.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Completed: {}", completed_accessions.join(", "))
+                };
+                if args.stdout {
                     eprintln!(
-                        "Interrupted -- cleaned up partial files for {}.",
+                        "Interrupted -- cleaned up partial files for {}.{suffix}",
                         style::header(interrupted),
                     );
                 } else {
                     eprintln!(
-                        "Interrupted -- cleaned up partial files for {}. Completed: {}",
+                        "Interrupted -- cleaned up partial output for {} \
+                         (temp SRA kept, next run will skip download).{suffix}",
                         style::header(interrupted),
-                        completed_accessions.join(", "),
                     );
                 }
                 std::process::exit(130);

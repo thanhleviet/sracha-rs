@@ -1974,7 +1974,7 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
     ) {
         Ok(result) => result,
         Err(Error::Cancelled { output_files }) => {
-            // Delete partial FASTQ output files; keep temp SRA for resume.
+            // Delete partial FASTQ output files.
             for path in &output_files {
                 if let Err(e) = std::fs::remove_file(path) {
                     tracing::warn!(
@@ -1984,11 +1984,24 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
                     );
                 }
             }
-            tracing::info!(
-                "{}: cancelled, cleaned up {} partial output file(s)",
-                downloaded.accession,
-                output_files.len(),
-            );
+            // In stdout mode, always delete the temp SRA (streaming should
+            // leave no artifacts). Otherwise keep it so the next run can
+            // skip the download.
+            if config.stdout {
+                let _ = std::fs::remove_file(&downloaded.temp_path);
+                tracing::info!(
+                    "{}: cancelled, cleaned up {} partial output file(s) and temp SRA",
+                    downloaded.accession,
+                    output_files.len(),
+                );
+            } else {
+                tracing::info!(
+                    "{}: cancelled, cleaned up {} partial output file(s) \
+                     (temp SRA kept — next run will skip download)",
+                    downloaded.accession,
+                    output_files.len(),
+                );
+            }
             return Err(Error::Cancelled {
                 output_files: vec![],
             });
