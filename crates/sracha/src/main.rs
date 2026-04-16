@@ -171,6 +171,14 @@ async fn main() -> Result<()> {
                         style::error_label("error:"),
                         style::path(input)
                     );
+                    if accession::parse_input(input).is_ok() {
+                        eprintln!(
+                            "  {} {} looks like an accession — use `sracha get {}` to download and convert",
+                            style::label("hint:"),
+                            input,
+                            input,
+                        );
+                    }
                     continue;
                 }
 

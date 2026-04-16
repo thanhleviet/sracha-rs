@@ -72,6 +72,7 @@ sracha get [OPTIONS] [ACCESSION]...
 | `--fasta` | | Output FASTA instead of FASTQ (drops quality scores) |
 | `--min-read-len <N>` | | Minimum read length filter |
 | `--include-technical` | | Include technical reads (skipped by default) |
+| `-Z, --stdout` | | Write to stdout (stream interleaved FASTQ, auto-delete temp SRA) |
 
 **Compression**
 
@@ -96,6 +97,7 @@ sracha get [OPTIONS] [ACCESSION]...
 | `--no-resume` | | Disable download resume (re-download from scratch) |
 | `-y, --yes` | | Skip confirmation prompt for large downloads (>500 GiB) |
 | `--prefer-sdl` | | Skip direct S3 and resolve via the SDL API |
+| `--no-runinfo` | | Skip EUtils RunInfo API call (derive read structure from VDB metadata) |
 | `--no-progress` | | Disable progress bar |
 
 ---
@@ -142,7 +144,7 @@ sracha fastq [OPTIONS] <INPUT>...
 
 | Argument | Description |
 |----------|-------------|
-| `INPUT` | SRA accession(s) or local `.sra` file path(s) |
+| `INPUT` | Local `.sra` file path(s) (from `sracha fetch`) |
 
 ### Options
 

@@ -115,7 +115,7 @@ pub struct FetchArgs {
 
 #[derive(Args)]
 pub struct FastqArgs {
-    /// SRA accession(s) or file path(s)
+    /// SRA file path(s) (.sra files from `sracha fetch`)
     #[arg(required = true)]
     pub inputs: Vec<String>,
 
