@@ -446,8 +446,24 @@ async fn main() -> Result<()> {
         }
         Command::Info(args) => {
             let raw = collect_accessions(&args.accessions, args.accession_list.as_deref())?;
+
+            // Split local file paths from accession strings. A bare file path
+            // goes straight to the local-file path; anything else is looked up
+            // via SDL/EUtils.
+            let (paths, accessions): (Vec<_>, Vec<_>) = raw
+                .into_iter()
+                .partition(|s| std::path::Path::new(s).is_file());
+
+            for p in &paths {
+                print_local_file_info(std::path::Path::new(p));
+            }
+
+            if accessions.is_empty() {
+                return Ok(());
+            }
+
             let client = SdlClient::new();
-            let (run_accessions, _has_projects) = resolve_to_runs(&raw, &client).await?;
+            let (run_accessions, _has_projects) = resolve_to_runs(&accessions, &client).await?;
 
             let sp = progress::Spinner::start(format!(
                 "Resolving {} accession(s)",
@@ -637,6 +653,97 @@ async fn resolve_to_runs(inputs: &[String], client: &SdlClient) -> Result<(Vec<S
     }
 
     Ok((run_accessions, has_projects))
+}
+
+fn print_local_file_info(path: &std::path::Path) {
+    use sracha_core::vdb::cursor::VdbCursor;
+    use sracha_core::vdb::kar::KarArchive;
+
+    let label = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown");
+
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+
+    println!("{}", style::header(label));
+    println!(
+        "  {}    {}",
+        style::label("Path:"),
+        style::path(path.display())
+    );
+    println!(
+        "  {}    {}",
+        style::label("Size:"),
+        style::value(format_size(size))
+    );
+
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("  {} open failed: {e}", style::error_label("error:"));
+            return;
+        }
+    };
+    let mut archive = match KarArchive::open(std::io::BufReader::new(file)) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("  {} KAR parse failed: {e}", style::error_label("error:"));
+            return;
+        }
+    };
+    let cursor = match VdbCursor::open(&mut archive, path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  {} cursor open failed: {e}", style::error_label("error:"));
+            return;
+        }
+    };
+
+    let platform = cursor.platform().unwrap_or("unknown").to_string();
+    let blob_count = cursor.read_col().blob_count();
+    let spot_count: u64 = cursor
+        .read_col()
+        .blobs()
+        .iter()
+        .map(|b| b.id_range as u64)
+        .sum();
+    let read_lengths = cursor.metadata_read_lengths().unwrap_or_default();
+    let layout = match read_lengths.len() {
+        0 => "unknown".to_string(),
+        1 => format!("SINGLE ({}bp)", read_lengths[0]),
+        n => format!("{n} reads × {read_lengths:?}bp"),
+    };
+
+    let mut columns: Vec<&str> = Vec::new();
+    columns.push("READ");
+    if cursor.quality_col().is_some() {
+        columns.push("QUALITY");
+    }
+    if cursor.read_len_col().is_some() {
+        columns.push("READ_LEN");
+    }
+    if cursor.name_col().is_some() {
+        columns.push("NAME");
+    }
+
+    println!("  {} {}", style::label("Platform:"), style::value(platform));
+    println!("  {}  {}", style::label("Layout:"), style::value(layout));
+    println!(
+        "  {}   {}",
+        style::label("Spots:"),
+        style::count(spot_count)
+    );
+    println!(
+        "  {}   {}",
+        style::label("Blobs:"),
+        style::count(blob_count)
+    );
+    println!(
+        "  {} {}",
+        style::label("Columns:"),
+        style::value(columns.join(", "))
+    );
 }
 
 fn print_resolved(resolved: &ResolvedAccession) {

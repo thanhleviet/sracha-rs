@@ -303,7 +303,7 @@ pub struct GetArgs {
 
 #[derive(Args)]
 pub struct InfoArgs {
-    /// SRA accession(s) to query (run, study, or BioProject)
+    /// SRA accession(s) to query, or local `.sra` file path(s)
     pub accessions: Vec<String>,
 
     /// Read accessions from a file (one per line)
