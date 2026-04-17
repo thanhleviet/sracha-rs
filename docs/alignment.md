@@ -25,7 +25,7 @@ bwa index chr22.fa.gz
 Stream directly from NCBI to a sorted BAM — no intermediate files:
 
 ```bash
-sracha get SRR28588231 -Z \
+sracha get SRR28588231 --split interleaved -Z \
   | bwa mem -p -t 8 chr22.fa.gz - \
   | samtools sort -@ 4 -o SRR28588231.chr22.bam
 samtools index SRR28588231.chr22.bam
@@ -53,7 +53,7 @@ bwa index hs1.fa.gz    # ~1 hour, ~5 GB RAM
 Stream alignment:
 
 ```bash
-sracha get SRR28588231 -Z \
+sracha get SRR28588231 --split interleaved -Z \
   | bwa mem -p -t 8 hs1.fa.gz - \
   | samtools sort -@ 4 -o SRR28588231.bam
 samtools index SRR28588231.bam
@@ -64,14 +64,15 @@ samtools index SRR28588231.bam
 If you already have an SRA file on disk, use `fastq -Z`:
 
 ```bash
-sracha fastq SRR28588231.sra -Z \
+sracha fastq SRR28588231.sra --split interleaved -Z \
   | bwa mem -p -t 8 hs1.fa.gz - \
   | samtools sort -@ 4 -o SRR28588231.bam
 ```
 
 ## How it works
 
-- `-Z` forces interleaved, uncompressed output to stdout
+- `-Z` streams uncompressed FASTQ to stdout; pair it with `--split interleaved`
+  so paired reads come out as a single interleaved stream
 - `bwa mem -p` reads interleaved paired-end FASTQ from stdin
 - `samtools sort` reads SAM from stdin and writes a coordinate-sorted BAM
 - Backpressure flows naturally through the Unix pipe
