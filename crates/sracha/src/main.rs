@@ -516,6 +516,7 @@ async fn main() -> Result<()> {
                 columns: String,
                 md5_status: String,
                 errors: Vec<String>,
+                any_blob_integrity_error: bool,
             }
 
             let mut rows: Vec<ValidateRow> = Vec::new();
@@ -589,6 +590,7 @@ async fn main() -> Result<()> {
                     columns: result.columns_found.join(", "),
                     md5_status,
                     errors: result.errors,
+                    any_blob_integrity_error: result.any_blob_integrity_error,
                 });
             }
 
@@ -633,6 +635,14 @@ async fn main() -> Result<()> {
                             eprintln!("  {err}");
                         }
                     }
+                }
+
+                if rows.iter().any(|r| r.any_blob_integrity_error) {
+                    eprintln!(
+                        "\n{} {}",
+                        style::header("hint:"),
+                        sracha_core::error::BLOB_INTEGRITY_GUIDANCE,
+                    );
                 }
             }
 

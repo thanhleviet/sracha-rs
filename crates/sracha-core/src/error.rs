@@ -30,6 +30,13 @@ pub enum Error {
     #[error("VDB format error: {0}")]
     Vdb(String),
 
+    #[error("{kind} mismatch: stored={stored}, computed={computed}")]
+    BlobIntegrity {
+        kind: &'static str,
+        stored: String,
+        computed: String,
+    },
+
     #[error("column not found: {table}/{column}")]
     ColumnNotFound { table: String, column: String },
 
@@ -67,3 +74,12 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Guidance text shown whenever a decode-time per-blob integrity check fails.
+/// Explains to the user which of the two action paths applies to them based
+/// on how they invoked the download.
+pub const BLOB_INTEGRITY_GUIDANCE: &str = "\
+If `sracha fetch` ran with MD5 verification (default), the downloaded bytes \
+match NCBI's source — this is likely a decoder bug in sracha, please report \
+at https://github.com/rnabioco/sracha-rs/issues. If you used `--no-validate`, \
+re-run without it to rule out a bad transfer.";

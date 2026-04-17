@@ -871,9 +871,11 @@ pub fn decode_blob<'a>(
         ]);
         let computed_crc = ncbi_crc32(blob_data);
         if stored_crc != computed_crc {
-            return Err(Error::Vdb(format!(
-                "CRC32 mismatch: stored={stored_crc:#010x}, computed={computed_crc:#010x}"
-            )));
+            return Err(Error::BlobIntegrity {
+                kind: "CRC32",
+                stored: format!("{stored_crc:#010x}"),
+                computed: format!("{computed_crc:#010x}"),
+            });
         }
     } else if checksum_type == 2 && cs_size == 16 {
         let stored: [u8; 16] = raw[raw.len() - 16..]
@@ -881,11 +883,11 @@ pub fn decode_blob<'a>(
             .expect("slice length is 16");
         let computed = Md5::digest(blob_data);
         if stored != computed.as_slice() {
-            return Err(Error::Vdb(format!(
-                "MD5 mismatch: stored={}, computed={}",
-                hex16(&stored),
-                hex16(computed.as_slice()),
-            )));
+            return Err(Error::BlobIntegrity {
+                kind: "MD5",
+                stored: hex16(&stored),
+                computed: hex16(computed.as_slice()),
+            });
         }
     }
 
@@ -2340,7 +2342,8 @@ mod tests {
     fn decode_blob_v1_crc32_mismatch() {
         let mut blob = vec![0x61u8, 0xAA, 0xBB];
         blob.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // wrong CRC
-        assert!(decode_blob(&blob, 1, 1, 8).is_err());
+        let err = decode_blob(&blob, 1, 1, 8).unwrap_err();
+        assert!(matches!(err, Error::BlobIntegrity { kind: "CRC32", .. }));
     }
 
     #[test]
@@ -2366,7 +2369,7 @@ mod tests {
         let mut blob = vec![0x61u8, 0xAA, 0xBB];
         blob.extend_from_slice(&[0u8; 16]); // wrong MD5 (all zeros)
         let err = decode_blob(&blob, 2, 1, 8).unwrap_err();
-        assert!(err.to_string().contains("MD5 mismatch"));
+        assert!(matches!(err, Error::BlobIntegrity { kind: "MD5", .. }));
     }
 
     #[test]

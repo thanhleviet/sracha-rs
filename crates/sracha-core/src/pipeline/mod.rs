@@ -487,6 +487,27 @@ pub fn is_unsupported_platform(platform: &str) -> bool {
     UNSUPPORTED_PLATFORMS.contains(&platform)
 }
 
+/// Map a raw `Error::BlobIntegrity` from `decode_blob` into the user-facing
+/// [`Error::IntegrityFailure`], attaching the accession and the shared
+/// [`crate::error::BLOB_INTEGRITY_GUIDANCE`] text. Passes other errors through
+/// unchanged.
+fn wrap_blob_integrity(accession: &str, err: Error) -> Error {
+    match err {
+        Error::BlobIntegrity {
+            kind,
+            stored,
+            computed,
+        } => Error::IntegrityFailure {
+            accession: accession.to_string(),
+            summary: format!(
+                "per-blob {kind} mismatch during decode (stored={stored}, computed={computed}). {}",
+                crate::error::BLOB_INTEGRITY_GUIDANCE,
+            ),
+        },
+        other => other,
+    }
+}
+
 /// Select the best mirror URL for downloading.
 ///
 /// Prefers cloud mirrors (s3, gs) over NCBI on-premises servers because
@@ -2049,6 +2070,10 @@ pub struct ValidationResult {
     pub errors: Vec<String>,
     /// MD5 hex digest of the entire SRA file.
     pub md5: Option<String>,
+    /// True if any error originated from [`Error::BlobIntegrity`] (per-blob
+    /// CRC32/MD5 failure during decode). Callers can use this to show the
+    /// shared [`crate::error::BLOB_INTEGRITY_GUIDANCE`] text once.
+    pub any_blob_integrity_error: bool,
 }
 
 /// Validate an SRA file by opening as KAR archive, parsing the SEQUENCE
@@ -2080,6 +2105,7 @@ pub fn run_validate(
                 columns_found,
                 errors,
                 md5: None,
+                any_blob_integrity_error: false,
             };
         }
     };
@@ -2096,6 +2122,7 @@ pub fn run_validate(
                 columns_found,
                 errors,
                 md5: None,
+                any_blob_integrity_error: false,
             };
         }
     };
@@ -2113,6 +2140,7 @@ pub fn run_validate(
                 columns_found,
                 errors,
                 md5: None,
+                any_blob_integrity_error: false,
             };
         }
     };
@@ -2155,6 +2183,7 @@ pub fn run_validate(
                 columns_found,
                 errors,
                 md5: None,
+                any_blob_integrity_error: false,
             };
         }
     };
@@ -2170,14 +2199,21 @@ pub fn run_validate(
 
     let total_spots = std::sync::atomic::AtomicU64::new(0);
     let mut blobs_validated: usize = 0;
+    let mut any_blob_integrity_error = false;
 
     const BATCH_SIZE: usize = 1024;
     let mut blob_idx: usize = 0;
 
+    // Helper: capture (msg, is_blob_integrity) from a decode Error.
+    fn fmt_err(tag: &str, bi: usize, e: Error) -> (String, bool) {
+        let is_integrity = matches!(e, Error::BlobIntegrity { .. });
+        (format!("{tag} blob {bi} decode: {e}"), is_integrity)
+    }
+
     while blob_idx < num_blobs {
         let batch_end = (blob_idx + BATCH_SIZE).min(num_blobs);
 
-        let batch_errors: Vec<(usize, String)> = pool.install(|| {
+        let batch_errors: Vec<(usize, String, bool)> = pool.install(|| {
             (blob_idx..batch_end)
                 .into_par_iter()
                 .filter_map(|bi| {
@@ -2185,11 +2221,12 @@ pub fn run_validate(
                     let read_blob = &cursor.read_col().blobs()[bi];
                     let read_raw = match cursor.read_col().read_raw_blob_slice(read_blob.start_id) {
                         Ok(r) => r,
-                        Err(e) => return Some((bi, format!("READ blob {bi}: {e}"))),
+                        Err(e) => return Some((bi, format!("READ blob {bi}: {e}"), false)),
                     };
                     let id_range = read_blob.id_range as u64;
                     if let Err(e) = decode_raw(read_raw, read_cs, id_range) {
-                        return Some((bi, format!("READ blob {bi} decode: {e}")));
+                        let (msg, is_integ) = fmt_err("READ", bi, e);
+                        return Some((bi, msg, is_integ));
                     }
 
                     // Count spots from this blob.
@@ -2208,18 +2245,19 @@ pub fn run_validate(
                                             return Some((
                                                 bi,
                                                 format!("QUALITY blob {bi} unzip: {e}"),
+                                                false,
                                             ));
                                         }
                                     }
                                     Err(e) => {
-                                        return Some((
-                                            bi,
-                                            format!("QUALITY blob {bi} decode: {e}"),
-                                        ));
+                                        let (msg, is_integ) = fmt_err("QUALITY", bi, e);
+                                        return Some((bi, msg, is_integ));
                                     }
                                 }
                             }
-                            Err(e) => return Some((bi, format!("QUALITY blob {bi}: {e}"))),
+                            Err(e) => {
+                                return Some((bi, format!("QUALITY blob {bi}: {e}"), false));
+                            }
                         }
                     }
 
@@ -2231,11 +2269,12 @@ pub fn run_validate(
                             Ok(rl_raw) => {
                                 let rl_id = rlblob.id_range as u64;
                                 if let Err(e) = decode_raw(rl_raw, read_len_cs, rl_id) {
-                                    return Some((bi, format!("READ_LEN blob {bi} decode: {e}")));
+                                    let (msg, is_integ) = fmt_err("READ_LEN", bi, e);
+                                    return Some((bi, msg, is_integ));
                                 }
                             }
                             Err(e) => {
-                                return Some((bi, format!("READ_LEN blob {bi}: {e}")));
+                                return Some((bi, format!("READ_LEN blob {bi}: {e}"), false));
                             }
                         }
                     }
@@ -2245,8 +2284,11 @@ pub fn run_validate(
                 .collect()
         });
 
-        for (bi, msg) in &batch_errors {
+        for (bi, msg, is_integ) in &batch_errors {
             errors.push(msg.clone());
+            if *is_integ {
+                any_blob_integrity_error = true;
+            }
             tracing::error!("validation error at blob {bi}: {msg}");
         }
 
@@ -2282,6 +2324,7 @@ pub fn run_validate(
         columns_found,
         errors,
         md5,
+        any_blob_integrity_error,
     }
 }
 
@@ -2341,7 +2384,8 @@ pub fn run_fastq(
 
     let diag = Arc::new(IntegrityDiag::default());
     let (spots_read, reads_written, output_files) =
-        decode_and_write(sra_path, &acc, config, is_lite, &diag)?;
+        decode_and_write(sra_path, &acc, config, is_lite, &diag)
+            .map_err(|e| wrap_blob_integrity(&acc, e))?;
 
     if !config.stdout
         && let Err(e) = write_stats_file(StatsEntry {
@@ -2585,7 +2629,7 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
                 output_files: vec![],
             });
         }
-        Err(e) => return Err(e),
+        Err(e) => return Err(wrap_blob_integrity(&downloaded.accession, e)),
     };
 
     // Clean up temp file.
