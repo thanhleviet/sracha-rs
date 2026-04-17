@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### Added
+
+- **MD5 verification by default**: Downloads verify MD5 against SDL-reported
+  hashes, decoded blobs verify per-blob MD5 and CRC32, and spot counts are
+  cross-checked against RunInfo. Use `fetch --no-validate` to skip.
+- **`sracha validate --md5 <HASH>` / `--offline`**: Check a file against an
+  explicit MD5 or skip the SDL lookup for air-gapped use.
+- **Local SRA files in `sracha info`**: Pass a `.sra` file path (including
+  `~/...`) to print the table of contents, schema, and metadata without
+  hitting NCBI.
+- **Resolution spinners**: `get`, `fetch`, and `info` show progress while
+  resolving projects and accessions.
+
+### Changed
+
+- **Silent decode corruption**: CRC32/MD5 mismatches and truncated
+  variable-length columns now abort with an error instead of producing
+  partial rows.
+- **Download resume hardening**: Range requests validate `Content-Range` and
+  track expected MD5 in `.sracha-progress`, catching servers that ignore
+  ranges or files replaced mid-transfer.
+- **Verbosity defaults**: Default log level hides `INFO`; use `-v` for `INFO`,
+  `-vv` for `DEBUG`, `-vvv` for `TRACE`.
+
+### Fixed
+
+- **CRC32 computation**: Per-blob CRC32 validation used the standard
+  CRC-32/ISO-HDLC (crc32fast) and disagreed with the variant emitted by
+  ncbi-vdb (MSB-first polynomial 0x04C11DB7, init=0, no reflection, no
+  final XOR). Previously the mismatch was swallowed; now that it's an
+  error, decode would have spuriously rejected real SRA files. Replaced
+  with a conforming implementation.
+
 ## 0.1.10 (2026-04-16)
 
 ### Added

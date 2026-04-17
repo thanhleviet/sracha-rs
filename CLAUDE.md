@@ -47,7 +47,7 @@ Key design: download of accession N+1 overlaps with decode of accession N (prefe
 
 ## Core modules in sracha-core
 
-- **`pipeline/mod.rs`** (~2000 lines) — Orchestrates download→decode→output. `PipelineConfig`, `PipelineStats`, `download_sra()`, `decode_sra()`, progress bars, cancellation polling.
+- **`pipeline/mod.rs`** (~3000 lines) — Orchestrates download→decode→output. `PipelineConfig`, `PipelineStats`, `download_sra()`, `decode_sra()`, progress bars, cancellation polling.
 - **`download/mod.rs`** — Parallel chunked HTTP downloads with resume support, retries with exponential backoff, adaptive chunk sizing.
 - **`vdb/`** — Pure Rust VDB format parser. `kar.rs` (KAR archive/TOC), `kdb.rs` (column index/blob addressing), `cursor.rs` (high-level SEQUENCE table cursor), `blob.rs` (variable-length encoding, izip decompression, page maps), `metadata.rs` (table metadata).
 - **`sdl/mod.rs`** — NCBI SDL locate API client + EUtils (ESearch/EFetch) for project-to-run resolution and RunInfo metadata.

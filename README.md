@@ -6,19 +6,18 @@ Fast SRA downloader and FASTQ converter, written in pure Rust.
 
 ## Features
 
-- **Parallel downloads** -- chunked HTTP Range requests with multiple connections
-- **Native VDB parsing** -- pure Rust, zero C dependencies
-- **Integrated pipeline** -- download, convert, and compress in one command
-- **Project-level accessions** -- pass a BioProject (PRJNA) or study (SRP) to download all runs
-- **Accession lists** -- batch download from a file with `--accession-list`
-- **Parallel gzip or zstd** -- pigz-style block compression via rayon
-- **FASTA output** -- drop quality scores with `--fasta`
-- **SRA and SRA-lite** -- full quality or simplified quality scores
+- **Fast** -- 3-10x faster than `fasterq-dump` on typical SRA files
+- **One command** -- download, convert to FASTQ, and compress
+- **Batch input** -- accessions, BioProjects (PRJNA), studies (SRP), or a file via `--accession-list`
+- **gzip or zstd output** -- parallel compression, or plain FASTQ
+- **FASTA output** -- `--fasta` drops quality scores
+- **SRA and SRA-lite** -- full or simplified quality scores
 - **Split modes** -- split-3, split-files, split-spot, interleaved
-- **Platform support** -- Illumina, BGISEQ/DNBSEQ, Element, Ultima, PacBio, Nanopore (legacy platforms like 454 and Ion Torrent are not supported)
-- **Resumable downloads** -- picks up where it left off on interruption
-- **Stdout streaming** -- pipe interleaved FASTQ to downstream tools with `-Z`
-- **File validation** -- verify SRA file integrity
+- **Resumable downloads** -- picks up where it left off
+- **Stdout streaming** -- `-Z` pipes FASTQ straight into downstream tools
+- **Integrity checks** -- MD5 verification on download and decode
+- **Platform support** -- Illumina, BGISEQ/DNBSEQ, Element, Ultima, PacBio, Nanopore (legacy 454 and Ion Torrent are not supported)
+- **Single static binary** -- no Python, no C dependencies
 
 ## Quick start
 
@@ -52,9 +51,8 @@ Local SRA-to-FASTQ conversion (no network), uncompressed output,
 
 | File | Size | sracha | fasterq-dump | fastq-dump | Speedup vs fasterq-dump |
 |:---|---:|---:|---:|---:|---:|
-| SRR28588231 | 23 MiB | 0.16 s | 1.79 s | 1.96 s | **11.6x** |
-| SRR2584863 | 288 MiB | 1.46 s | 5.46 s | 13.27 s | **3.7x** |
-| SRR14724462 | 3.78 GiB | 17.0 s | 108.8 s | -- | **6.4x** |
+| SRR28588231 | 23 MiB | 0.21 s | 2.39 s | 2.11 s | **11.2x** |
+| SRR2584863 | 288 MiB | 2.01 s | 8.05 s | 13.44 s | **4.0x** |
 
 Compression adds minimal overhead -- sracha produces gzipped FASTQ by default
 with parallel block compression, so the integrated pipeline
@@ -68,35 +66,28 @@ separate gzip step.
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `sracha` | 155.3 ± 1.6 | 151.8 | 158.2 | 1.00 |
-| `fasterq-dump` | 1793.9 ± 11.0 | 1778.1 | 1806.5 | 11.55 ± 0.14 |
-| `fastq-dump` | 1961.5 ± 2.6 | 1957.6 | 1964.5 | 12.63 ± 0.13 |
+| `sracha` | 213.2 ± 6.2 | 206.6 | 225.9 | 1.00 |
+| `fasterq-dump` | 2385.4 ± 738.8 | 2036.4 | 3706.2 | 11.19 ± 3.48 |
+| `fastq-dump` | 2109.8 ± 27.6 | 2082.0 | 2154.8 | 9.89 ± 0.32 |
 
 **SRR2584863 (288 MiB)**
 
 | Command | Mean [s] | Min [s] | Max [s] | Relative |
 |:---|---:|---:|---:|---:|
-| `sracha` | 1.456 ± 0.006 | 1.450 | 1.461 | 1.00 |
-| `fasterq-dump` | 5.456 ± 0.034 | 5.429 | 5.494 | 3.75 ± 0.03 |
-| `fastq-dump` | 13.268 ± 0.049 | 13.226 | 13.322 | 9.11 ± 0.05 |
-
-**SRR14724462 (3.78 GiB, single run)**
-
-| Command | Time [s] |
-|:---|---:|
-| `sracha` | 17.0 |
-| `fasterq-dump` | 108.8 |
+| `sracha` | 2.009 ± 0.045 | 1.981 | 2.062 | 1.00 |
+| `fasterq-dump` | 8.052 ± 2.347 | 6.288 | 10.716 | 4.01 ± 1.17 |
+| `fastq-dump` | 13.440 ± 1.762 | 12.398 | 15.475 | 6.69 ± 0.89 |
 
 **sracha gzip overhead (SRR28588231)**
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `sracha (no compression)` | 169.9 ± 51.8 | 151.9 | 363.9 | 1.00 |
-| `sracha (gzip)` | 315.2 ± 3.5 | 310.6 | 319.4 | 1.86 ± 0.57 |
+| `sracha (no compression)` | 254.9 ± 86.1 | 212.1 | 430.0 | 1.00 |
+| `sracha (gzip)` | 342.3 ± 11.1 | 327.3 | 362.1 | 1.34 ± 0.46 |
 
 </details>
 
-Benchmarks run with `sracha` v0.1.5, `sra-tools` v3.2.0, on Linux (8 CPUs).
+Benchmarks run with `sracha` v0.1.11, `sra-tools` v3.2.0, on Linux (8 CPUs).
 See `validation/benchmark.sh` to reproduce.
 
 ## Installation

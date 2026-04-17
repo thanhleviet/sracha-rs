@@ -100,6 +100,7 @@ sracha get [OPTIONS] [ACCESSION]...
 | `--prefer-sdl` | | Skip direct S3 and resolve via the SDL API |
 | `--no-runinfo` | | Skip EUtils RunInfo API call (derive read structure from VDB metadata) |
 | `--no-progress` | | Disable progress bar |
+| `--strict` | | Fail on data-integrity anomalies (quality length mismatch, paired-spot violations, truncated reads) |
 
 ---
 
@@ -125,7 +126,7 @@ sracha fetch [OPTIONS] [ACCESSION]...
 | `-O, --output-dir <DIR>` | `.` | Output directory |
 | `--format <FORMAT>` | `sra` | Download format: `sra` (full quality) or `sralite` (simplified quality, smaller) |
 | `--connections <N>` | `8` | HTTP connections per file |
-| `--validate` | | Verify MD5 after download |
+| `--no-validate` | | Skip MD5 verification after download (verification is on by default) |
 | `-f, --force` | | Overwrite existing files |
 | `--no-resume` | | Disable download resume (re-download from scratch) |
 | `-y, --yes` | | Confirm project downloads and large downloads (>100 GiB) |
@@ -177,22 +178,23 @@ sracha fastq [OPTIONS] <INPUT>...
 | `-O, --output-dir <DIR>` | `.` | Output directory |
 | `-f, --force` | | Overwrite existing files |
 | `--no-progress` | | Disable progress bar |
+| `--strict` | | Fail on data-integrity anomalies (quality length mismatch, paired-spot violations, truncated reads) |
 
 ---
 
 ## sracha info
 
-Show accession metadata.
+Show accession metadata, or inspect a local `.sra` file.
 
 ```
-sracha info [OPTIONS] [ACCESSION]...
+sracha info [OPTIONS] [ACCESSION_OR_PATH]...
 ```
 
 ### Arguments
 
 | Argument | Description |
 |----------|-------------|
-| `ACCESSION` | One or more accessions (run, study, or BioProject) |
+| `ACCESSION_OR_PATH` | Accession (run, study, or BioProject) or a local `.sra` file path |
 
 ### Options
 
@@ -200,9 +202,13 @@ sracha info [OPTIONS] [ACCESSION]...
 |--------|---------|-------------|
 | `--accession-list <FILE>` | | Read accessions from a file (one per line) |
 
-Displays file sizes, available formats, download mirrors, and quality
-information for each accession. Study and BioProject accessions are
-resolved to runs first.
+For accessions, displays file sizes, available formats, download mirrors,
+and quality information. Study and BioProject accessions are resolved to
+runs first.
+
+For local file paths, opens the KAR archive directly (no network) and
+prints its table of contents, schema, and metadata. Paths starting with
+`~/` are expanded to `$HOME`.
 
 ---
 
@@ -226,3 +232,5 @@ sracha validate [OPTIONS] <INPUT>...
 |--------|---------|-------------|
 | `-t, --threads <N>` | `8` | Thread count for decode |
 | `--no-progress` | | Disable progress bar |
+| `--md5 <HASH>` | | Expected MD5 hex; fail on mismatch. With multiple inputs every file must match |
+| `--offline` | | Skip the SDL lookup for the expected MD5 (air-gapped use) |
