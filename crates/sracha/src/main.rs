@@ -59,9 +59,9 @@ async fn main() -> Result<()> {
     // Set up tracing
     let filter = match (cli.quiet, cli.verbose) {
         (true, _) => "error",
-        (_, 0) => "info",
-        (_, 1) => "debug",
-        (_, 2) => "trace",
+        (_, 0) => "warn",
+        (_, 1) => "info",
+        (_, 2) => "debug",
         _ => "trace",
     };
     tracing_subscriber::fmt()
