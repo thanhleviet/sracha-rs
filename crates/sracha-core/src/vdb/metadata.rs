@@ -28,7 +28,8 @@ pub struct ReadDescriptor {
 pub fn parse_read_structure(tree_data: &[u8]) -> Result<Vec<ReadDescriptor>, String> {
     let nodes = parse_meta_nodes(tree_data)?;
 
-    // Strategy 1: look for READ_0, READ_1, ... metadata nodes.
+    // Strategy 1: READ_0, READ_1, ... top-level nodes with `B|151|`-style
+    // values. Used by older SRA-lite files.
     let mut read_descs: Vec<(u32, ReadDescriptor)> = Vec::new();
     for node in &nodes {
         if let Some(idx) = node.name.strip_prefix("READ_")
@@ -45,7 +46,15 @@ pub fn parse_read_structure(tree_data: &[u8]) -> Result<Vec<ReadDescriptor>, Str
         return Ok(read_descs.into_iter().map(|(_, d)| d).collect());
     }
 
-    // Strategy 2: detect platform from embedded schema text.
+    // Strategy 2: static columns under `col/{READ_TYPE,READ_LEN}/row`.
+    // Per-spot read structure is constant and stored once as a VDB
+    // "static" column. Authoritative for both SRA-lite and
+    // aligned-schema-labeled archives.
+    if let Some(descs) = read_static_col_read_structure(&nodes) {
+        return Ok(descs);
+    }
+
+    // Strategy 3: detect platform from embedded schema text.
     // The "schema" node contains the full VDB schema which starts with
     // the table type name (e.g. "NCBI:SRA:Illumina:tbl:phred:v2#1.0.4").
     for node in &nodes {
@@ -85,6 +94,45 @@ pub fn parse_read_structure(tree_data: &[u8]) -> Result<Vec<ReadDescriptor>, Str
         nodes.len(),
         node_names
     ))
+}
+
+/// Read per-read descriptors from `col/{READ_TYPE,READ_LEN}/row` static
+/// columns. `READ_TYPE/row` stores one `u8` per read (low bit: 1 =
+/// biological, 0 = technical); `READ_LEN/row` stores one little-endian
+/// `u32` per read. `nreads` comes from `READ_TYPE/row` because it is
+/// exactly one byte per read. When `READ_LEN/row` is absent or
+/// mis-sized we emit `read_len=0` so callers fall back to `spot_len /
+/// nreads`.
+fn read_static_col_read_structure(nodes: &[MetaNode]) -> Option<Vec<ReadDescriptor>> {
+    let col = nodes.iter().find(|n| n.name == "col")?;
+    let read_type = find_meta_node(&col.children, "READ_TYPE/row")?;
+    let nreads = read_type.value.len();
+    if nreads == 0 {
+        return None;
+    }
+    let lens_bytes = find_meta_node(&col.children, "READ_LEN/row")
+        .map(|n| n.value.as_slice())
+        .unwrap_or(&[]);
+    let have_lens = lens_bytes.len() == 4 * nreads;
+
+    let mut descs = Vec::with_capacity(nreads);
+    for i in 0..nreads {
+        let rtype = if read_type.value[i] & 1 != 0 {
+            b'B'
+        } else {
+            b'T'
+        };
+        let read_len = if have_lens {
+            u32::from_le_bytes(lens_bytes[i * 4..i * 4 + 4].try_into().ok()?)
+        } else {
+            0
+        };
+        descs.push(ReadDescriptor {
+            read_type: rtype,
+            read_len,
+        });
+    }
+    Some(descs)
 }
 
 /// Return the schema node's attribute name (e.g.
@@ -370,7 +418,7 @@ fn parse_attr_nodes(buf: &[u8]) -> Vec<(String, Vec<u8>)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------
@@ -378,7 +426,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Serialize a list of node byte slices into a PBSTree.
-    fn build_pbstree(node_data: &[&[u8]]) -> Vec<u8> {
+    pub(crate) fn build_pbstree(node_data: &[&[u8]]) -> Vec<u8> {
         if node_data.is_empty() {
             return vec![0, 0, 0, 0];
         }
@@ -420,7 +468,7 @@ mod tests {
     ///
     /// Encodes: `bits | name | [attrs_pbstree] | value`
     /// where `bits = (name_len - 1) << 2 | has_children << 1 | has_attrs`.
-    fn build_meta_node(name: &str, value: &[u8], attrs: Option<&[u8]>) -> Vec<u8> {
+    pub(crate) fn build_meta_node(name: &str, value: &[u8], attrs: Option<&[u8]>) -> Vec<u8> {
         let name_bytes = name.as_bytes();
         let name_len = name_bytes.len();
         assert!(
@@ -444,7 +492,7 @@ mod tests {
     /// Build an attribute PBSTree from `(name, value)` pairs.
     ///
     /// Each attribute node is serialized as `name\0value`.
-    fn build_attrs_pbstree(attrs: &[(&str, &[u8])]) -> Vec<u8> {
+    pub(crate) fn build_attrs_pbstree(attrs: &[(&str, &[u8])]) -> Vec<u8> {
         let nodes: Vec<Vec<u8>> = attrs
             .iter()
             .map(|(name, val)| {
@@ -762,6 +810,94 @@ mod tests {
     fn read_structure_empty_tree_errors() {
         let tree = build_pbstree(&[]);
         assert!(parse_read_structure(&tree).is_err());
+    }
+
+    /// Build a meta-node with a children PBSTree (for `col/X/row` layout).
+    fn build_meta_node_with_children(
+        name: &str,
+        value: &[u8],
+        children: &[&[u8]],
+        attrs: Option<&[u8]>,
+    ) -> Vec<u8> {
+        let name_bytes = name.as_bytes();
+        let name_len = name_bytes.len();
+        assert!((1..=64).contains(&name_len));
+        let has_attrs = attrs.is_some();
+        let has_children = !children.is_empty();
+        let bits: u8 =
+            (((name_len - 1) as u8) << 2) | (u8::from(has_children) << 1) | u8::from(has_attrs);
+        let mut buf = Vec::new();
+        buf.push(bits);
+        buf.extend_from_slice(name_bytes);
+        if let Some(attr_data) = attrs {
+            buf.extend_from_slice(attr_data);
+        }
+        if has_children {
+            buf.extend_from_slice(&build_pbstree(children));
+        }
+        buf.extend_from_slice(value);
+        buf
+    }
+
+    fn static_col_tree(nreads: usize, types: &[u8], lens: &[u32]) -> Vec<u8> {
+        assert_eq!(types.len(), nreads);
+        let row_type = build_meta_node("row", types, None);
+        let read_type = build_meta_node_with_children("READ_TYPE", b"", &[&row_type], None);
+        let mut lens_bytes = Vec::with_capacity(lens.len() * 4);
+        for &l in lens {
+            lens_bytes.extend_from_slice(&l.to_le_bytes());
+        }
+        let row_len = build_meta_node("row", &lens_bytes, None);
+        let read_len = build_meta_node_with_children("READ_LEN", b"", &[&row_len], None);
+        let col = build_meta_node_with_children("col", b"", &[&read_type, &read_len], None);
+        build_pbstree(&[&col])
+    }
+
+    #[test]
+    fn read_structure_static_cols_paired_illumina() {
+        let tree = static_col_tree(2, &[1, 1], &[151, 151]);
+        let descs = parse_read_structure(&tree).unwrap();
+        assert_eq!(descs.len(), 2);
+        assert_eq!(descs[0].read_type, b'B');
+        assert_eq!(descs[0].read_len, 151);
+        assert_eq!(descs[1].read_type, b'B');
+        assert_eq!(descs[1].read_len, 151);
+    }
+
+    #[test]
+    fn read_structure_static_cols_technical_barcode() {
+        // READ_TYPE low bit 0 => technical.
+        let tree = static_col_tree(2, &[0, 1], &[10, 151]);
+        let descs = parse_read_structure(&tree).unwrap();
+        assert_eq!(descs[0].read_type, b'T');
+        assert_eq!(descs[0].read_len, 10);
+        assert_eq!(descs[1].read_type, b'B');
+        assert_eq!(descs[1].read_len, 151);
+    }
+
+    #[test]
+    fn read_structure_static_cols_missing_len_keeps_types() {
+        // No READ_LEN/row — callers fall back to spot_len / nreads but
+        // still get nreads and types.
+        let row_type = build_meta_node("row", &[1, 1], None);
+        let read_type = build_meta_node_with_children("READ_TYPE", b"", &[&row_type], None);
+        let col = build_meta_node_with_children("col", b"", &[&read_type], None);
+        let tree = build_pbstree(&[&col]);
+
+        let descs = parse_read_structure(&tree).unwrap();
+        assert_eq!(descs.len(), 2);
+        assert!(descs.iter().all(|d| d.read_type == b'B'));
+        assert!(descs.iter().all(|d| d.read_len == 0));
+    }
+
+    #[test]
+    fn read_structure_static_cols_beats_schema_fallback() {
+        // Even in the presence of an Illumina schema, static cols with
+        // concrete lengths should be preferred (Strategy 2 before 3).
+        let tree_with_col = static_col_tree(2, &[1, 1], &[75, 76]);
+        let descs = parse_read_structure(&tree_with_col).unwrap();
+        assert_eq!(descs[0].read_len, 75);
+        assert_eq!(descs[1].read_len, 76);
     }
 
     // -----------------------------------------------------------------------

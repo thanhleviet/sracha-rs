@@ -104,6 +104,26 @@ pub enum VdbCmd {
         /// Table to inspect (defaults to SEQUENCE / first table)
         #[arg(short = 'T', long)]
         table: Option<String>,
+        /// Show row counts, blob counts, and first-blob header stats per column
+        #[arg(short = 's', long)]
+        stats: bool,
+    },
+    /// Dump the metadata tree (schema/stats/LOAD/SOFTWARE nodes)
+    Meta {
+        /// Local .sra file path
+        file: PathBuf,
+        /// Table whose metadata tree to walk (defaults to SEQUENCE)
+        #[arg(short = 'T', long)]
+        table: Option<String>,
+        /// Restrict to a sub-path like `STATS/TABLE` or `LOAD`
+        #[arg(short = 'P', long)]
+        path: Option<String>,
+        /// Limit recursion depth below the chosen sub-path
+        #[arg(short = 'd', long)]
+        depth: Option<usize>,
+        /// Walk the database-level tree (root `md/cur`) instead of a table tree
+        #[arg(long)]
+        db: bool,
     },
     /// Print the embedded schema text
     Schema {

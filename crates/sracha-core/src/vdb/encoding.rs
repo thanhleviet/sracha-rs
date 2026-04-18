@@ -168,15 +168,11 @@ const ASCII_TO_4NA: [u8; 256] = {
     lut
 };
 
-/// Merge 2na-decoded ASCII bases with the ALTREAD 4na ambiguity mask.
+/// Merge 2na-decoded ASCII bases with an ALTREAD 4na-packed ambiguity mask.
 ///
-/// Reproduces the VDB schema's `bit_or(out_2na_4na_bin, .ALTREAD)` followed
-/// by `map<4na→text>`. For each position the ASCII base is converted to its
-/// 4na code, OR'd with the ALTREAD nibble, and mapped back to ASCII via
-/// [`DNA_4NA`].
-///
-/// `altread_packed` is 4na-packed (2 bases per byte, high nibble first).
-/// `num_bases` is the number of meaningful base positions.
+/// Used when the physical ALTREAD column stores `INSDC:4na:packed` (2 bases
+/// per byte, high nibble first). Reproduces the VDB schema's
+/// `bit_or(out_2na_4na_bin, .ALTREAD)` followed by `map<4na→text>`.
 pub fn merge_altread(bases: &mut [u8], altread_packed: &[u8], num_bases: usize) {
     let count = bases.len().min(num_bases);
     for i in 0..count {
@@ -189,6 +185,32 @@ pub fn merge_altread(bases: &mut [u8], altread_packed: &[u8], num_bases: usize) 
         } else {
             altread_packed[byte_idx] & 0x0F
         };
+        if nibble == 0 {
+            continue;
+        }
+        let base_4na = ASCII_TO_4NA[bases[i] as usize];
+        let merged = base_4na | nibble;
+        bases[i] = DNA_4NA[(merged & 0x0F) as usize];
+    }
+}
+
+/// Merge 2na-decoded ASCII bases with an ALTREAD 4na-bin ambiguity mask.
+///
+/// Used when the physical ALTREAD column stores `INSDC:4na:bin` (one byte
+/// per base, low nibble carries the 4na code). This is the common case for
+/// tables that inherit `NCBI:tbl:base_space` or `NCBI:align:tbl:seq`:
+///
+/// ```text
+/// physical column <INSDC:4na:bin>zip_encoding#1 .ALTREAD = trim#1<0,0>(…);
+/// ```
+///
+/// `altread_bytes` is expected to be padded to `num_bases` bytes — one
+/// entry per base position (zeros beyond the end of a per-row trim are
+/// restored by the caller before calling this function).
+pub fn merge_altread_bin(bases: &mut [u8], altread_bytes: &[u8], num_bases: usize) {
+    let count = bases.len().min(num_bases).min(altread_bytes.len());
+    for i in 0..count {
+        let nibble = altread_bytes[i] & 0x0F;
         if nibble == 0 {
             continue;
         }
@@ -515,5 +537,54 @@ mod tests {
         let altread = [0x00, 0xF0]; // pos0=0, pos1=0, pos2=F (high nibble of byte1)
         merge_altread(&mut bases, &altread, 3);
         assert_eq!(bases, b"ACN");
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_altread_bin tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn merge_altread_bin_no_ambiguity() {
+        let mut bases = b"ACGT".to_vec();
+        let altread = [0x00, 0x00, 0x00, 0x00];
+        merge_altread_bin(&mut bases, &altread, 4);
+        assert_eq!(bases, b"ACGT");
+    }
+
+    #[test]
+    fn merge_altread_bin_selective_n() {
+        // 4na_bin: one byte per base, low nibble = 4na code. 0x0F = N.
+        let mut bases = b"ACGT".to_vec();
+        let altread = [0x00, 0x0F, 0x00, 0x0F];
+        merge_altread_bin(&mut bases, &altread, 4);
+        assert_eq!(bases, b"ANGN");
+    }
+
+    #[test]
+    fn merge_altread_bin_iupac_merge() {
+        // A (4na=1) OR G-code (4na=4) = 5 → R (purine).
+        let mut bases = b"A".to_vec();
+        let altread = [0x04];
+        merge_altread_bin(&mut bases, &altread, 1);
+        assert_eq!(bases, b"R");
+    }
+
+    #[test]
+    fn merge_altread_bin_short_altread_stops_cleanly() {
+        // When altread is shorter than bases we stop at its end, leaving
+        // trailing bases untouched.
+        let mut bases = b"ACGT".to_vec();
+        let altread = [0x0F, 0x0F];
+        merge_altread_bin(&mut bases, &altread, 4);
+        assert_eq!(bases, b"NNGT");
+    }
+
+    #[test]
+    fn merge_altread_bin_ignores_high_nibble() {
+        // Writer should only populate low nibble; high nibble must be ignored.
+        let mut bases = b"A".to_vec();
+        let altread = [0xF0]; // high nibble set, low nibble zero → no change
+        merge_altread_bin(&mut bases, &altread, 1);
+        assert_eq!(bases, b"A");
     }
 }

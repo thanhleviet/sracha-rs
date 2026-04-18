@@ -3,7 +3,7 @@ use std::io::{BufReader, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use sracha_core::vdb::inspect::{self, InfoReport, VdbKind};
+use sracha_core::vdb::inspect::{self, ColumnStats, InfoReport, VdbKind};
 use sracha_core::vdb::kar::KarArchive;
 use sracha_core::vdb::metadata::{self, SoftwareEvent};
 
@@ -14,7 +14,14 @@ pub fn run(cmd: VdbCmd) -> Result<()> {
     match cmd {
         VdbCmd::Info { file, json } => cmd_info(&file, json),
         VdbCmd::Tables { file } => cmd_tables(&file),
-        VdbCmd::Columns { file, table } => cmd_columns(&file, table.as_deref()),
+        VdbCmd::Columns { file, table, stats } => cmd_columns(&file, table.as_deref(), stats),
+        VdbCmd::Meta {
+            file,
+            table,
+            path,
+            depth,
+            db,
+        } => cmd_meta(&file, table.as_deref(), path.as_deref(), depth, db),
         VdbCmd::Schema { file } => cmd_schema(&file),
         VdbCmd::IdRange {
             file,
@@ -186,13 +193,121 @@ fn cmd_tables(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_columns(path: &Path, table: Option<&str>) -> Result<()> {
-    let kar = open_kar(path)?;
-    let cols = inspect::list_columns(&kar, table)?;
+fn cmd_columns(path: &Path, table: Option<&str>, stats: bool) -> Result<()> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    for c in cols {
-        writeln!(out, "{c}")?;
+    if stats {
+        let mut kar = open_kar(path)?;
+        let rows = inspect::column_stats_all(&mut kar, path, table)?;
+        write_column_stats(&mut out, &rows)?;
+    } else {
+        let kar = open_kar(path)?;
+        let cols = inspect::list_columns(&kar, table)?;
+        for c in cols {
+            writeln!(out, "{c}")?;
+        }
+    }
+    Ok(())
+}
+
+fn write_column_stats<W: Write>(w: &mut W, rows: &[ColumnStats]) -> Result<()> {
+    writeln!(
+        w,
+        "{:<20} {:>12} {:>7} {:>8} {:>3} {:>12} {:>4} {:>4} {:>10} {:>5} {:>5} {:>5}",
+        "column",
+        "rows",
+        "blobs",
+        "first",
+        "ver",
+        "data_eof",
+        "page",
+        "csum",
+        "b0_size",
+        "range",
+        "rowlen",
+        "adj",
+    )?;
+    for s in rows {
+        write!(
+            w,
+            "{:<20} {:>12} {:>7} {:>8} {:>3} {:>12} {:>4} {:>4}",
+            s.name,
+            s.row_count,
+            s.blob_count,
+            s.first_row_id,
+            s.version,
+            s.data_eof,
+            s.page_size,
+            s.checksum_type,
+        )?;
+        if let Some(fb) = &s.first_blob {
+            write!(
+                w,
+                " {:>10} {:>5} {:>5} {:>5}",
+                fb.size,
+                fb.id_range,
+                fb.row_length
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                fb.adjust,
+            )?;
+            if fb.header_frames > 0 || fb.has_page_map || fb.big_endian {
+                write!(
+                    w,
+                    "  [frames={} page_map={} be={}]",
+                    fb.header_frames, fb.has_page_map, fb.big_endian
+                )?;
+            }
+        }
+        writeln!(w)?;
+    }
+    Ok(())
+}
+
+fn cmd_meta(
+    path: &Path,
+    table: Option<&str>,
+    sub_path: Option<&str>,
+    depth: Option<usize>,
+    db: bool,
+) -> Result<()> {
+    let mut kar = open_kar(path)?;
+    let nodes = if db {
+        inspect::read_db_metadata(&mut kar)
+            .ok_or_else(|| anyhow::anyhow!("no database-level md/cur in archive"))?
+    } else {
+        inspect::read_table_metadata(&mut kar, table).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no table metadata for {} in archive",
+                table.unwrap_or("SEQUENCE/first table")
+            )
+        })?
+    };
+    let rows = inspect::flatten_metadata(&nodes, sub_path.unwrap_or(""), depth);
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    if rows.is_empty() {
+        let target = sub_path.unwrap_or("<root>");
+        writeln!(
+            out,
+            "{} no metadata nodes under {target}",
+            style::header("note:")
+        )?;
+        return Ok(());
+    }
+    for r in rows {
+        write!(
+            out,
+            "{:<48} len={:<6} kids={}",
+            r.path, r.value_len, r.child_count
+        )?;
+        if r.value_len > 0 {
+            write!(out, "  val={:?}", r.preview)?;
+        }
+        for (k, v) in &r.attrs {
+            write!(out, "  {k}={v:?}")?;
+        }
+        writeln!(out)?;
     }
     Ok(())
 }

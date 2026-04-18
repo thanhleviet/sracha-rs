@@ -170,6 +170,17 @@ pub fn vlen_decode_u64_array(data: &[u8], count: usize) -> Result<(Vec<u64>, usi
 // Page map deserialization
 // ---------------------------------------------------------------------------
 
+/// Side that `vdb:trim` removed from each row when the column was
+/// written. Mirrors the transform's first template argument
+/// (`0 = leading`, `1 = trailing`). On restore, leading-trimmed rows
+/// right-align their stored bytes inside the padded row; trailing-
+/// trimmed rows left-align.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrimSide {
+    Leading,
+    Trailing,
+}
+
 /// Deserialized page map describing row boundaries within a blob.
 #[derive(Debug, Clone)]
 pub struct PageMap {
@@ -259,6 +270,75 @@ impl PageMap {
             row += repeat;
         }
         record_lens
+    }
+
+    /// Expand a per-row-trimmed column (e.g. ALTREAD `trim<0,0>`) to a
+    /// flat `total_rows * row_bytes` buffer, zero-padding the removed
+    /// positions that were trimmed at write time.
+    ///
+    /// `data` is the decompressed payload with one contiguous byte run
+    /// per data record. Records 0..N are then replicated `data_runs[i]`
+    /// times to produce the full row sequence. For every emitted row we
+    /// copy `min(stored, row_bytes)` bytes into the appropriate end of
+    /// the padded row (right-aligned for `TrimSide::Leading`,
+    /// left-aligned for `TrimSide::Trailing`) and leave the other end
+    /// zero.
+    ///
+    /// Fails if a per-record stored length exceeds `row_bytes` (would
+    /// silently drop data) or if data runs short.
+    pub fn pad_trimmed_rows_fixed(
+        &self,
+        data: &[u8],
+        row_bytes: usize,
+        side: TrimSide,
+    ) -> Result<Vec<u8>> {
+        let total_rows = self.total_rows() as usize;
+        let mut out = vec![0u8; total_rows * row_bytes];
+        let record_lens = self.data_record_lengths();
+
+        let mut in_off = 0usize;
+        let mut out_row = 0usize;
+        for (rec_idx, &rec_len_u32) in record_lens.iter().enumerate() {
+            let rec_len = rec_len_u32 as usize;
+            if rec_len > row_bytes {
+                return Err(Error::Vdb(format!(
+                    "page_map: record {rec_idx} stored {rec_len} bytes exceeds \
+                     row_bytes={row_bytes}"
+                )));
+            }
+            if in_off + rec_len > data.len() {
+                return Err(Error::Vdb(format!(
+                    "page_map: record {rec_idx} wants {rec_len} bytes at offset \
+                     {in_off} but data has only {}",
+                    data.len()
+                )));
+            }
+            let rec_data = &data[in_off..in_off + rec_len];
+            let repeat = if self.data_runs.is_empty() {
+                1
+            } else {
+                self.data_runs.get(rec_idx).copied().unwrap_or(1) as usize
+            };
+            for _ in 0..repeat {
+                if out_row >= total_rows {
+                    return Ok(out);
+                }
+                let out_start = out_row * row_bytes;
+                match side {
+                    TrimSide::Leading => {
+                        // stored bytes right-align; leading zeros fill the gap.
+                        let offset = row_bytes - rec_len;
+                        out[out_start + offset..out_start + row_bytes].copy_from_slice(rec_data);
+                    }
+                    TrimSide::Trailing => {
+                        out[out_start..out_start + rec_len].copy_from_slice(rec_data);
+                    }
+                }
+                out_row += 1;
+            }
+            in_off += rec_len;
+        }
+        Ok(out)
     }
 
     /// Expand variable-length data via data_runs.
@@ -2507,6 +2587,78 @@ mod tests {
         };
         let data = vec![1u8, 2];
         assert!(pm.expand_variable_data_runs(&data).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // pad_trimmed_rows_fixed
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pad_trimmed_rows_leading_right_aligns_and_replicates() {
+        // Mirrors ALTREAD `trim<0,0>`: each record's stored bytes land at
+        // the END of a fixed-width row, and `data_runs` copies those bytes
+        // into multiple consecutive rows.
+        let pm = PageMap {
+            data_recs: 2,
+            lengths: vec![3, 0],
+            leng_runs: vec![2, 3],
+            data_runs: vec![2, 3],
+        };
+        // Record 0 = 3 bytes, record 1 = 0 bytes. Data = record 0 only.
+        let data = vec![0xAA, 0xBB, 0xCC];
+        let padded = pm
+            .pad_trimmed_rows_fixed(&data, 5, TrimSide::Leading)
+            .unwrap();
+        // 5 rows × 5 bytes. First 2 rows: right-aligned [00 00 AA BB CC].
+        // Next 3 rows: all zero (record 1 was empty).
+        assert_eq!(
+            padded,
+            vec![
+                0x00, 0x00, 0xAA, 0xBB, 0xCC, // row 0
+                0x00, 0x00, 0xAA, 0xBB, 0xCC, // row 1
+                0x00, 0x00, 0x00, 0x00, 0x00, // row 2
+                0x00, 0x00, 0x00, 0x00, 0x00, // row 3
+                0x00, 0x00, 0x00, 0x00, 0x00, // row 4
+            ]
+        );
+    }
+
+    #[test]
+    fn pad_trimmed_rows_trailing_left_aligns() {
+        let pm = PageMap {
+            data_recs: 1,
+            lengths: vec![2],
+            leng_runs: vec![3],
+            data_runs: vec![3],
+        };
+        let data = vec![0x01, 0x02];
+        let padded = pm
+            .pad_trimmed_rows_fixed(&data, 4, TrimSide::Trailing)
+            .unwrap();
+        assert_eq!(
+            padded,
+            vec![
+                0x01, 0x02, 0x00, 0x00, // row 0
+                0x01, 0x02, 0x00, 0x00, // row 1
+                0x01, 0x02, 0x00, 0x00, // row 2
+            ]
+        );
+    }
+
+    #[test]
+    fn pad_trimmed_rows_rejects_stored_longer_than_row() {
+        let pm = PageMap {
+            data_recs: 1,
+            lengths: vec![5],
+            leng_runs: vec![1],
+            data_runs: vec![1],
+        };
+        let data = vec![1u8, 2, 3, 4, 5];
+        // row_bytes=3 is shorter than the 5-byte record — must error.
+        assert!(
+            pm.pad_trimmed_rows_fixed(&data, 3, TrimSide::Leading)
+                .is_err()
+        );
     }
 
     // -----------------------------------------------------------------------

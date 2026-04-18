@@ -35,12 +35,19 @@ cursor open (or download) and exits with a clear error rather than
 producing bad output, so you can fall back to `fasterq-dump` for these
 specific runs.
 
-- **Aligned SRA / cSRA** — runs built from aligned BAMs (schemas like
-  `NCBI:align:db:alignment_sorted`, or archives with `CMP_READ` /
-  `PRIMARY_ALIGNMENT`). Reads require ncbi-vdb's schema-aware virtual
-  cursor to reconstruct; sracha only reads physical VDB columns. Common
-  in human genomics and re-analyses; most unaligned submissions
-  (latf-load, BGISEQ, Element, PacBio, Nanopore) are unaffected.
+- **Reference-compressed cSRA** — archives with a physical `CMP_READ`
+  column or a sibling `PRIMARY_ALIGNMENT` table. Reads are stored as
+  deltas against a reference genome and require
+  `NCBI:align:seq_restore_read` cross-table joins, which sracha does
+  not yet implement. Common in human WGS/WES re-analyses; most
+  unaligned submissions (latf-load, BGISEQ, Element, PacBio, Nanopore)
+  are unaffected.
+
+  Archives that merely *label* themselves with an aligned schema
+  (e.g. bam-load's `ConvertDatabaseToUnmapped` pathway, which renames
+  `CMP_READ` → `READ` when no alignments were ingested) are handled
+  transparently — they decode through the same physical-column path
+  as regular SRA-lite files.
 
 ## Demo
 

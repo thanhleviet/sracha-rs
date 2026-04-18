@@ -482,45 +482,49 @@ impl VdbCursor {
         (templates, starts)
     }
 
-    /// Detect reads_per_spot and platform from the table metadata (`md/cur`).
+    /// Detect reads_per_spot and platform from the metadata trees.
+    ///
+    /// Read structure lives in the **table-level** `tbl/SEQUENCE/md/cur`
+    /// (it carries the `col/{READ_TYPE,READ_LEN}/row` static columns and
+    /// `READ_0`/`READ_1` nodes). The **database-level** `md/cur` usually
+    /// only has `LOAD`, `SOFTWARE`, and a DB-scope `schema` attribute.
+    /// We try table-level first, then fall back to DB-level so flat
+    /// tables (no `tbl/` wrapper) still work. Platform detection runs on
+    /// whichever tree produced a schema attribute.
     fn detect_metadata<R: Read + Seek>(
         archive: &mut KarArchive<R>,
     ) -> (Option<Vec<ReadDescriptor>>, Option<String>) {
-        // Try table-level metadata first, then database-level.
-        let md_bytes = match archive.read_file("md/cur") {
-            Ok(b) => b,
-            Err(_) => match archive.read_file("tbl/SEQUENCE/md/cur") {
-                Ok(b) => b,
+        fn try_tree<R: Read + Seek>(
+            archive: &mut KarArchive<R>,
+            path: &str,
+        ) -> Option<(Option<Vec<ReadDescriptor>>, Option<String>)> {
+            let md_bytes = archive.read_file(path).ok()?;
+            if md_bytes.len() < 8 {
+                return None;
+            }
+            let tree_data = md_bytes[8..].to_vec();
+            let rps = match crate::vdb::metadata::parse_read_structure(&tree_data) {
+                Ok(descs) => Some(descs),
                 Err(e) => {
-                    tracing::debug!("no md/cur found: {e}");
-                    return (None, None);
+                    tracing::debug!("metadata {path}: no read structure: {e}");
+                    None
                 }
-            },
-        };
-
-        if md_bytes.len() < 8 {
-            return (None, None);
+            };
+            let platform = crate::vdb::metadata::detect_platform(&tree_data);
+            Some((rps, platform))
         }
 
-        // Skip 8-byte KDBHdr (endian + version).
-        let tree_data = &md_bytes[8..];
+        let (rps_tbl, plat_tbl) = try_tree(archive, "tbl/SEQUENCE/md/cur").unwrap_or((None, None));
+        let (rps_db, plat_db) = try_tree(archive, "md/cur").unwrap_or((None, None));
 
-        let rps = match crate::vdb::metadata::parse_read_structure(tree_data) {
-            Ok(descs) => {
-                tracing::debug!("metadata: detected {} reads per spot", descs.len());
-                Some(descs)
-            }
-            Err(e) => {
-                tracing::debug!("metadata: could not determine read structure: {e}");
-                None
-            }
-        };
-
-        let platform = crate::vdb::metadata::detect_platform(tree_data);
+        let rps = rps_tbl.or(rps_db);
+        let platform = plat_tbl.or(plat_db);
+        if let Some(ref descs) = rps {
+            tracing::debug!("metadata: detected {} reads per spot", descs.len());
+        }
         if let Some(ref p) = platform {
             tracing::debug!("metadata: detected platform {p}");
         }
-
         (rps, platform)
     }
 }
@@ -589,24 +593,23 @@ fn find_sequence_col_base<R: Read + Seek>(archive: &KarArchive<R>) -> Result<Str
     ))
 }
 
-/// Reject cSRA (aligned / reference-compressed) archives.
+/// Reject archives that need ncbi-vdb's schema-aware virtual cursor.
 ///
 /// cSRA is NCBI's umbrella term for SRA files built from alignments.
-/// Several physical shapes appear in the wild:
+/// The shape that actually blocks a pure-Rust decoder is classic
+/// reference-compressed cSRA: a SEQUENCE table with `CMP_READ` (bases of
+/// unaligned mate halves only) plus a sibling `PRIMARY_ALIGNMENT` table
+/// that stores the aligned bases. Reconstructing per-spot reads requires
+/// `NCBI:align:seq_restore_read` cross-table joins which sracha does not
+/// yet implement.
 ///
-/// 1. Classic cSRA: `CMP_READ` instead of `READ` in `SEQUENCE`, plus
-///    `PRIMARY_ALIGNMENT` / `REFERENCE` sibling tables.
-/// 2. `bam-load`-style aligned databases: a physical `READ` column is
-///    present but the database-level schema is `NCBI:align:db:...`.
-///    READ_LEN / READ_TYPE are synthesized by ncbi-vdb's schema-aware
-///    virtual cursor from the alignment representation.
-///
-/// Both shapes need ncbi-vdb's virtual cursor to reconstruct per-spot read
-/// structure — sracha reads physical columns directly and would either
-/// error on the missing column (shape 1) or wedge on fallback heuristics
-/// (shape 2). Detect both and return a single actionable error.
+/// Archives that merely *label* themselves with an aligned schema (e.g.
+/// latf-load output that got `NCBI:align:db:alignment_sorted` stamped on,
+/// or bam-load's `ConvertDatabaseToUnmapped` pathway which renames
+/// CMP_READ→READ) carry a full physical READ column and decode correctly
+/// through the existing SRA-lite code path. Only schema label + CMP_READ
+/// (or PRIMARY_ALIGNMENT sibling) together mean we must bail out.
 fn reject_if_csra<R: Read + Seek>(archive: &mut KarArchive<R>, seq_col_base: &str) -> Result<()> {
-    // Structural detection: CMP_READ column or PRIMARY_ALIGNMENT table.
     let cmp_read_prefix = format!("{seq_col_base}/CMP_READ");
     let has_cmp_read = archive
         .entries()
@@ -617,27 +620,24 @@ fn reject_if_csra<R: Read + Seek>(archive: &mut KarArchive<R>, seq_col_base: &st
         .keys()
         .any(|p| p == "tbl/PRIMARY_ALIGNMENT" || p.contains("/tbl/PRIMARY_ALIGNMENT"));
 
-    // Schema-name detection: `NCBI:align:db:...` at table or db level.
-    let has_align_schema = read_aligned_schema_name(archive).is_some();
-
-    if has_cmp_read || has_primary_alignment || has_align_schema {
-        let hint = match read_aligned_schema_name(archive) {
-            Some(name) => format!(
-                "schema={name}. Reads require ncbi-vdb's schema-aware virtual cursor \
-                 to reconstruct; sracha reads physical columns only. Use fasterq-dump \
-                 from sra-tools instead."
-            ),
-            None => "reads are reference-compressed and cannot be directly converted; \
-                     use fasterq-dump from sra-tools instead."
-                .into(),
-        };
-        return Err(Error::UnsupportedFormat {
-            format: "aligned SRA (cSRA)".into(),
-            hint,
-        });
+    if !has_cmp_read && !has_primary_alignment {
+        return Ok(());
     }
 
-    Ok(())
+    let hint = match read_aligned_schema_name(archive) {
+        Some(name) => format!(
+            "schema={name}. Reads require ncbi-vdb's schema-aware virtual cursor \
+             to reconstruct; sracha reads physical columns only. Use fasterq-dump \
+             from sra-tools instead."
+        ),
+        None => "reads are reference-compressed and cannot be directly converted; \
+                 use fasterq-dump from sra-tools instead."
+            .into(),
+    };
+    Err(Error::UnsupportedFormat {
+        format: "aligned SRA (cSRA)".into(),
+        hint,
+    })
 }
 
 /// Probe the table- and db-level `md/cur` trees for a schema attribute that
@@ -958,6 +958,64 @@ mod tests {
             err.contains("aligned SRA") || err.contains("cSRA"),
             "expected cSRA error, got: {err}"
         );
+        let _ = std::fs::remove_file(&sra_path);
+    }
+
+    /// Build a minimal `md/cur` blob with a single `schema` node carrying
+    /// `name=<schema_name>` as an attribute. Shape matches what ncbi-vdb
+    /// writes: 8-byte KDBHdr prefix followed by a PBSTree.
+    fn build_md_cur_with_schema(schema_name: &str) -> Vec<u8> {
+        use crate::vdb::metadata::tests::{build_attrs_pbstree, build_meta_node, build_pbstree};
+        let attrs = build_attrs_pbstree(&[("name", schema_name.as_bytes())]);
+        let schema_node = build_meta_node("schema", b"", Some(&attrs));
+        let tree = build_pbstree(&[&schema_node]);
+        let mut buf = vec![0u8; 8];
+        buf.extend_from_slice(&tree);
+        buf
+    }
+
+    /// Build an archive: aligned-schema label in tbl/SEQUENCE/md/cur, but
+    /// only a physical READ column — no CMP_READ, no PRIMARY_ALIGNMENT.
+    /// After the narrowed reject, this shape should open cleanly.
+    fn build_align_schema_plain_archive() -> Vec<u8> {
+        let col_data = b"ACGTN";
+        let idx1 = build_idx1_v1(col_data.len() as u64, 1, 0);
+        let idx0 = build_kdb_blob_loc(0, 5, 1, 1);
+        let md_cur = build_md_cur_with_schema("NCBI:align:db:alignment_sorted#1.3");
+
+        let mut data_section = Vec::new();
+        let idx1_off = 0u64;
+        data_section.extend_from_slice(&idx1);
+        let idx0_off = data_section.len() as u64;
+        data_section.extend_from_slice(&idx0);
+        let data_off = data_section.len() as u64;
+        data_section.extend_from_slice(col_data);
+        let md_cur_off = data_section.len() as u64;
+        data_section.extend_from_slice(&md_cur);
+
+        let idx1_node = build_file_node("idx1", idx1_off, idx1.len() as u64);
+        let idx0_node = build_file_node("idx0", idx0_off, idx0.len() as u64);
+        let data_node = build_file_node("data", data_off, col_data.len() as u64);
+        let cur_node = build_file_node("cur", md_cur_off, md_cur.len() as u64);
+
+        let read_dir = build_dir_node("READ", &[&data_node, &idx0_node, &idx1_node]);
+        let col_dir = build_dir_node("col", &[&read_dir]);
+        let md_dir = build_dir_node("md", &[&cur_node]);
+        let seq_dir = build_dir_node("SEQUENCE", &[&col_dir, &md_dir]);
+        let tbl_dir = build_dir_node("tbl", &[&seq_dir]);
+        build_kar_archive(&[&tbl_dir], &data_section)
+    }
+
+    #[test]
+    fn accept_align_schema_without_alignment_tables() {
+        let archive_bytes = build_align_schema_plain_archive();
+        let sra_path = write_temp_sra(&archive_bytes);
+        let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
+        // Narrowed reject_if_csra: schema label alone must not trigger
+        // rejection when neither CMP_READ nor PRIMARY_ALIGNMENT is present.
+        let cursor = VdbCursor::open(&mut archive, &sra_path)
+            .expect("align-schema plain archive should open");
+        assert_eq!(cursor.spot_count(), 1);
         let _ = std::fs::remove_file(&sra_path);
     }
 

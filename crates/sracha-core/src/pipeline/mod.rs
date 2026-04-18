@@ -808,6 +808,31 @@ fn decode_blob_to_fastq(
     let mut read_data = crate::vdb::encoding::unpack_2na(&read_decoded.data, actual_bases);
     let read_page_map = read_decoded.page_map;
 
+    // V2 blobs may deduplicate identical rows via the page map's
+    // `data_runs` — e.g., two spots with identical base calls get
+    // written once and replicated on read. For fixed-row-length
+    // columns we replicate the 2na-decoded ASCII bytes accordingly so
+    // downstream slicing sees the full logical row count; without this
+    // trailing duplicate rows would drop out at blob boundaries and
+    // every subsequent spot would drift.
+    if let Some(ref pm) = read_page_map
+        && !pm.data_runs.is_empty()
+        && !pm.lengths.is_empty()
+        && pm.lengths.iter().all(|&l| l == pm.lengths[0])
+        && pm.lengths[0] > 0
+    {
+        let row_bytes = pm.lengths[0] as usize;
+        if read_data.len().is_multiple_of(row_bytes) {
+            match pm.expand_data_runs_bytes(&read_data, row_bytes) {
+                Ok(expanded) => read_data = expanded,
+                Err(e) => {
+                    tracing::debug!("blob {blob_idx}: READ expand_data_runs_bytes skipped: {e}");
+                }
+            }
+        }
+    }
+    let actual_bases = read_data.len();
+
     // ------------------------------------------------------------------
     // Decode QUALITY blob (skipped entirely in FASTA mode).
     // ------------------------------------------------------------------
@@ -869,13 +894,29 @@ fn decode_blob_to_fastq(
     if raw.has_altread && !raw.has_illumina_name_parts && !raw.altread_raw.is_empty() {
         let alt_decoded = decode_raw(raw.altread_raw, raw.altread_cs, raw.altread_id_range)?;
         let alt_page_map = alt_decoded.page_map.clone();
-        let mut altread_data = decode_zip_encoding(&alt_decoded)?;
-        if let Some(ref pm) = alt_page_map
-            && !pm.data_runs.is_empty()
+        let altread_data = decode_zip_encoding(&alt_decoded)?;
+        // Physical ALTREAD is `<INSDC:4na:bin>zip_encoding#1 .ALTREAD =
+        // trim<0,0>(…)` — one byte per base in the low nibble, stored
+        // as variable-length rows with leading zeros stripped. Pad each
+        // row back to the full per-row length (right-aligning the
+        // stored bytes because `trim<0, 0>` trims from the left) using
+        // the page_map, then merge byte-per-base.
+        let row_bases = actual_bases / raw.read_id_range.max(1) as usize;
+        if let Some(pm) = alt_page_map.as_ref()
+            && row_bases > 0
+            && actual_bases == row_bases * raw.read_id_range as usize
+            && let Ok(padded) = pm.pad_trimmed_rows_fixed(
+                &altread_data,
+                row_bases,
+                crate::vdb::blob::TrimSide::Leading,
+            )
         {
-            altread_data = pm.expand_variable_data_runs(&altread_data)?;
+            crate::vdb::encoding::merge_altread_bin(&mut read_data, &padded, actual_bases);
+        } else {
+            // Fallback for variable-length rows or missing page_map:
+            // best-effort byte-per-base merge over the flat payload.
+            crate::vdb::encoding::merge_altread_bin(&mut read_data, &altread_data, actual_bases);
         }
-        crate::vdb::encoding::merge_altread(&mut read_data, &altread_data, actual_bases);
     } else if !quality_is_empty && quality_all.len() == read_data.len() {
         // Fallback: quality-based N-masking (Phred <= 2 → N).
         const NOCALL_QUAL_BYTE: u8 = 35; // Phred 2 + 33 offset = ASCII '#'

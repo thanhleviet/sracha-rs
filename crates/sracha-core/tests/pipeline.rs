@@ -61,6 +61,45 @@ fn ensure_srr28588231() -> PathBuf {
     path
 }
 
+/// Ensure the SRR10358300 fixture (Illumina paired-end, ~23 MiB).
+///
+/// Exercises the aligned-schema-plain-SRA path: `latf-load`-origin archive
+/// with `NCBI:align:tbl:seq#1.1` table schema and no alignment tables, so
+/// the narrowed `reject_if_csra` lets it through and decode goes through
+/// the existing SRA-lite code path using static-column read structure.
+fn ensure_srr10358300() -> PathBuf {
+    static DOWNLOAD: Once = Once::new();
+    let path = fixtures_dir().join("SRR10358300.sra");
+
+    DOWNLOAD.call_once(|| {
+        if path.exists() {
+            return;
+        }
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let url = "https://sra-pub-run-odp.s3.amazonaws.com/sra/SRR10358300/SRR10358300";
+        eprintln!("downloading SRR10358300 fixture from {url} ...");
+
+        let resp = reqwest::blocking::get(url)
+            .unwrap_or_else(|e| panic!("failed to download SRR10358300: {e}"));
+        assert!(
+            resp.status().is_success(),
+            "HTTP {} downloading fixture",
+            resp.status()
+        );
+        let bytes = resp.bytes().unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        eprintln!(
+            "fixture saved to {} ({} bytes)",
+            path.display(),
+            bytes.len()
+        );
+    });
+
+    assert!(path.exists(), "fixture not found at {}", path.display());
+    path
+}
+
 /// Build a `PipelineConfig` suitable for testing.
 fn test_config(
     output_dir: &std::path::Path,
@@ -467,6 +506,42 @@ fn illumina_paired_byte_identity() {
     assert_eq!(
         md5_2, "d307ea894444f2ede7a1ee51d65c6e04",
         "SRR28588231_2.fastq md5 mismatch — deflines or data differ from fasterq-dump"
+    );
+}
+
+#[ignore] // requires network on first run
+#[test]
+fn aligned_schema_plain_byte_identity() {
+    // Regression guard for the cSRA-rejection narrowing (0c63e1a) and
+    // static-column read-structure fallback. SRR10358300 is a
+    // `latf-load.2.9.1`-origin archive whose table schema is
+    // `NCBI:align:tbl:seq#1.1`; it has no alignment tables, no physical
+    // READ_LEN column, and no platform-inferable schema name, so before
+    // the aligned-schema relaxation it was rejected up-front and after
+    // is decoded via `col/READ_TYPE/row` + `col/READ_LEN/row` static
+    // columns plus the blob-0 row_length hint.
+    //
+    // md5s below match `fastq-dump --split-3` output on all 62,983
+    // spots.
+    let sra_path = ensure_srr10358300();
+    let tmp = tempfile::tempdir().unwrap();
+    let config = test_config(tmp.path(), SplitMode::Split3, CompressionMode::None);
+
+    let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR10358300"), &config).unwrap();
+
+    assert_eq!(stats.spots_read, 62_983);
+    assert_eq!(stats.reads_written, stats.spots_read * 2);
+    assert_eq!(stats.output_files.len(), 2);
+
+    let md5_1 = md5_file(&stats.output_files[0]);
+    let md5_2 = md5_file(&stats.output_files[1]);
+    assert_eq!(
+        md5_1, "395fc640bdf2dd9d1888f9b422f800ba",
+        "SRR10358300_1.fastq md5 mismatch — aligned-schema plain path regressed"
+    );
+    assert_eq!(
+        md5_2, "10e15712bdf6449535c5044e0460e32b",
+        "SRR10358300_2.fastq md5 mismatch — aligned-schema plain path regressed"
     );
 }
 
