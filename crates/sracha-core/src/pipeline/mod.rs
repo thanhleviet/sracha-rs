@@ -1320,6 +1320,14 @@ fn decode_blob_to_fastq(
     // Reusable buffer for itoa spot-name formatting.
     let mut itoa_buf = itoa::Buffer::new();
 
+    // Per-spot segment list reused across spots — allocated once per blob
+    // instead of once per spot. `rps` is typically 1 or 2.
+    struct ReadSeg {
+        start: usize,
+        len: usize,
+    }
+    let mut segments: Vec<ReadSeg> = Vec::with_capacity(rps);
+
     while rl_cursor + rps <= read_lengths.len() {
         let spot_read_lengths = &read_lengths[rl_cursor..rl_cursor + rps];
         let spot_total_bases: usize = spot_read_lengths.iter().map(|&l| l as usize).sum();
@@ -1404,12 +1412,7 @@ fn decode_blob_to_fastq(
         // ------------------------------------------------------------------
         // Inline format_spot logic: split reads, filter, route, format.
         // ------------------------------------------------------------------
-        struct ReadSeg {
-            start: usize,
-            len: usize,
-        }
-
-        let mut segments: Vec<ReadSeg> = Vec::with_capacity(rps);
+        segments.clear();
         let mut read_offset: usize = 0;
         for (i, &rlen) in spot_read_lengths.iter().enumerate() {
             let rlen_usize = rlen as usize;
