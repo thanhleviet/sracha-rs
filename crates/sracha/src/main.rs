@@ -480,22 +480,33 @@ async fn main() -> Result<()> {
                 style::count(resolve_results.len()),
             ));
 
-            let mut resolved_all = Vec::new();
-            for result in resolve_results {
-                match result {
-                    Ok(resolved) => resolved_all.push(resolved),
-                    Err(e) => eprintln!("{} {e}", style::error_label("error:")),
-                }
-            }
+            let entries: Vec<InfoEntry> = run_accessions
+                .iter()
+                .zip(resolve_results.iter())
+                .map(|(acc, result)| match result {
+                    Ok(resolved) => InfoEntry::Ok(resolved),
+                    Err(e) => InfoEntry::Error {
+                        accession: acc.clone(),
+                        message: format!("{e}"),
+                    },
+                })
+                .collect();
 
-            if resolved_all.len() > 1 {
-                // Project/multi-accession: print summary table then total.
-                print_info_table(&resolved_all);
-            } else {
+            let ok_count = entries
+                .iter()
+                .filter(|e| matches!(e, InfoEntry::Ok(_)))
+                .count();
+
+            if entries.len() > 1 {
+                // Project/multi-accession: summary table; errors included as rows.
+                print_info_table(&entries);
+            } else if ok_count == 1 {
                 // Single accession: detailed view.
-                for resolved in &resolved_all {
+                if let Some(InfoEntry::Ok(resolved)) = entries.first() {
                     print_resolved(resolved);
                 }
+            } else if let Some(InfoEntry::Error { accession, message }) = entries.first() {
+                eprintln!("{} {accession}: {message}", style::error_label("error:"),);
             }
             Ok(())
         }
@@ -864,42 +875,78 @@ fn print_resolved(resolved: &ResolvedAccession) {
     }
 }
 
-/// Print a compact table for multiple resolved accessions (project view).
-fn print_info_table(resolved: &[ResolvedAccession]) {
+/// One row's worth of `sracha info` state: either a fully resolved record
+/// (from SDL/S3) or an error captured during resolution so it can still be
+/// rendered as a table row.
+pub enum InfoEntry<'a> {
+    Ok(&'a ResolvedAccession),
+    Error { accession: String, message: String },
+}
+
+/// Print a compact table for multiple accessions. Errored entries appear
+/// as rows with a `error` status (Size/Layout/Lite dashed) and the error
+/// message is printed beneath the table.
+fn print_info_table(entries: &[InfoEntry<'_>]) {
     use tabled::builder::Builder;
     use tabled::settings::object::{Columns, Rows};
     use tabled::settings::style::HorizontalLine;
     use tabled::settings::{Alignment, Color, Modify, Panel, Style};
 
     let mut total_size: u64 = 0;
+    let mut ok_count = 0usize;
     let mut builder = Builder::new();
 
-    builder.push_record(["Accession", "Size", "Layout", "Lite"]);
+    builder.push_record(["Accession", "Size", "Layout", "Lite", "Status"]);
 
-    for r in resolved {
-        let layout = r
-            .run_info
-            .as_ref()
-            .map(|ri| if ri.nreads == 2 { "PAIRED" } else { "SINGLE" })
-            .unwrap_or("?");
-        let lite = if r.sra_file.is_lite { "yes" } else { "no" };
-        total_size += r.sra_file.size;
+    for entry in entries {
+        match entry {
+            InfoEntry::Ok(r) => {
+                let layout = r
+                    .run_info
+                    .as_ref()
+                    .map(|ri| if ri.nreads == 2 { "PAIRED" } else { "SINGLE" })
+                    .unwrap_or("?");
+                let lite = if r.sra_file.is_lite { "yes" } else { "no" };
+                total_size += r.sra_file.size;
+                ok_count += 1;
 
-        builder.push_record([
-            r.accession.clone(),
-            format_size(r.sra_file.size),
-            layout.to_string(),
-            lite.to_string(),
-        ]);
+                builder.push_record([
+                    r.accession.clone(),
+                    format_size(r.sra_file.size),
+                    layout.to_string(),
+                    lite.to_string(),
+                    style::value("ok"),
+                ]);
+            }
+            InfoEntry::Error { accession, .. } => {
+                builder.push_record([
+                    accession.clone(),
+                    "-".into(),
+                    "-".into(),
+                    "-".into(),
+                    style::error_label("error"),
+                ]);
+            }
+        }
     }
 
-    let summary = format!(
-        "Total: {} across {} run(s)",
-        style::value(format_size(total_size)),
-        style::count(resolved.len()),
-    );
+    let err_count = entries.len() - ok_count;
+    let summary = if err_count == 0 {
+        format!(
+            "Total: {} across {} run(s)",
+            style::value(format_size(total_size)),
+            style::count(ok_count),
+        )
+    } else {
+        format!(
+            "Total: {} across {} ok, {} error",
+            style::value(format_size(total_size)),
+            style::count(ok_count),
+            style::count(err_count),
+        )
+    };
 
-    let footer_line = resolved.len() + 1;
+    let footer_line = entries.len() + 1;
     let mut table = builder.build();
     table
         .with(Panel::footer(summary))
@@ -911,6 +958,13 @@ fn print_info_table(resolved: &[ResolvedAccession]) {
         .with(Modify::new(Columns::new(1..=1)).with(Alignment::right()));
 
     println!("{table}");
+
+    // Error details below the table so the user can act on each failure.
+    for entry in entries {
+        if let InfoEntry::Error { accession, message } = entry {
+            eprintln!("  {}: {message}", style::header(accession));
+        }
+    }
 }
 
 /// Size threshold (in bytes) above which downloads require `--yes` confirmation.
@@ -1051,10 +1105,11 @@ fn check_download_confirmation(
     has_projects: bool,
 ) -> Result<()> {
     let total_size: u64 = resolved.iter().map(|r| r.sra_file.size).sum();
+    let entries: Vec<InfoEntry> = resolved.iter().map(InfoEntry::Ok).collect();
 
     if has_projects && !yes {
         eprintln!();
-        print_info_table(resolved);
+        print_info_table(&entries);
         eprintln!();
         anyhow::bail!(
             "project downloads require confirmation -- rerun with --yes / -y to proceed ({})",
@@ -1064,7 +1119,7 @@ fn check_download_confirmation(
 
     if total_size > LARGE_DOWNLOAD_THRESHOLD && !yes {
         eprintln!();
-        print_info_table(resolved);
+        print_info_table(&entries);
         eprintln!();
         anyhow::bail!(
             "total download size {} exceeds 100 GiB -- rerun with --yes / -y to confirm",
@@ -1075,7 +1130,7 @@ fn check_download_confirmation(
     // For confirmed project downloads, still show the table for visibility.
     if has_projects {
         eprintln!();
-        print_info_table(resolved);
+        print_info_table(&entries);
         eprintln!();
     }
 
