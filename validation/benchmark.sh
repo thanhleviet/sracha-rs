@@ -46,7 +46,10 @@ SRATOOLS_DIR="$SCRIPT_DIR/sra-tools"
 
 SMALL_SRA="$ROOT_DIR/crates/sracha-core/tests/fixtures/SRR28588231.sra"   # 23 MiB
 MEDIUM_SRA="$SCRIPT_DIR/SRR2584863.sra"                                   # 288 MiB
-LARGE_SRA="$SCRIPT_DIR/SRR14724462.sra"                                   # 3.78 GiB
+# NOTE: previously SRR6691717 but that is a cSRA (NCBI:align:db:...) which
+# sracha now rejects. SRR6691717 is a plain Illumina SINGLE 100bp run of
+# comparable size (3.2 GiB).
+LARGE_SRA="$SCRIPT_DIR/SRR6691717.sra"                                    # 3.20 GiB
 
 SKIP_LARGE=false
 ONLY=""
@@ -240,14 +243,14 @@ if should_run medium; then
 fi
 
 # =====================================================================
-# Benchmark: Large file (SRR14724462, 3.78 GiB) — single run
+# Benchmark: Large file (SRR6691717, 3.20 GiB) — single run
 # =====================================================================
 if should_run large && [[ "$SKIP_LARGE" != true ]]; then
     if [[ ! -f "$LARGE_SRA" ]]; then
-        log "Downloading SRR14724462 for large benchmark..."
-        "$SRACHA" fetch SRR14724462 -O "$SCRIPT_DIR" --no-progress
+        log "Downloading SRR6691717 for large benchmark..."
+        "$SRACHA" fetch SRR6691717 -O "$SCRIPT_DIR" --no-progress
     fi
-    log "Benchmark: SRR14724462 (3.78 GiB) — uncompressed FASTQ (single run)"
+    log "Benchmark: SRR6691717 (3.20 GiB) — uncompressed FASTQ (single run)"
     echo "  (fastq-dump skipped for large file — too slow)"
 
     LARGE_OUT="$SCRATCH/large"
@@ -276,7 +279,7 @@ if should_run large && [[ "$SKIP_LARGE" != true ]]; then
         awk '{ printf "| `%s` | %.2f |\n", $1, $2 }' "$TIMING_FILE"
     } > "$OUTDIR/large.md"
 elif should_run large; then
-    log "Benchmark: SRR14724462 SKIPPED (--skip-large)"
+    log "Benchmark: SRR6691717 SKIPPED (--skip-large)"
 fi
 
 # =====================================================================
