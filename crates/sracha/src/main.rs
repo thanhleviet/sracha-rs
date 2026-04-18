@@ -1,6 +1,7 @@
 mod cli;
 mod progress;
 mod style;
+mod vdb_cmd;
 
 use std::path::Path;
 
@@ -663,6 +664,7 @@ async fn main() -> Result<()> {
 
             Ok(())
         }
+        Command::Vdb(args) => vdb_cmd::run(args.cmd),
     }
 }
 

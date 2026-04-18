@@ -190,15 +190,19 @@ fn parse_read_desc_string(s: &str) -> Option<ReadDescriptor> {
 // Metadata node parser (uses shared PBSTree from kar.rs)
 // ---------------------------------------------------------------------------
 
-struct MetaNode {
-    name: String,
-    value: Vec<u8>,
+pub struct MetaNode {
+    pub name: String,
+    pub value: Vec<u8>,
     /// Attribute key-value pairs (name → value bytes).
-    attrs: Vec<(String, Vec<u8>)>,
+    pub attrs: Vec<(String, Vec<u8>)>,
+    /// Child nodes (parsed lazily; empty when the node has none on disk).
+    pub children: Vec<MetaNode>,
 }
 
-/// Parse top-level metadata nodes from a PBSTree buffer.
-fn parse_meta_nodes(buf: &[u8]) -> Result<Vec<MetaNode>, String> {
+/// Parse a metadata node tree from a PBSTree buffer, recursively inflating
+/// child PBSTrees so that nested paths like `LOAD/timestamp` and
+/// `SOFTWARE/loader` can be resolved.
+pub(crate) fn parse_meta_nodes(buf: &[u8]) -> Result<Vec<MetaNode>, String> {
     let slices = kar::parse_pbstree_slices(buf).map_err(|e| e.to_string())?;
 
     let mut nodes = Vec::with_capacity(slices.len());
@@ -227,7 +231,6 @@ fn parse_meta_node(data: &[u8]) -> Option<MetaNode> {
     let name = String::from_utf8_lossy(&data[1..1 + name_len]).to_string();
     let mut pos = 1 + name_len;
 
-    // Parse attributes PBSTree if present.
     let attrs = if has_attrs {
         let attr_start = pos;
         let skip = kar::pbstree_byte_size(&data[pos..])?;
@@ -238,15 +241,113 @@ fn parse_meta_node(data: &[u8]) -> Option<MetaNode> {
         Vec::new()
     };
 
-    // Skip children PBSTree if present (we don't need them).
-    if has_children {
+    let children = if has_children {
+        let child_start = pos;
         let skip = kar::pbstree_byte_size(&data[pos..])?;
+        let child_buf = &data[child_start..child_start + skip];
         pos += skip;
-    }
+        parse_meta_nodes(child_buf).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     let value = data[pos..].to_vec();
 
-    Some(MetaNode { name, value, attrs })
+    Some(MetaNode {
+        name,
+        value,
+        attrs,
+        children,
+    })
+}
+
+/// Look up a node by `/`-delimited path within a parsed metadata tree.
+pub fn find_meta_node<'a>(nodes: &'a [MetaNode], path: &str) -> Option<&'a MetaNode> {
+    let mut parts = path.splitn(2, '/');
+    let first = parts.next()?;
+    let node = nodes.iter().find(|n| n.name == first)?;
+    match parts.next() {
+        None => Some(node),
+        Some(rest) => find_meta_node(&node.children, rest),
+    }
+}
+
+fn attr_value<'a>(node: &'a MetaNode, key: &str) -> Option<&'a [u8]> {
+    node.attrs
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_slice())
+}
+
+fn attr_string(node: &MetaNode, key: &str) -> Option<String> {
+    attr_value(node, key).map(|b| String::from_utf8_lossy(b).into_owned())
+}
+
+/// A single SOFTWARE/{formatter,loader,update} record, mirroring the
+/// fields vdb-dump prints for FMT/LDR/UPD lines.
+#[derive(Debug, Clone)]
+pub struct SoftwareEvent {
+    pub name: String,
+    pub vers: String,
+    pub run_date: String,
+    pub tool_date: String,
+}
+
+/// Read one SOFTWARE event by sub-path (e.g. `formatter`, `loader`, `update`).
+pub fn software_event(nodes: &[MetaNode], sub_path: &str) -> Option<SoftwareEvent> {
+    let path = format!("SOFTWARE/{sub_path}");
+    let node = find_meta_node(nodes, &path)?;
+    let name = attr_string(node, "name")
+        .or_else(|| attr_string(node, "tool"))
+        .unwrap_or_default();
+    if name.is_empty() {
+        return None;
+    }
+    let vers = attr_string(node, "vers").unwrap_or_default();
+    let run_date = attr_string(node, "run").unwrap_or_default();
+    let tool_date = attr_string(node, "date")
+        .or_else(|| attr_string(node, "build"))
+        .unwrap_or_default();
+    Some(SoftwareEvent {
+        name,
+        vers,
+        run_date,
+        tool_date,
+    })
+}
+
+/// Read the `LOAD/timestamp` Unix-epoch value, if present.
+///
+/// Mirrors `KMDataNodeReadAsU64`: the value is 1/2/4/8 raw LE bytes depending
+/// on the load tool's choice. Returns `None` for any other size.
+pub fn load_timestamp(nodes: &[MetaNode]) -> Option<u64> {
+    let node = find_meta_node(nodes, "LOAD/timestamp")?;
+    match node.value.len() {
+        1 => Some(node.value[0] as u64),
+        2 => Some(u16::from_le_bytes(node.value[..2].try_into().ok()?) as u64),
+        4 => Some(u32::from_le_bytes(node.value[..4].try_into().ok()?) as u64),
+        8 => Some(u64::from_le_bytes(node.value[..8].try_into().ok()?)),
+        _ => None,
+    }
+}
+
+/// Return the raw bytes of the embedded schema text (`schema` node value).
+pub fn schema_text(nodes: &[MetaNode]) -> Option<&[u8]> {
+    let node = nodes.iter().find(|n| n.name == "schema")?;
+    if node.value.is_empty() {
+        None
+    } else {
+        Some(&node.value)
+    }
+}
+
+/// Convenience: parse the metadata bytes of an `md/cur` file (after stripping
+/// the 8-byte KDBHdr) into a node tree. Returns an empty Vec on failure.
+pub fn parse_md_cur(md_bytes: &[u8]) -> Vec<MetaNode> {
+    if md_bytes.len() < 8 {
+        return Vec::new();
+    }
+    parse_meta_nodes(&md_bytes[8..]).unwrap_or_default()
 }
 
 /// Parse attribute nodes from a PBSTree. Attribute nodes store a

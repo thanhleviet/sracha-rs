@@ -71,6 +71,57 @@ pub enum Command {
 
     /// Validate SRA file integrity
     Validate(ValidateArgs),
+
+    /// Inspect VDB structure of a local .sra file (replacement for vdb-dump)
+    Vdb(VdbArgs),
+}
+
+#[derive(Args)]
+pub struct VdbArgs {
+    #[command(subcommand)]
+    pub cmd: VdbCmd,
+}
+
+#[derive(Subcommand)]
+pub enum VdbCmd {
+    /// Print summary metadata (schema, platform, row counts, dates)
+    Info {
+        /// Local .sra file path
+        file: PathBuf,
+        /// Emit a single JSON object instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+    /// List tables in the archive (Database only)
+    Tables {
+        /// Local .sra file path
+        file: PathBuf,
+    },
+    /// List columns in the chosen table
+    Columns {
+        /// Local .sra file path
+        file: PathBuf,
+        /// Table to inspect (defaults to SEQUENCE / first table)
+        #[arg(short = 'T', long)]
+        table: Option<String>,
+    },
+    /// Print the embedded schema text
+    Schema {
+        /// Local .sra file path
+        file: PathBuf,
+    },
+    /// Print first row id and row count for the chosen table/column
+    #[command(name = "id-range")]
+    IdRange {
+        /// Local .sra file path
+        file: PathBuf,
+        /// Table to inspect (defaults to SEQUENCE / first table)
+        #[arg(short = 'T', long)]
+        table: Option<String>,
+        /// Column to read (defaults to the first column alphabetically)
+        #[arg(short = 'C', long)]
+        column: Option<String>,
+    },
 }
 
 #[derive(Args)]

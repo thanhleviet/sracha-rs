@@ -1,0 +1,256 @@
+use std::fs::File;
+use std::io::{BufReader, Write};
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use sracha_core::vdb::inspect::{self, InfoReport, VdbKind};
+use sracha_core::vdb::kar::KarArchive;
+use sracha_core::vdb::metadata::{self, SoftwareEvent};
+
+use crate::cli::VdbCmd;
+use crate::style;
+
+pub fn run(cmd: VdbCmd) -> Result<()> {
+    match cmd {
+        VdbCmd::Info { file, json } => cmd_info(&file, json),
+        VdbCmd::Tables { file } => cmd_tables(&file),
+        VdbCmd::Columns { file, table } => cmd_columns(&file, table.as_deref()),
+        VdbCmd::Schema { file } => cmd_schema(&file),
+        VdbCmd::IdRange {
+            file,
+            table,
+            column,
+        } => cmd_id_range(&file, table.as_deref(), column.as_deref()),
+    }
+}
+
+fn open_kar(path: &Path) -> Result<KarArchive<BufReader<File>>> {
+    let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    KarArchive::open(BufReader::new(f))
+        .with_context(|| format!("parsing KAR archive at {}", path.display()))
+}
+
+fn cmd_info(path: &Path, as_json: bool) -> Result<()> {
+    let mut kar = open_kar(path)?;
+    let report = inspect::gather_info(&mut kar, path)?;
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let acc = path.display().to_string();
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    if as_json {
+        write_info_json(&mut out, &acc, path, file_size, &report)?;
+    } else {
+        write_info_text(&mut out, &acc, path, file_size, &report)?;
+    }
+    Ok(())
+}
+
+fn write_info_text<W: Write>(
+    w: &mut W,
+    acc: &str,
+    path: &Path,
+    file_size: u64,
+    r: &InfoReport,
+) -> Result<()> {
+    writeln!(w, "acc    : {acc}")?;
+    writeln!(w, "path   : {}", path.display())?;
+    if file_size != 0 {
+        writeln!(w, "size   : {}", thousands(file_size))?;
+    }
+    writeln!(w, "type   : {}", r.kind.as_str())?;
+    if let Some(p) = &r.platform {
+        writeln!(w, "platf  : SRA_PLATFORM_{p}")?;
+    }
+    for (name, count) in &r.tables {
+        let label = match name.as_str() {
+            "SEQUENCE" => "SEQ    ",
+            "REFERENCE" => "REF    ",
+            "PRIMARY_ALIGNMENT" => "PRIM   ",
+            "SECONDARY_ALIGNMENT" => "SEC    ",
+            "EVIDENCE_ALIGNMENT" => "EVID   ",
+            "EVIDENCE_INTERVAL" => "EVINT  ",
+            "CONSENSUS" => "CONS   ",
+            "PASSES" => "PASS   ",
+            "METRICS" => "METR   ",
+            _ => "",
+        };
+        if !label.is_empty() && *count != 0 {
+            writeln!(w, "{label}: {}", thousands(*count))?;
+        }
+    }
+    if let Some(s) = &r.schema_name {
+        writeln!(w, "SCHEMA : {s}")?;
+    }
+    if let Some(ts) = r.timestamp {
+        writeln!(w, "TIME   : 0x{ts:016x} ({})", format_c_time(ts))?;
+    }
+    write_event_text(w, "FMT", r.formatter.as_ref())?;
+    write_event_text(w, "LDR", r.loader.as_ref())?;
+    write_event_text(w, "UPD", r.update.as_ref())?;
+    Ok(())
+}
+
+fn write_event_text<W: Write>(w: &mut W, prefix: &str, ev: Option<&SoftwareEvent>) -> Result<()> {
+    let Some(ev) = ev else {
+        return Ok(());
+    };
+    if !ev.name.is_empty() {
+        writeln!(w, "{prefix:<6} : {}", ev.name)?;
+    }
+    if !ev.vers.is_empty() {
+        writeln!(w, "{prefix}VER : {}", ev.vers)?;
+    }
+    if !ev.tool_date.is_empty() {
+        writeln!(w, "{prefix}DATE: {}", ev.tool_date)?;
+    }
+    if !ev.run_date.is_empty() {
+        writeln!(w, "{prefix}RUN : {}", ev.run_date)?;
+    }
+    Ok(())
+}
+
+fn write_info_json<W: Write>(
+    w: &mut W,
+    acc: &str,
+    path: &Path,
+    file_size: u64,
+    r: &InfoReport,
+) -> Result<()> {
+    use serde_json::{Map, Value, json};
+    let mut obj = Map::new();
+    obj.insert("acc".into(), json!(acc));
+    obj.insert("path".into(), json!(path.display().to_string()));
+    if file_size != 0 {
+        obj.insert("size".into(), json!(file_size));
+    }
+    obj.insert("type".into(), json!(r.kind.as_str()));
+    if let Some(p) = &r.platform {
+        obj.insert("platform".into(), json!(format!("SRA_PLATFORM_{p}")));
+    }
+    let mut tables = Map::new();
+    for (name, count) in &r.tables {
+        tables.insert(name.clone(), json!(count));
+    }
+    obj.insert("tables".into(), Value::Object(tables));
+    if let Some(s) = &r.schema_name {
+        obj.insert("schema".into(), json!(s));
+    }
+    if let Some(ts) = r.timestamp {
+        obj.insert("timestamp".into(), json!(ts));
+        obj.insert("time".into(), json!(format_iso_time(ts)));
+    }
+    let mut events = Map::new();
+    for (key, ev) in [
+        ("formatter", r.formatter.as_ref()),
+        ("loader", r.loader.as_ref()),
+        ("update", r.update.as_ref()),
+    ] {
+        if let Some(ev) = ev {
+            events.insert(
+                key.into(),
+                json!({
+                    "name": ev.name,
+                    "vers": ev.vers,
+                    "date": ev.tool_date,
+                    "run":  ev.run_date,
+                }),
+            );
+        }
+    }
+    if !events.is_empty() {
+        obj.insert("software".into(), Value::Object(events));
+    }
+    serde_json::to_writer_pretty(&mut *w, &Value::Object(obj))?;
+    writeln!(w)?;
+    Ok(())
+}
+
+fn cmd_tables(path: &Path) -> Result<()> {
+    let kar = open_kar(path)?;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    match inspect::detect_kind(&kar)? {
+        VdbKind::Database => {
+            for t in inspect::list_tables(&kar)? {
+                writeln!(out, "{t}")?;
+            }
+        }
+        VdbKind::Table => {
+            eprintln!(
+                "{} this archive is a flat Table; no inner tables to list",
+                style::header("note:")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_columns(path: &Path, table: Option<&str>) -> Result<()> {
+    let kar = open_kar(path)?;
+    let cols = inspect::list_columns(&kar, table)?;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for c in cols {
+        writeln!(out, "{c}")?;
+    }
+    Ok(())
+}
+
+fn cmd_schema(path: &Path) -> Result<()> {
+    let mut kar = open_kar(path)?;
+    let nodes = inspect::read_table_metadata(&mut kar, None)
+        .or_else(|| inspect::read_db_metadata(&mut kar))
+        .ok_or_else(|| anyhow::anyhow!("no metadata (md/cur) found in archive"))?;
+    let text = metadata::schema_text(&nodes)
+        .ok_or_else(|| anyhow::anyhow!("no schema node found in metadata"))?;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    out.write_all(text)?;
+    if !text.ends_with(b"\n") {
+        writeln!(out)?;
+    }
+    Ok(())
+}
+
+fn cmd_id_range(path: &Path, table: Option<&str>, column: Option<&str>) -> Result<()> {
+    let mut kar = open_kar(path)?;
+    let (first, count) = inspect::id_range(&mut kar, path, table, column)?;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    writeln!(
+        out,
+        "id-range: first-row = {first}, row-count = {}",
+        thousands(count)
+    )?;
+    Ok(())
+}
+
+fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i != 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
+fn format_c_time(ts: u64) -> String {
+    use chrono::TimeZone;
+    match chrono::Local.timestamp_opt(ts as i64, 0) {
+        chrono::LocalResult::Single(dt) => dt.format("%m/%d/%Y %H:%M").to_string(),
+        _ => format!("ts={ts}"),
+    }
+}
+
+fn format_iso_time(ts: u64) -> String {
+    use chrono::TimeZone;
+    match chrono::Local.timestamp_opt(ts as i64, 0) {
+        chrono::LocalResult::Single(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+        _ => format!("ts={ts}"),
+    }
+}

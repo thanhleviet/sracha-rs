@@ -1,6 +1,7 @@
 pub mod blob;
 pub mod cursor;
 pub mod encoding;
+pub mod inspect;
 pub mod kar;
 pub mod kdb;
 pub mod metadata;
