@@ -103,19 +103,23 @@ fn decode_4na(nibble: u8) -> u8 {
 /// `num_bases` may be less than `packed.len() * 4` when the last byte contains
 /// padding bits.
 pub fn unpack_2na(packed: &[u8], num_bases: usize) -> Vec<u8> {
-    let mut bases = Vec::with_capacity(num_bases);
-
-    // Fast path: process full bytes (4 bases each) via lookup table.
     let full_bytes = num_bases / 4;
-    for &byte in &packed[..full_bytes] {
-        bases.extend_from_slice(&LUT_2NA[byte as usize]);
+    let trailing = num_bases % 4;
+
+    // Pre-size the output. Previously `Vec::with_capacity` + per-iter
+    // `extend_from_slice` forced LLVM to emit a capacity check and len
+    // writeback inside the hot loop (~33% of its time per `perf
+    // annotate`). With a sized Vec and `chunks_exact_mut(4)` the loop
+    // becomes load-byte → LUT-load → 4-byte store, with no bookkeeping.
+    let mut bases = vec![0u8; num_bases];
+
+    for (chunk, &byte) in bases.chunks_exact_mut(4).zip(packed[..full_bytes].iter()) {
+        chunk.copy_from_slice(&LUT_2NA[byte as usize]);
     }
 
-    // Handle trailing bases from the last partial byte.
-    let trailing = num_bases % 4;
     if trailing > 0 && full_bytes < packed.len() {
         let entry = &LUT_2NA[packed[full_bytes] as usize];
-        bases.extend_from_slice(&entry[..trailing]);
+        bases[full_bytes * 4..].copy_from_slice(&entry[..trailing]);
     }
 
     bases
