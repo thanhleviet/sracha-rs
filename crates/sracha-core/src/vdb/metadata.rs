@@ -87,6 +87,34 @@ pub fn parse_read_structure(tree_data: &[u8]) -> Result<Vec<ReadDescriptor>, Str
     ))
 }
 
+/// Return the schema node's attribute name (e.g.
+/// `"NCBI:SRA:Illumina:tbl:phred:v2#1.0.4"` or
+/// `"NCBI:align:db:alignment_sorted#1.3"`) if present in the table-level
+/// metadata tree. Returns `None` when no `schema` node has an attribute.
+pub fn schema_attr_name(tree_data: &[u8]) -> Option<String> {
+    let nodes = parse_meta_nodes(tree_data).ok()?;
+    for node in &nodes {
+        if node.name == "schema" {
+            for (_, attr_val) in &node.attrs {
+                if !attr_val.is_empty() {
+                    return Some(String::from_utf8_lossy(attr_val).into_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Returns true if a schema name indicates an alignment database (cSRA-like).
+/// These use `NCBI:align:db:...` schemas where `READ`/`READ_LEN`/`READ_TYPE`
+/// are logical columns synthesized by ncbi-vdb's schema-aware cursor from
+/// the alignment representation. sracha's physical-only cursor cannot
+/// reconstruct them, so we reject up-front instead of mis-decoding or
+/// hanging on fallback heuristics.
+pub fn is_aligned_database_schema(schema_name: &str) -> bool {
+    schema_name.contains("align:db")
+}
+
 /// Extract the sequencing platform from the schema table name.
 ///
 /// NCBI VDB schema names follow the pattern `NCBI:SRA:<Platform>:tbl:...`.
@@ -464,6 +492,29 @@ mod tests {
     #[test]
     fn platform_case_sensitive() {
         assert_eq!(detect_platform_from_schema("illumina"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // is_aligned_database_schema
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn aligned_db_schemas_detected() {
+        assert!(is_aligned_database_schema(
+            "NCBI:align:db:alignment_sorted#1.3"
+        ));
+        assert!(is_aligned_database_schema(
+            "NCBI:align:db:alignment_unsorted"
+        ));
+    }
+
+    #[test]
+    fn plain_sequence_schemas_not_aligned() {
+        assert!(!is_aligned_database_schema(
+            "NCBI:SRA:Illumina:tbl:phred:v2#1.0.4"
+        ));
+        assert!(!is_aligned_database_schema("NCBI:SRA:PacBio:tbl:v2"));
+        assert!(!is_aligned_database_schema(""));
     }
 
     // -----------------------------------------------------------------------

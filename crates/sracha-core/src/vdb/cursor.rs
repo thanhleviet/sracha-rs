@@ -75,6 +75,7 @@ impl VdbCursor {
     ) -> Result<Self> {
         let seq_col_base = find_sequence_col_base(archive)?;
         reject_if_csra(archive, &seq_col_base)?;
+        reject_if_aligned_database(archive)?;
 
         // Parse table metadata (md/cur) to extract reads_per_spot and
         // platform for SRA-lite files that lack physical READ_LEN/NREADS columns.
@@ -587,6 +588,40 @@ fn find_sequence_col_base<R: Read + Seek>(archive: &KarArchive<R>) -> Result<Str
     Err(Error::Vdb(
         "SEQUENCE table not found in KAR archive (tried database and flat-table layouts)".into(),
     ))
+}
+
+/// Reject alignment-database schemas (e.g. `NCBI:align:db:alignment_sorted`).
+///
+/// These files expose a physical `SEQUENCE/col/READ` column but their
+/// logical read structure (READ_LEN, READ_TYPE) is synthesized by
+/// ncbi-vdb's schema-aware virtual cursor from the alignment
+/// representation. sracha reads physical VDB columns directly and cannot
+/// reconstruct that structure, so decode would otherwise fall through to
+/// fixed-length heuristics and stall. We surface a clear error instead.
+fn reject_if_aligned_database<R: Read + Seek>(archive: &mut KarArchive<R>) -> Result<()> {
+    // Prefer the table-level metadata; fall back to database-level.
+    let md_bytes = match archive.read_file("md/cur") {
+        Ok(b) => b,
+        Err(_) => match archive.read_file("tbl/SEQUENCE/md/cur") {
+            Ok(b) => b,
+            Err(_) => return Ok(()), // no metadata — nothing to check against
+        },
+    };
+    if md_bytes.len() < 8 {
+        return Ok(());
+    }
+    let tree_data = &md_bytes[8..];
+    if let Some(schema_name) = crate::vdb::metadata::schema_attr_name(tree_data)
+        && crate::vdb::metadata::is_aligned_database_schema(&schema_name)
+    {
+        return Err(Error::UnsupportedFormat {
+            format: format!("aligned SRA database (schema={schema_name})"),
+            hint: "sracha reads physical VDB columns directly and does not support schema-aware \
+                   aligned databases. Use fasterq-dump from sra-tools for these files."
+                .into(),
+        });
+    }
+    Ok(())
 }
 
 /// Reject cSRA (aligned/reference-compressed) archives.
