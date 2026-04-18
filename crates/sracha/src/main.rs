@@ -139,7 +139,12 @@ async fn main() -> Result<()> {
                     &dl_config,
                 )
                 .await?;
-                tracing::info!("{acc}: saved to {}", output_path.display());
+                eprintln!(
+                    "{}: {} downloaded",
+                    style::header(acc),
+                    style::value(format_size(resolved.sra_file.size)),
+                );
+                eprintln!("  wrote {}", style::path(output_path.display()));
             }
             Ok(())
         }
@@ -197,6 +202,7 @@ async fn main() -> Result<()> {
                     cancelled: None,
                     http_client: None,
                     strict: args.strict,
+                    keep_sra: false,
                 };
 
                 let stats = sracha_core::pipeline::run_fastq(sra_path, None, &pipeline_config)?;
@@ -209,7 +215,7 @@ async fn main() -> Result<()> {
                 );
                 if !args.stdout {
                     for path in &stats.output_files {
-                        eprintln!("  -> {}", style::path(path.display()));
+                        eprintln!("  wrote {}", style::path(path.display()));
                     }
                 }
             }
@@ -330,6 +336,7 @@ async fn main() -> Result<()> {
                     cancelled: Some(cancelled.clone()),
                     strict: args.strict,
                     http_client: Some(http_client.clone()),
+                    keep_sra: args.keep_sra,
                 }
             };
 
@@ -418,7 +425,7 @@ async fn main() -> Result<()> {
                         }
                         if !args.stdout {
                             for path in &stats.output_files {
-                                eprintln!("  -> {}", style::path(path.display()));
+                                eprintln!("  wrote {}", style::path(path.display()));
                             }
                         }
                         completed_accessions.push(resolved.accession.clone());

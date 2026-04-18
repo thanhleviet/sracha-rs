@@ -2582,6 +2582,41 @@ mod tests {
     }
 
     #[test]
+    fn page_map_expand_data_runs_bytes_row_length_gt_1() {
+        // Regression for iter-1 validation: columns with row_length > 1 crashed
+        // sracha with `data_runs has N entries, expected at least 2N for 4N
+        // bytes at 4 bytes/elem`. Callers must pass entry_bytes
+        // (= row_length × elem_bytes), not elem_bytes, so the "number of rows"
+        // check matches the per-row data_runs count.
+        let pm = PageMap {
+            data_recs: 3,
+            lengths: vec![2], // two u32s per row
+            leng_runs: vec![6],
+            data_runs: vec![2, 1, 3],
+        };
+        // Three rows, two u32 LE each = 24 bytes.
+        let mut data = Vec::new();
+        for v in [10u32, 11, 20, 21, 30, 31] {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        let row_length = pm.lengths[0] as usize;
+        let entry_bytes = row_length * 4;
+
+        let expanded = pm.expand_data_runs_bytes(&data, entry_bytes).unwrap();
+        // 2 + 1 + 3 = 6 logical rows, each 8 bytes.
+        assert_eq!(expanded.len(), 6 * 8);
+        let vals: Vec<u32> = expanded
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(vals, vec![10, 11, 10, 11, 20, 21, 30, 31, 30, 31, 30, 31]);
+
+        // And confirm the old mis-invocation (passing elem_bytes=4) still
+        // fails, so we don't silently regress.
+        assert!(pm.expand_data_runs_bytes(&data, 4).is_err());
+    }
+
+    #[test]
     fn page_map_expand_variable_data_runs_rejects_truncated_data() {
         // record_lens will be [4], needs 4 bytes; give it only 2.
         let pm = PageMap {

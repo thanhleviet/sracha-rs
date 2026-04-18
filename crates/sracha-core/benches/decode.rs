@@ -56,6 +56,7 @@ fn config(out: &std::path::Path, threads: usize, compression: CompressionMode) -
         cancelled: None,
         strict: false,
         http_client: None,
+        keep_sra: false,
     }
 }
 

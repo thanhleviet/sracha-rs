@@ -439,6 +439,14 @@ pub fn format_spot(
         let qual = &spot.quality[offset..end];
         offset = end;
 
+        // Filter: skip zero-length reads — fasterq-dump drops these.
+        // (Some SRA schemas store empty placeholder segments alongside
+        // real reads; including them inflates the apparent segment count
+        // and mis-routes single-end spots into `_1.fastq`/`_2.fastq`.)
+        if rlen == 0 {
+            continue;
+        }
+
         // Filter: skip technical reads if configured.
         if config.skip_technical
             && let Some(&rtype) = spot.read_types.get(i)
@@ -559,7 +567,9 @@ pub fn output_filename(
         OutputSlot::Single => format!("{accession}{ext}"),
         OutputSlot::Read1 => format!("{accession}_1{ext}"),
         OutputSlot::Read2 => format!("{accession}_2{ext}"),
-        OutputSlot::Unpaired => format!("{accession}_0{ext}"),
+        // Matches fasterq-dump: split-3 orphans and single-end runs both
+        // land in `{accession}.fastq` (no `_0` suffix).
+        OutputSlot::Unpaired => format!("{accession}{ext}"),
         // ReadN is 0-indexed internally but 1-indexed in the filename to match
         // the convention used by SRA tools (read number, not array index).
         OutputSlot::ReadN(n) => format!("{accession}_{}{ext}", n + 1),
@@ -947,6 +957,78 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Zero-length read filtering
+    //
+    // Regression for iter-1 validation: runs like DRR032766 (SINGLE-layout
+    // on paper) declare two reads per spot where one has length 0. Without
+    // filtering, sracha emitted `_1.fastq` + `_2.fastq` while fasterq-dump
+    // dropped the empty segment and wrote a single `.fastq`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn zero_length_trailing_segment_filtered_in_split3() {
+        // Build a spot manually: 4bp biological read + 0bp empty segment.
+        let spot = SpotRecord {
+            name: b"1".to_vec(),
+            sequence: b"ACGT".to_vec(),
+            quality: b"????".to_vec(),
+            read_lengths: vec![4, 0],
+            read_types: vec![0, 0],
+            read_filter: vec![0, 0],
+            spot_group: Vec::new(),
+        };
+        let config = FastqConfig {
+            split_mode: SplitMode::Split3,
+            ..default_config()
+        };
+        let results = format_spot(&spot, "SRR1", &config);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, OutputSlot::Unpaired);
+    }
+
+    #[test]
+    fn zero_length_leading_segment_filtered_in_split3() {
+        // Flipped order: empty first, then a biological read.
+        let spot = SpotRecord {
+            name: b"1".to_vec(),
+            sequence: b"ACGT".to_vec(),
+            quality: b"????".to_vec(),
+            read_lengths: vec![0, 4],
+            read_types: vec![0, 0],
+            read_filter: vec![0, 0],
+            spot_group: Vec::new(),
+        };
+        let config = FastqConfig {
+            split_mode: SplitMode::Split3,
+            ..default_config()
+        };
+        let results = format_spot(&spot, "SRR1", &config);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, OutputSlot::Unpaired);
+    }
+
+    #[test]
+    fn zero_length_segment_in_paired_drops_to_unpaired() {
+        // Paired schema, but one read is empty — collapses to single unpaired.
+        let spot = SpotRecord {
+            name: b"1".to_vec(),
+            sequence: b"ACGTACGT".to_vec(),
+            quality: b"????????".to_vec(),
+            read_lengths: vec![8, 0],
+            read_types: vec![0, 0],
+            read_filter: vec![0, 0],
+            spot_group: Vec::new(),
+        };
+        let config = FastqConfig {
+            split_mode: SplitMode::Split3,
+            ..default_config()
+        };
+        let results = format_spot(&spot, "SRR1", &config);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, OutputSlot::Unpaired);
+    }
+
+    // -----------------------------------------------------------------------
     // Combined filtering
     // -----------------------------------------------------------------------
 
@@ -1108,10 +1190,13 @@ mod tests {
 
     #[test]
     fn output_filename_unpaired() {
+        // Regression guard: fasterq-dump names split-3 orphans (and single-end
+        // runs) plain `{acc}.fastq`, not `{acc}_0.fastq`. Divergence here
+        // causes FAIL_MISSING in validation comparisons.
         let gz = CompressionMode::Gzip { level: 6 };
         assert_eq!(
             output_filename("SRR123456", OutputSlot::Unpaired, false, &gz),
-            "SRR123456_0.fastq.gz"
+            "SRR123456.fastq.gz"
         );
     }
 
@@ -1147,7 +1232,7 @@ mod tests {
                 false,
                 &CompressionMode::None
             ),
-            "SRR999_0.fastq"
+            "SRR999.fastq"
         );
     }
 

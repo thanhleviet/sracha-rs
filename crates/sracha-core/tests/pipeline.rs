@@ -123,6 +123,7 @@ fn test_config(
         cancelled: None,
         strict: false,
         http_client: None,
+        keep_sra: false,
     }
 }
 

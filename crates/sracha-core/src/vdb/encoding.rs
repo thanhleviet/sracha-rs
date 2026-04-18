@@ -408,6 +408,11 @@ mod tests {
 
     #[test]
     fn phred_to_ascii_sequence() {
+        // Direct +33 offset, no flooring: older srf-load-produced
+        // archives (e.g. DRR000918) legitimately store Q0 at some
+        // positions and fasterq-dump preserves them as `!`. An earlier
+        // Q2 floor helped DRR002048-style 2011 fastq-load files but
+        // regressed these older srf-load files on every Q0/Q1 byte.
         let input: Vec<u8> = (0..=10).collect();
         let expected: Vec<u8> = (33..=43).collect();
         assert_eq!(phred_to_ascii(&input), expected);
@@ -415,6 +420,7 @@ mod tests {
 
     #[test]
     fn phred_to_ascii_edge_zero() {
+        // Q0 must map to '!' verbatim for srf-load parity (DRR000918).
         assert_eq!(phred_to_ascii(&[0]), vec![33]); // '!'
     }
 

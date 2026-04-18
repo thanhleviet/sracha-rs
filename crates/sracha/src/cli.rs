@@ -387,6 +387,12 @@ pub struct GetArgs {
     /// paired-spot violations, truncated reads). Off by default.
     #[arg(long, help_heading = "Advanced")]
     pub strict: bool,
+
+    /// Keep the downloaded SRA file in the output directory instead of
+    /// deleting it after decode. Useful for validation runs that want
+    /// to re-run another tool (e.g. `fasterq-dump`) on the same input.
+    #[arg(long, help_heading = "Advanced")]
+    pub keep_sra: bool,
 }
 
 #[derive(Args)]

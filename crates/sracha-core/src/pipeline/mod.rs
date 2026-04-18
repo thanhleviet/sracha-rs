@@ -82,6 +82,10 @@ pub struct PipelineConfig {
     /// [`DownloadConfig`] so TLS sessions and connection pools are reused
     /// across accessions.
     pub http_client: Option<reqwest::Client>,
+    /// Preserve the downloaded SRA file in the output directory after
+    /// decode instead of deleting it. Useful for validation runs that
+    /// want to compare against another tool on the same input file.
+    pub keep_sra: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -633,7 +637,10 @@ fn expand_via_page_map(decoded_ints: Vec<u8>, page_map: &Option<blob::PageMap>) 
         }
         Ok(expanded)
     } else if !pm.data_runs.is_empty() {
-        pm.expand_data_runs_bytes(&decoded_ints, elem_bytes)
+        // data_runs is per-row; each row is `entry_bytes` (row_length × elem_bytes).
+        // Passing elem_bytes here would trip the length check on any column with
+        // row_length > 1, crashing with a 2:1 (or N:1) "expected at least" ratio.
+        pm.expand_data_runs_bytes(&decoded_ints, entry_bytes)
     } else {
         Ok(decoded_ints)
     }
@@ -697,6 +704,20 @@ fn decode_zip_encoding(decoded: &blob::DecodedBlob<'_>) -> Result<Vec<u8>> {
     }
 
     if hdr_version >= 1 {
+        // Very small payloads (under the ~12-byte deflate/zlib minimum) can't
+        // realistically be compressed — any such bytes are the raw data. NCBI
+        // writes these for tiny ALTREAD / secondary-column blobs where the
+        // compression header is set but the payload skips compression because
+        // it's too short to benefit. Treat as raw as a last resort so one
+        // small blob doesn't cause entire downstream columns to fail.
+        if decoded.data.len() <= 12 {
+            tracing::debug!(
+                "zip_encoding v{hdr_version}: treating {}-byte payload as raw \
+                 (below deflate/zlib minimum)",
+                decoded.data.len(),
+            );
+            return Ok(decoded.data.to_vec());
+        }
         return Err(Error::Vdb(format!(
             "zip_encoding v{hdr_version}: both deflate and zlib failed on {}-byte payload",
             decoded.data.len(),
@@ -705,6 +726,54 @@ fn decode_zip_encoding(decoded: &blob::DecodedBlob<'_>) -> Result<Vec<u8>> {
 
     // v0 (no transform header): payload is often raw bytes already.
     Ok(decoded.data.to_vec())
+}
+
+/// Decode the QUALITY blob payload, handling both `zip_encoding` (deflate/
+/// zlib — modern Illumina) and `izip_encoding` (NCBI integer compression —
+/// older srf-load-era Illumina such as DRR001816).
+///
+/// The encoding isn't tagged in the blob header in a way that's trivially
+/// inspectable, so we probe by attempting `izip_decode` first: its 5-byte
+/// header validation (`flags + data_count` — see
+/// [`blob::deserialize_izip_encoded`]) rejects non-iZip payloads cleanly,
+/// so any file whose QUALITY is standard deflate falls straight through to
+/// [`decode_zip_encoding`]. Byte-identity regressions for SRR28588231 /
+/// SRR2584863 (both `zip_encoding`) remain intact because their probe
+/// attempt errors out and we hit the identical deflate path we used
+/// before.
+fn decode_quality_encoding(decoded: &blob::DecodedBlob<'_>) -> Result<Vec<u8>> {
+    if !decoded.data.is_empty()
+        && let Ok(qdata) = blob::izip_decode(&decoded.data, 8, decoded.data.len() as u32)
+        && !qdata.is_empty()
+    {
+        return Ok(qdata);
+    }
+    decode_zip_encoding(decoded)
+}
+
+/// Convert raw Phred quality bytes (as read from the physical `QUALITY`
+/// column) into Phred+33 ASCII-encoded bytes ready for FASTQ output.
+///
+/// Returns `(encoded, is_empty)` where `is_empty` is true when the input
+/// is empty or all-zero (both cases mean "no real quality data — caller
+/// should synthesize a fallback"). Every other byte goes through
+/// [`crate::vdb::encoding::phred_to_ascii`], which adds `+33` verbatim.
+/// Raw Q0 maps to `!` — older srf-load archives (e.g. DRR000918) do
+/// legitimately store Q0 and fasterq-dump preserves it as-is.
+///
+/// Extracted so the invariant "raw column bytes always get +33 applied,
+/// never passed through as ASCII" is unit-testable independently of the
+/// rest of the decode pipeline. An earlier implementation tried to
+/// detect already-encoded inputs via an `all_valid_ascii` heuristic and
+/// silently skipped the offset — that branch misfired on files whose
+/// raw Phred distribution happened to be entirely in [33, 126] (e.g.
+/// DRR040728) and produced systematic off-by-33 quality divergence.
+fn encode_raw_quality_for_fastq(quality_data: &[u8]) -> (Vec<u8>, bool) {
+    let is_empty = quality_data.is_empty() || quality_data.iter().all(|&b| b == 0);
+    if is_empty {
+        return (Vec::new(), true);
+    }
+    (crate::vdb::encoding::phred_to_ascii(quality_data), false)
 }
 
 // ---------------------------------------------------------------------------
@@ -719,6 +788,9 @@ struct RawBlobData<'a> {
     read_raw: &'a [u8],
     /// Row count (id_range) for the READ blob.
     read_id_range: u64,
+    /// Start row id of the READ blob — used to align ALTREAD (which may
+    /// be chunked into differently-sized blobs).
+    read_start_id: i64,
     /// QUALITY column raw bytes (empty if column absent or blob out of range).
     quality_raw: &'a [u8],
     /// Row count for the QUALITY blob (0 if absent).
@@ -753,6 +825,13 @@ struct RawBlobData<'a> {
     altread_raw: &'a [u8],
     /// Row count for the ALTREAD blob (0 if absent).
     altread_id_range: u64,
+    /// Start row id of the ALTREAD blob. Needed because ALTREAD and READ
+    /// can be chunked into blobs with different row counts — e.g.
+    /// DRR035866 has READ in 4096-row blobs but ALTREAD in 8192-row
+    /// blobs. We look up the ALTREAD blob by row id rather than by
+    /// index, and use this field to compute the row offset within the
+    /// padded ALTREAD buffer when the blobs don't align 1:1.
+    altread_start_id: i64,
     /// Checksum type for the ALTREAD column.
     altread_cs: u8,
     /// Whether the ALTREAD column exists (independent of Illumina name parts).
@@ -779,6 +858,9 @@ struct RawBlobData<'a> {
     /// fallback when READ_LEN column is absent). Borrowed from the outer
     /// `decode_and_write` scope so we don't clone a Vec per blob.
     fallback_read_lengths: Option<&'a [u32]>,
+    /// Per-read types (0=biological, 1=technical) from VDB metadata,
+    /// used as a fallback when the physical READ_TYPE column is absent.
+    fallback_read_types: Option<&'a [u8]>,
 }
 
 /// Decode a single blob and produce FASTQ records directly.
@@ -848,15 +930,18 @@ fn decode_blob_to_fastq(
     let actual_bases = read_data.len();
 
     // ------------------------------------------------------------------
-    // Decode QUALITY blob (skipped entirely in FASTA mode).
+    // Decode QUALITY blob (skipped entirely in FASTA mode, and also for
+    // SRA-Lite runs — the stored bytes there are synthetic placeholders
+    // (e.g. Q3 reject/'$') that don't match fasterq-dump's syn_quality
+    // output, so we force the synthesis fallback below).
     // ------------------------------------------------------------------
-    let (quality_all, quality_is_empty): (Vec<u8>, bool) = if config.fasta {
+    let (quality_all, quality_is_empty): (Vec<u8>, bool) = if config.fasta || is_lite {
         (Vec::new(), true)
     } else {
         let quality_data: Vec<u8> = if !raw.quality_raw.is_empty() {
             let qdecoded = decode_raw(raw.quality_raw, raw.quality_cs, raw.quality_id_range)?;
             let qpage_map = qdecoded.page_map.clone();
-            let mut qdata = decode_zip_encoding(&qdecoded)?;
+            let mut qdata = decode_quality_encoding(&qdecoded)?;
             // Expand quality data via page map data_runs if present.
             // Some blobs (e.g., PacBio) store repeated rows once with
             // data_runs > 1; the decompressed data only contains unique
@@ -871,7 +956,7 @@ fn decode_blob_to_fastq(
             Vec::new()
         };
 
-        let is_empty = quality_data.is_empty() || quality_data.iter().all(|&b| b == 0);
+        let (all, is_empty) = encode_raw_quality_for_fastq(&quality_data);
         if is_empty && !quality_data.is_empty() {
             diag.all_zero_quality_blobs
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -881,74 +966,154 @@ fn decode_blob_to_fastq(
                 quality_data.len(),
             );
         }
-        let all: Vec<u8> = if !is_empty {
-            // Check ALL bytes to decide if data is already Phred+33 ASCII.
-            let all_valid_ascii = quality_data.len() == read_data.len()
-                && quality_data.iter().all(|&b| (33..=126).contains(&b));
-            if all_valid_ascii {
-                quality_data
-            } else {
-                crate::vdb::encoding::phred_to_ascii(&quality_data)
-            }
-        } else {
-            Vec::new()
-        };
-
         (all, is_empty)
     };
 
     // ------------------------------------------------------------------
-    // N-masking: ALTREAD ambiguity merge (preferred) or quality fallback.
+    // N-masking: ALTREAD (4na) ambiguity merge.
     //
-    // When ALTREAD + X + Y columns are all present (Illumina), ALTREAD
-    // stores ASCII name templates, not 4na ambiguity data — skip merge.
-    // When ALTREAD is present WITHOUT Illumina name parts, it contains
-    // the 4na ambiguity mask used by the VDB schema's bit_or operation.
+    // Physical ALTREAD is always <INSDC:4na:bin> — it holds the 4na
+    // ambiguity mask that the VDB schema `bit_or`s over the 2na basecalls
+    // to produce the canonical READ column. The X+Y columns enable NAME
+    // reconstruction but don't change ALTREAD's semantics; earlier
+    // versions of this code mistakenly assumed X+Y-present meant
+    // "ALTREAD is a name template" and skipped the merge, producing
+    // garbage for Illumina runs.
+    //
+    // No quality-based N-masking fallback: fasterq-dump emits the raw
+    // 2na basecalls for low-quality positions (Q <= 2 is common in
+    // late-cycle Illumina reads) and only replaces with N where ALTREAD
+    // says so. A Q-based mask over-writes real bases, causing
+    // FAIL_SEQ divergences validated on accessions like DRR006688.
     // ------------------------------------------------------------------
-    if raw.has_altread && !raw.has_illumina_name_parts && !raw.altread_raw.is_empty() {
-        let alt_decoded = decode_raw(raw.altread_raw, raw.altread_cs, raw.altread_id_range)?;
-        let alt_page_map = alt_decoded.page_map.clone();
-        let altread_data = decode_zip_encoding(&alt_decoded)?;
-        // Physical ALTREAD is `<INSDC:4na:bin>zip_encoding#1 .ALTREAD =
-        // trim<0,0>(…)` — one byte per base in the low nibble, stored
-        // as variable-length rows with leading zeros stripped. Pad each
-        // row back to the full per-row length (right-aligning the
-        // stored bytes because `trim<0, 0>` trims from the left) using
-        // the page_map, then merge byte-per-base.
-        let row_bases = actual_bases / raw.read_id_range.max(1) as usize;
-        if let Some(pm) = alt_page_map.as_ref()
-            && row_bases > 0
-            && actual_bases == row_bases * raw.read_id_range as usize
-            && let Ok(padded) = pm.pad_trimmed_rows_fixed(
-                &altread_data,
-                row_bases,
-                crate::vdb::blob::TrimSide::Leading,
-            )
-        {
-            crate::vdb::encoding::merge_altread_bin(&mut read_data, &padded, actual_bases);
-        } else {
-            // Fallback for variable-length rows or missing page_map:
-            // best-effort byte-per-base merge over the flat payload.
-            crate::vdb::encoding::merge_altread_bin(&mut read_data, &altread_data, actual_bases);
-        }
-    } else if !quality_is_empty && quality_all.len() == read_data.len() {
-        // Fallback: quality-based N-masking (Phred <= 2 → N).
-        const NOCALL_QUAL_BYTE: u8 = 35; // Phred 2 + 33 offset = ASCII '#'
-        for (base, &qual) in read_data.iter_mut().zip(quality_all.iter()) {
-            if qual <= NOCALL_QUAL_BYTE {
-                *base = b'N';
+    if raw.has_altread && !raw.altread_raw.is_empty() {
+        // ALTREAD decode is best-effort: some (usually very small) blobs
+        // fail to decompress — e.g. a 5-byte payload where neither deflate
+        // nor zlib produces valid output. Previously this was masked by
+        // only running the merge when !has_illumina_name_parts, but that
+        // also skipped the merge for modern Illumina runs that do need
+        // it. Now we attempt the merge always and tolerate decode errors.
+        let alt_result = decode_raw(raw.altread_raw, raw.altread_cs, raw.altread_id_range)
+            .and_then(|alt_decoded| {
+                let alt_page_map = alt_decoded.page_map.clone();
+                let altread_data = decode_zip_encoding(&alt_decoded)?;
+                Ok((alt_page_map, altread_data))
+            });
+        match alt_result {
+            Ok((alt_page_map, altread_data)) => {
+                // Physical ALTREAD is `<INSDC:4na:bin>zip_encoding#1 .ALTREAD =
+                // trim<0,0>(…)` — one byte per base in the low nibble, stored
+                // as variable-length rows with leading zeros stripped. Pad each
+                // row back to the full per-row length (right-aligning the
+                // stored bytes because `trim<0, 0>` trims from the left) using
+                // the page_map, then merge byte-per-base.
+                //
+                // Fail-fast on variant 2 page maps: when `data_runs` is empty
+                // *and* we have more than one distinct length value, the
+                // stored data layout doesn't match either of the two
+                // interpretations that work elsewhere (`sum(lengths)` nor
+                // `sum(lengths × leng_runs)` equals `stored_len` on real
+                // data — validated against DRR024182 blob 162). We don't
+                // have a correct decoder for that variant yet, and silently
+                // skipping the merge leaks real N annotations into output
+                // (0.01–1.5% sequence divergence from fasterq-dump).
+                // Erroring out with an actionable message is the safer
+                // choice — better to refuse than produce wrong FASTQ.
+                if let Some(pm) = alt_page_map.as_ref()
+                    && pm.data_runs.is_empty()
+                    && pm.lengths.len() > 1
+                    && altread_data.iter().any(|&b| b != 0)
+                {
+                    return Err(Error::UnsupportedFormat {
+                        format: "page_map v1 variant 2 in ALTREAD".into(),
+                        hint: format!(
+                            "ALTREAD blob {blob_idx} stores {} rows with {} unique length \
+                             values via a variant-2 page_map (no data_runs); sracha's \
+                             decoder for this variant doesn't produce byte-identical \
+                             output vs fasterq-dump. Refusing to emit potentially-wrong \
+                             FASTQ — use fasterq-dump for this file, or file an issue \
+                             with the accession so we can add proper variant-2 support. \
+                             See comment in pipeline::decode_blob_to_fastq.",
+                            pm.leng_runs.iter().sum::<u32>(),
+                            pm.lengths.len(),
+                        ),
+                    });
+                }
+                // Pad ALTREAD across its *whole* blob (which may be larger
+                // than the READ blob), then slice the portion covering
+                // READ's row range. DRR035866 has READ in 4096-row blobs
+                // but ALTREAD in 8192-row blobs — pairing by blob index
+                // merges ALTREAD rows 1..4096 against READ rows 4097..8192,
+                // producing N's at random positions in unrelated records.
+                let row_bases = actual_bases / raw.read_id_range.max(1) as usize;
+                let padded_ok = alt_page_map.as_ref().and_then(|pm| {
+                    if row_bases > 0 && !altread_data.is_empty() {
+                        match pm.pad_trimmed_rows_fixed(
+                            &altread_data,
+                            row_bases,
+                            crate::vdb::blob::TrimSide::Leading,
+                        ) {
+                            Ok(v) => Some(v),
+                            Err(e) => {
+                                tracing::debug!(
+                                    "blob {blob_idx}: ALTREAD pad_trimmed_rows_fixed err: {e}"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                });
+                match padded_ok {
+                    Some(padded) => {
+                        // Offset into padded for READ's starting row within
+                        // the ALTREAD blob. 0 when the two blobs align 1:1.
+                        let row_offset = (raw.read_start_id - raw.altread_start_id).max(0) as usize;
+                        let byte_offset = row_offset * row_bases;
+                        if byte_offset < padded.len() {
+                            let slice_end =
+                                byte_offset + actual_bases.min(padded.len() - byte_offset);
+                            crate::vdb::encoding::merge_altread_bin(
+                                &mut read_data,
+                                &padded[byte_offset..slice_end],
+                                actual_bases,
+                            );
+                        }
+                    }
+                    None => {
+                        // Remaining path for the case where alt_page_map is
+                        // None or row_bases math doesn't work out. The
+                        // variant-2 case (most common cause of misalignment)
+                        // is caught above and errors out; reaching here means
+                        // either no page map or a more unusual shape. Skip
+                        // the merge rather than corrupt — this was the
+                        // behavior before the variant-2 check was added, and
+                        // it produces 0 divergence on the validation fixtures
+                        // we do have coverage for.
+                        tracing::debug!(
+                            "blob {blob_idx}: ALTREAD merge skipped — cannot align \
+                             (row_bases={row_bases}, actual={actual_bases}, stored={})",
+                            altread_data.len(),
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!("blob {blob_idx}: ALTREAD decode skipped: {e}");
             }
         }
     }
 
-    // Quality fallback buffer for SRA-lite / empty quality.  Only allocated
-    // when quality is actually missing; the quality-overrun fallback path
-    // allocates on demand (rare).
-    let lite_qual_char = if is_lite {
-        crate::vdb::encoding::SRA_LITE_REJECT_QUAL + crate::vdb::encoding::QUAL_PHRED_OFFSET
-    } else {
-        crate::vdb::encoding::SRA_LITE_PASS_QUAL + crate::vdb::encoding::QUAL_PHRED_OFFSET
-    };
+    // Quality fallback buffer for SRA-lite / empty quality. Default to the
+    // SRA-Lite *pass* constant (Q30 / '?') because fasterq-dump's
+    // syn_quality emits Q30 for any spot that passes the read filter, and
+    // fast-filter data is the overwhelming majority of SRA-Lite runs. The
+    // previous code used REJECT (Q3 / '$') under `is_lite`, which diverged
+    // from fasterq-dump's output for every record on DRR035195-style
+    // delite-processed runs.
+    let lite_qual_char =
+        crate::vdb::encoding::SRA_LITE_PASS_QUAL + crate::vdb::encoding::QUAL_PHRED_OFFSET;
     let mut lite_qual_buf: Option<Vec<u8>> = if quality_is_empty {
         Some(vec![lite_qual_char; read_data.len()])
     } else {
@@ -1408,6 +1573,9 @@ fn decode_blob_to_fastq(
                 let rt = &read_type_data[rt_offset..rt_offset + rps];
                 rt_offset += rps;
                 rt
+            } else if let Some(meta_rt) = raw.fallback_read_types.filter(|rt| rt.len() == rps) {
+                rt_offset += rps;
+                meta_rt
             } else {
                 rt_offset += rps;
                 &[] // empty = all biological (checked below)
@@ -1423,6 +1591,15 @@ fn decode_blob_to_fastq(
             let end = read_offset + rlen_usize;
             if end > spot_total_bases {
                 break;
+            }
+
+            // Filter: skip zero-length reads — fasterq-dump drops these,
+            // so mirroring keeps split-3 routing consistent (e.g., SINGLE
+            // runs with a 0-length placeholder segment would otherwise
+            // route into `_1.fastq`/`_2.fastq` instead of `.fastq`).
+            if rlen_usize == 0 {
+                read_offset = end;
+                continue;
             }
 
             // Filter: skip technical reads if configured.
@@ -1593,9 +1770,13 @@ fn decode_and_write(
         });
     }
 
-    // Detect SRA-lite from actual file: if QUALITY column is absent,
-    // treat as lite regardless of what the SDL API reported.
-    let is_lite = is_lite || !cursor.has_quality();
+    // Detect SRA-lite from actual file: the QUALITY column is absent
+    // (classic variant) or the VDB metadata carries the `SOFTWARE/delite`
+    // stamp (delite-processed variant — QUALITY column is present but
+    // contains only synthesized Q3/Q30 placeholder bytes that don't match
+    // fasterq-dump's output). Both cases mean we should synthesize quality
+    // ourselves rather than echo the stored bytes.
+    let is_lite = is_lite || !cursor.has_quality() || cursor.is_sra_lite_schema();
 
     // Validate blob locator ranges on the authoritative (READ) column before
     // decoding: row IDs must be monotonic, non-overlapping, and — when
@@ -1709,7 +1890,7 @@ fn decode_and_write(
 
     let has_altread = cursor.altread_col().is_some();
     let has_illumina_name_parts = cursor.has_illumina_name_parts();
-    let altread_blob_count = cursor.altread_col().map_or(0, |c| c.blob_count());
+    let _altread_blob_count = cursor.altread_col().map_or(0, |c| c.blob_count());
     let altread_cs = cursor.altread_col().map_or(0, |c| c.meta().checksum_type);
     let x_blob_count = cursor.x_col().map_or(0, |c| c.blob_count());
     let x_cs = cursor.x_col().map_or(0, |c| c.meta().checksum_type);
@@ -1750,6 +1931,17 @@ fn decode_and_write(
             .as_ref()
             .map(|ri| ri.avg_read_len.clone())
             .or_else(|| cursor.metadata_read_lengths())
+    } else {
+        None
+    };
+    // When the physical READ_TYPE column is absent (common in old
+    // DDBJ submissions), read types come from schema metadata. Without
+    // this fallback, pipeline defaults every read to biological (0),
+    // so technical reads in runs like DRR000065 leak into the output —
+    // fasterq-dump filters them (driven by the same metadata), and the
+    // outputs diverge at spot count and file count.
+    let fallback_read_types: Option<Vec<u8>> = if !has_read_type {
+        cursor.metadata_read_types()
     } else {
         None
     };
@@ -1904,6 +2096,7 @@ fn decode_and_write(
                         let read_blob = &cursor.read_col().blobs()[bi];
                         let read_raw = cursor.read_col().read_raw_blob_slice(read_blob.start_id)?;
                         let read_id_range = read_blob.id_range as u64;
+                        let read_start_id = read_blob.start_id;
 
                         let (q_raw, q_id_range): (&[u8], u64) =
                             if has_quality && bi < quality_blob_count {
@@ -1955,16 +2148,28 @@ fn decode_and_write(
 
                         // ALTREAD column: 4na ambiguity mask (also triggers
                         // Illumina name reconstruction when X + Y present).
-                        let (alt_raw, alt_id_range): (&[u8], u64) =
-                            if has_altread && bi < altread_blob_count {
+                        //
+                        // ALTREAD and READ can have *different blob
+                        // boundaries*. E.g. DRR035866 has READ in 51 blobs
+                        // of 4096 rows each, but ALTREAD in 50 blobs of
+                        // 8192 rows each. Pairing by index (`col.blobs()[bi]`)
+                        // fetches the wrong ALTREAD blob for most READ
+                        // blobs and yields 4na overlays at totally unrelated
+                        // row positions. Look up the ALTREAD blob that
+                        // actually covers READ blob `bi`'s starting row id.
+                        let (alt_raw, alt_id_range, alt_start_id): (&[u8], u64, i64) =
+                            if has_altread {
                                 let col = cursor.altread_col().unwrap();
-                                let blob = &col.blobs()[bi];
-                                (
-                                    col.read_raw_blob_slice(blob.start_id)?,
-                                    blob.id_range as u64,
-                                )
+                                match col.find_blob(read_start_id) {
+                                    Some(blob) => (
+                                        col.read_raw_blob_slice(blob.start_id)?,
+                                        blob.id_range as u64,
+                                        blob.start_id,
+                                    ),
+                                    None => (&[], 0, 0),
+                                }
                             } else {
-                                (&[], 0)
+                                (&[], 0, 0)
                             };
                         let (xr, xi): (&[u8], u64) = if has_illumina_name_parts && bi < x_blob_count
                         {
@@ -1992,6 +2197,7 @@ fn decode_and_write(
                         let raw = RawBlobData {
                             read_raw,
                             read_id_range,
+                            read_start_id,
                             quality_raw: q_raw,
                             quality_id_range: q_id_range,
                             quality_cs,
@@ -2006,6 +2212,7 @@ fn decode_and_write(
                             read_type_cs,
                             altread_raw: alt_raw,
                             altread_id_range: alt_id_range,
+                            altread_start_id: alt_start_id,
                             altread_cs,
                             has_altread,
                             x_raw: xr,
@@ -2023,6 +2230,7 @@ fn decode_and_write(
                             metadata_reads_per_spot,
                             fixed_spot_len,
                             fallback_read_lengths: fallback_read_lengths.as_deref(),
+                            fallback_read_types: fallback_read_types.as_deref(),
                         };
 
                         decode_blob_to_fastq(&raw, &decode_ctx, bi, spots_before_per_blob[i])
@@ -2464,6 +2672,21 @@ pub fn run_fastq(
         decode_and_write(sra_path, &acc, config, is_lite, &diag)
             .map_err(|e| wrap_blob_integrity(&acc, e))?;
 
+    // Warn (but don't fail) when split-3 was requested on an effectively
+    // single-end run: every spot produced exactly one read, so output
+    // lands in `{accession}.fastq` with no `_1`/`_2` files. Users asking
+    // for --split split-3 on single-end data usually didn't realize the
+    // layout; surfacing this beats a silently-different filename.
+    if matches!(config.split_mode, SplitMode::Split3)
+        && spots_read > 0
+        && reads_written == spots_read
+    {
+        eprintln!(
+            "warning: {acc}: --split split-3 requested but run is single-end \
+             ({spots_read} spots, 1 read each); output is {acc}.fastq"
+        );
+    }
+
     if !config.stdout
         && let Err(e) = write_stats_file(StatsEntry {
             output_dir: &config.output_dir,
@@ -2710,8 +2933,23 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
         Err(e) => return Err(wrap_blob_integrity(&downloaded.accession, e)),
     };
 
-    // Clean up temp file.
-    if let Err(e) = std::fs::remove_file(&downloaded.temp_path) {
+    // Clean up temp file (or preserve it in the output dir if requested).
+    if config.keep_sra && !config.stdout {
+        let kept = config
+            .output_dir
+            .join(format!("{}.sra", downloaded.accession));
+        if let Err(e) = std::fs::rename(&downloaded.temp_path, &kept) {
+            tracing::warn!(
+                "{}: failed to move temp SRA {} -> {}: {e}",
+                downloaded.accession,
+                downloaded.temp_path.display(),
+                kept.display(),
+            );
+        }
+        // Drop the progress sidecar — download is fully verified at this point.
+        let sidecar = crate::download::progress_path(&downloaded.temp_path);
+        let _ = std::fs::remove_file(&sidecar);
+    } else if let Err(e) = std::fs::remove_file(&downloaded.temp_path) {
         tracing::warn!(
             "{}: failed to remove temp file {}: {e}",
             downloaded.accession,
@@ -3127,6 +3365,80 @@ mod tests {
         let v1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(v1["accession"], "SRR2");
         assert_eq!(v1["integrity"]["ok"], true);
+    }
+
+    // -----------------------------------------------------------------------
+    // encode_raw_quality_for_fastq
+    //
+    // Regression for the +33 offset bug: the physical QUALITY column is
+    // always raw Phred, never ASCII-encoded, so every byte must pass
+    // through phred_to_ascii. A prior heuristic passed input through
+    // verbatim whenever every byte was in [33, 126], which broke files
+    // like DRR040728/DRR040407 whose raw quality distribution was
+    // entirely above 33.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn encode_quality_applies_phred33_offset_to_high_values() {
+        // All bytes >= 33 — would have been pass-through under the old
+        // heuristic. Output must be input + 33 (with Q2 floor, but all
+        // inputs here are > 2 already).
+        let raw = vec![33u8, 40, 50, 60, 80];
+        let (encoded, is_empty) = encode_raw_quality_for_fastq(&raw);
+        assert!(!is_empty);
+        assert_eq!(encoded, vec![33 + 33, 40 + 33, 50 + 33, 60 + 33, 80 + 33]);
+    }
+
+    #[test]
+    fn encode_quality_applies_phred33_offset_to_low_values() {
+        let raw = vec![5u8, 10, 15, 20];
+        let (encoded, is_empty) = encode_raw_quality_for_fastq(&raw);
+        assert!(!is_empty);
+        assert_eq!(encoded, vec![5 + 33, 10 + 33, 15 + 33, 20 + 33]);
+    }
+
+    #[test]
+    fn encode_quality_preserves_q0_and_q1() {
+        // Raw Q0 and Q1 must pass through as `!` and `"` respectively.
+        // An earlier Q2 floor was reverted after iter-6 surfaced
+        // DRR000918 (srf-load 1.0.0, 2010) which legitimately stores
+        // Q0 and fasterq-dump emits `!` — flooring regressed that file
+        // on every Q<2 byte.
+        let raw = vec![0u8, 1, 2, 3];
+        let (encoded, is_empty) = encode_raw_quality_for_fastq(&raw);
+        assert!(!is_empty);
+        assert_eq!(encoded, vec![b'!', b'"', b'#', b'$']);
+    }
+
+    #[test]
+    fn encode_quality_empty_input_is_flagged_empty() {
+        let (encoded, is_empty) = encode_raw_quality_for_fastq(&[]);
+        assert!(is_empty);
+        assert!(encoded.is_empty());
+    }
+
+    #[test]
+    fn encode_quality_all_zero_input_is_flagged_empty() {
+        // All-zero blobs are a legitimate "no data" signal used by some
+        // producers; caller synthesizes a fallback when empty=true.
+        let (encoded, is_empty) = encode_raw_quality_for_fastq(&[0, 0, 0, 0]);
+        assert!(is_empty);
+        assert!(encoded.is_empty());
+    }
+
+    #[test]
+    fn encode_quality_never_passes_through_ascii_range_bytes() {
+        // This is the explicit guard against re-introducing the
+        // all_valid_ascii heuristic: bytes 33..=126 must still go
+        // through phred_to_ascii (= +33), not be emitted verbatim.
+        // Verify a representative ASCII-range input:
+        //   input 33 -> output 66  (not 33)
+        //   input 65 -> output 98  (not 65)
+        //   input 93 -> output 126 (not 93)
+        let raw = vec![33u8, 65, 93];
+        let (encoded, _) = encode_raw_quality_for_fastq(&raw);
+        assert_ne!(encoded, raw, "verbatim passthrough — heuristic regression");
+        assert_eq!(encoded, vec![66, 98, 126]);
     }
 
     #[test]

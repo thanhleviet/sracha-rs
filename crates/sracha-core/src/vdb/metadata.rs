@@ -154,13 +154,59 @@ pub fn schema_attr_name(tree_data: &[u8]) -> Option<String> {
 }
 
 /// Returns true if a schema name indicates an alignment database (cSRA-like).
-/// These use `NCBI:align:db:...` schemas where `READ`/`READ_LEN`/`READ_TYPE`
-/// are logical columns synthesized by ncbi-vdb's schema-aware cursor from
-/// the alignment representation. sracha's physical-only cursor cannot
-/// reconstruct them, so we reject up-front instead of mis-decoding or
-/// hanging on fallback heuristics.
+/// These use `NCBI:align:db:...` or `NCBI:align:tbl:seq` schemas where
+/// `READ`/`READ_LEN`/`READ_TYPE` are logical columns synthesized by
+/// ncbi-vdb's schema-aware cursor from the alignment representation.
+/// sracha's physical-only cursor cannot reconstruct them, so we reject
+/// up-front instead of mis-decoding or hanging on fallback heuristics.
 pub fn is_aligned_database_schema(schema_name: &str) -> bool {
-    schema_name.contains("align:db")
+    schema_name.contains("align:db") || schema_name.contains("align:tbl")
+}
+
+/// Read the `STATS/TABLE/CMP_BASE_COUNT` node (if present) — the number of
+/// bases stored as compressed reads (CMP_READ), i.e., bases whose recovery
+/// requires `seq_restore_read` + the alignment/reference sibling tables.
+///
+/// Returns:
+/// - `Some(0)` — aligned schema went through bam-load but
+///   `ConvertDatabaseToUnmapped` (or similar) already moved every base out
+///   of CMP_READ, so the physical READ column holds complete sequences and
+///   sracha can decode normally.
+/// - `Some(N)` with `N > 0` — N bases live only in CMP_READ; decoding them
+///   needs the reference and a cross-table join sracha does not implement.
+/// - `None` — the node is absent (most non-cSRA runs), no signal either
+///   way.
+pub fn read_cmp_base_count(tree_data: &[u8]) -> Option<u64> {
+    let nodes = parse_meta_nodes(tree_data).ok()?;
+    // STATS is a top-level node with nested children; we want STATS/TABLE/CMP_BASE_COUNT.
+    fn find_child<'a>(parent: &'a [MetaNode], name: &str) -> Option<&'a MetaNode> {
+        parent.iter().find(|n| n.name == name)
+    }
+    let stats = find_child(&nodes, "STATS")?;
+    let table = find_child(&stats.children, "TABLE")?;
+    let cmp = find_child(&table.children, "CMP_BASE_COUNT")?;
+    if cmp.value.len() >= 8 {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&cmp.value[..8]);
+        Some(u64::from_le_bytes(b))
+    } else {
+        None
+    }
+}
+
+/// Whether the metadata has a top-level `unaligned` node.
+///
+/// bam-load's `ConvertDatabaseToUnmapped` stamps this marker when it
+/// re-expands every row's compressed bases into the physical READ column
+/// and removes the cross-table alignment dependency. Runs with this
+/// marker decode normally even though the schema still claims to be
+/// aligned; runs without it whose schema *is* aligned need
+/// `seq_restore_read` and cannot be handled by sracha today.
+pub fn has_unaligned_marker(tree_data: &[u8]) -> bool {
+    let Ok(nodes) = parse_meta_nodes(tree_data) else {
+        return false;
+    };
+    nodes.iter().any(|n| n.name == "unaligned")
 }
 
 /// Extract the sequencing platform from the schema table name.
@@ -192,6 +238,32 @@ fn infer_nreads_from_schema(schema_text: &str) -> Option<usize> {
         return Some(2);
     }
     None
+}
+
+/// Detect whether a run is an SRA-Lite (quality-stripped, synthesized-on-read)
+/// submission.
+///
+/// SRA-Lite files are produced by NCBI's `delite` tool, which drops real
+/// per-base quality scores and relies on the schema's `syn_quality` function
+/// to synthesize a constant Phred score on read — Q30 for pass-filter reads,
+/// Q3 for reject. Fasterq-dump honors this and emits the synthesized values,
+/// while a naive reader sees the physically stored Q3 bytes and emits `$`
+/// instead of `?`. The cleanest signal is the `SOFTWARE/delite` metadata
+/// node stamped by the delite pipeline at conversion time.
+pub fn detect_sra_lite(tree_data: &[u8]) -> bool {
+    let Ok(nodes) = parse_meta_nodes(tree_data) else {
+        return false;
+    };
+    for node in &nodes {
+        if node.name == "SOFTWARE" {
+            for child in &node.children {
+                if child.name.eq_ignore_ascii_case("delite") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Detect the sequencing platform from VDB metadata.
@@ -658,6 +730,16 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn aligned_tbl_schemas_detected() {
+        // Regression for iter-4 cSRA detection: DRR032766 carries the
+        // `NCBI:align:tbl:seq` schema (table-level, not database-level)
+        // but still needs seq_restore_read. The predicate must catch
+        // both `align:db` and `align:tbl` forms.
+        assert!(is_aligned_database_schema("NCBI:align:tbl:seq#1"));
+        assert!(is_aligned_database_schema("NCBI:align:tbl:seq#1.2.1"));
+    }
+
+    #[test]
     fn plain_sequence_schemas_not_aligned() {
         assert!(!is_aligned_database_schema(
             "NCBI:SRA:Illumina:tbl:phred:v2#1.0.4"
@@ -813,7 +895,7 @@ pub(crate) mod tests {
     }
 
     /// Build a meta-node with a children PBSTree (for `col/X/row` layout).
-    fn build_meta_node_with_children(
+    pub(crate) fn build_meta_node_with_children(
         name: &str,
         value: &[u8],
         children: &[&[u8]],
@@ -937,5 +1019,90 @@ pub(crate) mod tests {
         let schema = build_meta_node("schema", b"some_unknown_schema", None);
         let tree = build_pbstree(&[&schema]);
         assert_eq!(detect_platform(&tree), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // detect_sra_lite
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn detect_sra_lite_with_delite_child() {
+        // SOFTWARE node with a `delite` child — the marker `delite` stamps on
+        // processed SRA-Lite runs (DRR035195).
+        let delite = build_meta_node("delite", b"", None);
+        let software = build_meta_node_with_children("SOFTWARE", b"", &[&delite], None);
+        let tree = build_pbstree(&[&software]);
+        assert!(detect_sra_lite(&tree));
+    }
+
+    #[test]
+    fn detect_sra_lite_without_delite() {
+        let loader = build_meta_node("loader", b"", None);
+        let software = build_meta_node_with_children("SOFTWARE", b"", &[&loader], None);
+        let tree = build_pbstree(&[&software]);
+        assert!(!detect_sra_lite(&tree));
+    }
+
+    #[test]
+    fn detect_sra_lite_empty_tree() {
+        let tree = build_pbstree(&[]);
+        assert!(!detect_sra_lite(&tree));
+    }
+
+    // -----------------------------------------------------------------------
+    // read_cmp_base_count
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_cmp_base_count_present() {
+        // STATS/TABLE/CMP_BASE_COUNT holds a u64 LE — the "bases stored
+        // compressed via alignment" signal we use to distinguish classic
+        // cSRA from ConvertDatabaseToUnmapped-expanded archives.
+        let cmp_bc_val = 12345u64.to_le_bytes();
+        let cmp_bc = build_meta_node("CMP_BASE_COUNT", &cmp_bc_val, None);
+        let table = build_meta_node_with_children("TABLE", b"", &[&cmp_bc], None);
+        let stats = build_meta_node_with_children("STATS", b"", &[&table], None);
+        let tree = build_pbstree(&[&stats]);
+        assert_eq!(read_cmp_base_count(&tree), Some(12345));
+    }
+
+    #[test]
+    fn read_cmp_base_count_absent() {
+        let tree = build_pbstree(&[]);
+        assert_eq!(read_cmp_base_count(&tree), None);
+    }
+
+    #[test]
+    fn read_cmp_base_count_zero() {
+        // Zero value should still parse (important: CMP_BASE_COUNT=0 means
+        // aligned schema but no compressed bases — safe to decode).
+        let cmp_bc_val = 0u64.to_le_bytes();
+        let cmp_bc = build_meta_node("CMP_BASE_COUNT", &cmp_bc_val, None);
+        let table = build_meta_node_with_children("TABLE", b"", &[&cmp_bc], None);
+        let stats = build_meta_node_with_children("STATS", b"", &[&table], None);
+        let tree = build_pbstree(&[&stats]);
+        assert_eq!(read_cmp_base_count(&tree), Some(0));
+    }
+
+    // -----------------------------------------------------------------------
+    // has_unaligned_marker
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn has_unaligned_marker_present() {
+        // `ConvertDatabaseToUnmapped` stamps a top-level `unaligned` node
+        // after re-expanding every base back into physical READ. Its
+        // presence means sracha can decode even if the schema claims to
+        // be aligned. SRR10358300 fixture has this.
+        let unaligned = build_meta_node("unaligned", b"", None);
+        let tree = build_pbstree(&[&unaligned]);
+        assert!(has_unaligned_marker(&tree));
+    }
+
+    #[test]
+    fn has_unaligned_marker_absent() {
+        let stats = build_meta_node("STATS", b"", None);
+        let tree = build_pbstree(&[&stats]);
+        assert!(!has_unaligned_marker(&tree));
     }
 }

@@ -58,6 +58,9 @@ pub struct VdbCursor {
     metadata_read_descs: Option<Vec<ReadDescriptor>>,
     /// Sequencing platform detected from VDB schema metadata.
     platform: Option<String>,
+    /// `true` when the metadata shows a `SOFTWARE/delite` node — the tell-tale
+    /// signature of an SRA-Lite submission with synthesized quality.
+    is_sra_lite: bool,
 }
 
 impl VdbCursor {
@@ -79,6 +82,7 @@ impl VdbCursor {
         // Parse table metadata (md/cur) to extract reads_per_spot and
         // platform for SRA-lite files that lack physical READ_LEN/NREADS columns.
         let (metadata_read_descs, platform) = Self::detect_metadata(archive);
+        let is_sra_lite = Self::detect_sra_lite(archive);
 
         // READ is required.
         let read_col = ColumnReader::open(archive, &format!("{seq_col_base}/{COL_READ}"), sra_path)
@@ -160,6 +164,7 @@ impl VdbCursor {
             row_count,
             metadata_read_descs,
             platform,
+            is_sra_lite,
         })
     }
 
@@ -257,9 +262,32 @@ impl VdbCursor {
         }
     }
 
+    /// Per-read technical/biological types from VDB metadata, if available.
+    ///
+    /// Returns a byte per read: `0` for biological (`B`), `1` for technical
+    /// (`T`, any other flag). Used as a fallback when the physical
+    /// `READ_TYPE` column is absent — common in older DDBJ/SRA submissions
+    /// where read-type info lives only in the schema metadata.
+    pub fn metadata_read_types(&self) -> Option<Vec<u8>> {
+        let descs = self.metadata_read_descs.as_ref()?;
+        Some(
+            descs
+                .iter()
+                .map(|d| if d.read_type == b'B' { 0u8 } else { 1u8 })
+                .collect(),
+        )
+    }
+
     /// Sequencing platform detected from VDB schema metadata.
     pub fn platform(&self) -> Option<&str> {
         self.platform.as_deref()
+    }
+
+    /// Whether the VDB metadata identifies this run as SRA-Lite
+    /// (stored quality is synthetic; real per-base qualities were dropped
+    /// during the `delite` conversion step).
+    pub fn is_sra_lite_schema(&self) -> bool {
+        self.is_sra_lite
     }
 
     /// Load NAME_FMT templates from the skey index.
@@ -527,6 +555,24 @@ impl VdbCursor {
         }
         (rps, platform)
     }
+
+    /// Scan metadata trees (table + database root) for the `SOFTWARE/delite`
+    /// node that marks a run as SRA-Lite.
+    fn detect_sra_lite<R: Read + Seek>(archive: &mut KarArchive<R>) -> bool {
+        for path in ["tbl/SEQUENCE/md/cur", "md/cur"] {
+            let Ok(md_bytes) = archive.read_file(path) else {
+                continue;
+            };
+            if md_bytes.len() < 8 {
+                continue;
+            }
+            if crate::vdb::metadata::detect_sra_lite(&md_bytes[8..]) {
+                tracing::debug!("metadata {path}: SOFTWARE/delite node present — SRA-Lite");
+                return true;
+            }
+        }
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -620,7 +666,24 @@ fn reject_if_csra<R: Read + Seek>(archive: &mut KarArchive<R>, seq_col_base: &st
         .keys()
         .any(|p| p == "tbl/PRIMARY_ALIGNMENT" || p.contains("/tbl/PRIMARY_ALIGNMENT"));
 
-    if !has_cmp_read && !has_primary_alignment {
+    // Some runs (e.g. DRR032766) carry the `NCBI:align:tbl:seq` schema but no
+    // CMP_READ column and no PRIMARY_ALIGNMENT table — yet the physical READ
+    // column still stores bam-load's compressed residue only. The
+    // `STATS/TABLE/CMP_BASE_COUNT` metadata node records how many bases are
+    // compressed away; when it's non-zero AND the archive has no `unaligned`
+    // top-level marker (stamped by `ConvertDatabaseToUnmapped` after it
+    // re-expands those bases into the physical READ column), reconstruction
+    // via `seq_restore_read` is required and we cannot decode.
+    //
+    // SRR10358300-style fixtures — aligned schema + CMP_BASE_COUNT > 0 +
+    // `unaligned` marker present — decode correctly because the physical
+    // READ column already holds complete sequences; the CMP_BASE_COUNT is
+    // stale pre-conversion bookkeeping.
+    let cmp_base_count = read_cmp_base_count_from_archive(archive);
+    let has_unaligned_marker = read_unaligned_marker_from_archive(archive);
+    let has_compressed_bases = cmp_base_count.unwrap_or(0) > 0 && !has_unaligned_marker;
+
+    if !has_cmp_read && !has_primary_alignment && !has_compressed_bases {
         return Ok(());
     }
 
@@ -638,6 +701,34 @@ fn reject_if_csra<R: Read + Seek>(archive: &mut KarArchive<R>, seq_col_base: &st
         format: "aligned SRA (cSRA)".into(),
         hint,
     })
+}
+
+/// Scan table and database-level `md/cur` trees for `STATS/TABLE/CMP_BASE_COUNT`
+/// and return the first non-`None` value found.
+fn read_cmp_base_count_from_archive<R: Read + Seek>(archive: &mut KarArchive<R>) -> Option<u64> {
+    for path in ["tbl/SEQUENCE/md/cur", "md/cur"] {
+        if let Ok(md_bytes) = archive.read_file(path)
+            && md_bytes.len() >= 8
+            && let Some(n) = crate::vdb::metadata::read_cmp_base_count(&md_bytes[8..])
+        {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// Scan table and database-level `md/cur` trees for the top-level
+/// `unaligned` marker that `ConvertDatabaseToUnmapped` stamps.
+fn read_unaligned_marker_from_archive<R: Read + Seek>(archive: &mut KarArchive<R>) -> bool {
+    for path in ["tbl/SEQUENCE/md/cur", "md/cur"] {
+        if let Ok(md_bytes) = archive.read_file(path)
+            && md_bytes.len() >= 8
+            && crate::vdb::metadata::has_unaligned_marker(&md_bytes[8..])
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Probe the table- and db-level `md/cur` trees for a schema attribute that
@@ -893,6 +984,35 @@ mod tests {
     }
 
     #[test]
+    fn metadata_read_types_biological_and_technical() {
+        // Regression for iter-2 validation: older DDBJ runs (e.g. DRR000065)
+        // declare technical reads in schema metadata rather than a physical
+        // READ_TYPE column. Without metadata_read_types + the pipeline
+        // fallback, sracha defaulted every read to biological and emitted
+        // technical reads as real output, causing FAIL_MISSING vs fasterq.
+        let md = build_metadata_bytes(&[("READ_0", b"T|20|"), ("READ_1", b"B|75|")], None);
+        let archive_bytes = build_sra_archive_with_metadata(Some(&md));
+        let sra_path = write_temp_sra(&archive_bytes);
+        let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
+        let cursor = VdbCursor::open(&mut archive, &sra_path).unwrap();
+
+        // 1 = technical, 0 = biological.
+        assert_eq!(cursor.metadata_read_types(), Some(vec![1, 0]));
+        let _ = std::fs::remove_file(&sra_path);
+    }
+
+    #[test]
+    fn metadata_read_types_none_when_metadata_missing() {
+        let archive_bytes = build_sra_archive_with_metadata(None);
+        let sra_path = write_temp_sra(&archive_bytes);
+        let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
+        let cursor = VdbCursor::open(&mut archive, &sra_path).unwrap();
+
+        assert_eq!(cursor.metadata_read_types(), None);
+        let _ = std::fs::remove_file(&sra_path);
+    }
+
+    #[test]
     fn metadata_read_lengths_none_when_zero() {
         // READ_ nodes with len=0 → metadata_read_lengths returns None.
         let md = build_metadata_bytes(&[("READ_0", b"B|0|"), ("READ_1", b"B|0|")], None);
@@ -1015,6 +1135,112 @@ mod tests {
         // rejection when neither CMP_READ nor PRIMARY_ALIGNMENT is present.
         let cursor = VdbCursor::open(&mut archive, &sra_path)
             .expect("align-schema plain archive should open");
+        assert_eq!(cursor.spot_count(), 1);
+        let _ = std::fs::remove_file(&sra_path);
+    }
+
+    /// Build an md/cur blob with a `schema` node + nested STATS/TABLE/CMP_BASE_COUNT,
+    /// optionally preceded by a top-level `unaligned` marker.
+    fn build_md_cur_with_csra_stats(
+        schema_name: &str,
+        cmp_base_count: u64,
+        with_unaligned: bool,
+    ) -> Vec<u8> {
+        use crate::vdb::metadata::tests::{
+            build_attrs_pbstree, build_meta_node, build_meta_node_with_children, build_pbstree,
+        };
+        let attrs = build_attrs_pbstree(&[("name", schema_name.as_bytes())]);
+        let schema_node = build_meta_node("schema", b"", Some(&attrs));
+        let cmp_bc = build_meta_node("CMP_BASE_COUNT", &cmp_base_count.to_le_bytes(), None);
+        let table = build_meta_node_with_children("TABLE", b"", &[&cmp_bc], None);
+        let stats = build_meta_node_with_children("STATS", b"", &[&table], None);
+        let mut children: Vec<&[u8]> = vec![&schema_node, &stats];
+        let unaligned;
+        if with_unaligned {
+            unaligned = build_meta_node("unaligned", b"", None);
+            children.push(&unaligned);
+        }
+        let tree = build_pbstree(&children);
+        let mut buf = vec![0u8; 8]; // KDBHdr prefix
+        buf.extend_from_slice(&tree);
+        buf
+    }
+
+    fn build_align_archive_with_csra_stats(cmp_base_count: u64, with_unaligned: bool) -> Vec<u8> {
+        let col_data = b"ACGTN";
+        let idx1 = build_idx1_v1(col_data.len() as u64, 1, 0);
+        let idx0 = build_kdb_blob_loc(0, 5, 1, 1);
+        let md_cur =
+            build_md_cur_with_csra_stats("NCBI:align:tbl:seq#1", cmp_base_count, with_unaligned);
+
+        let mut data_section = Vec::new();
+        let idx1_off = 0u64;
+        data_section.extend_from_slice(&idx1);
+        let idx0_off = data_section.len() as u64;
+        data_section.extend_from_slice(&idx0);
+        let data_off = data_section.len() as u64;
+        data_section.extend_from_slice(col_data);
+        let md_cur_off = data_section.len() as u64;
+        data_section.extend_from_slice(&md_cur);
+
+        let idx1_node = build_file_node("idx1", idx1_off, idx1.len() as u64);
+        let idx0_node = build_file_node("idx0", idx0_off, idx0.len() as u64);
+        let data_node = build_file_node("data", data_off, col_data.len() as u64);
+        let cur_node = build_file_node("cur", md_cur_off, md_cur.len() as u64);
+
+        let read_dir = build_dir_node("READ", &[&data_node, &idx0_node, &idx1_node]);
+        let col_dir = build_dir_node("col", &[&read_dir]);
+        let md_dir = build_dir_node("md", &[&cur_node]);
+        let seq_dir = build_dir_node("SEQUENCE", &[&col_dir, &md_dir]);
+        let tbl_dir = build_dir_node("tbl", &[&seq_dir]);
+        build_kar_archive(&[&tbl_dir], &data_section)
+    }
+
+    #[test]
+    fn reject_csra_with_nonzero_cmp_base_count() {
+        // Regression for iter-4 cSRA detection: DRR032766-class archives
+        // have aligned schema + non-zero CMP_BASE_COUNT + no `unaligned`
+        // marker — sracha cannot reconstruct reads via seq_restore_read,
+        // so must reject instead of emitting half-length garbage.
+        let archive_bytes = build_align_archive_with_csra_stats(1_000_000, false);
+        let sra_path = write_temp_sra(&archive_bytes);
+        let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
+        let msg = match VdbCursor::open(&mut archive, &sra_path) {
+            Ok(_) => panic!("expected cSRA rejection"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("aligned SRA") || msg.contains("cSRA"),
+            "expected cSRA rejection, got: {msg}"
+        );
+        let _ = std::fs::remove_file(&sra_path);
+    }
+
+    #[test]
+    fn accept_csra_with_unaligned_marker() {
+        // Regression for iter-4: SRR10358300-class archives have aligned
+        // schema AND non-zero CMP_BASE_COUNT but *also* carry the top-level
+        // `unaligned` marker that ConvertDatabaseToUnmapped stamps. Those
+        // have a complete physical READ column — sracha can decode them
+        // without seq_restore_read and must NOT reject.
+        let archive_bytes = build_align_archive_with_csra_stats(1_000_000, true);
+        let sra_path = write_temp_sra(&archive_bytes);
+        let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
+        let cursor = VdbCursor::open(&mut archive, &sra_path)
+            .expect("aligned + unaligned-marker should decode");
+        assert_eq!(cursor.spot_count(), 1);
+        let _ = std::fs::remove_file(&sra_path);
+    }
+
+    #[test]
+    fn accept_csra_with_zero_cmp_base_count() {
+        // Aligned schema + CMP_BASE_COUNT==0 means no bases live in a
+        // compressed column — safe to decode without seq_restore_read.
+        let archive_bytes = build_align_archive_with_csra_stats(0, false);
+        let sra_path = write_temp_sra(&archive_bytes);
+        let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
+        let cursor =
+            VdbCursor::open(&mut archive, &sra_path).expect("zero CMP_BASE_COUNT should decode");
         assert_eq!(cursor.spot_count(), 1);
         let _ = std::fs::remove_file(&sra_path);
     }
