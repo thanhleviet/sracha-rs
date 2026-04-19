@@ -9,3 +9,6 @@ sracha-big-*.out
 test-big*.sh
 validation/
 .claude/worktrees
+
+# development artifacts
+.sracha-done-*
