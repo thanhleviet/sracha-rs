@@ -1215,10 +1215,19 @@ fn print_info_table(entries: &[InfoEntry<'_>]) {
     let mut table = builder.build();
     table
         .with(Panel::footer(summary))
-        .with(Style::rounded().horizontals([
-            (1, HorizontalLine::full('─', '┼', '├', '┤')),
-            (footer_line, HorizontalLine::full('─', '┴', '├', '┤')),
-        ]))
+        // `intersection_bottom('─')` flattens the outer bottom border —
+        // the footer panel has no column separators, so the default `┴`
+        // ticks were sticking up at nothing. The body/footer separator
+        // keeps its `┴` (set via horizontals below) since the body row
+        // above it does have columns.
+        .with(
+            Style::rounded()
+                .intersection_bottom('─')
+                .horizontals([
+                    (1, HorizontalLine::full('─', '┼', '├', '┤')),
+                    (footer_line, HorizontalLine::full('─', '┴', '├', '┤')),
+                ]),
+        )
         .with(Modify::new(Rows::first()).with(Color::new("\x1b[1m", "\x1b[22m")))
         // Right-align numeric columns: Size (1), Spots (5).
         .with(Modify::new(Columns::new(1..=1)).with(Alignment::right()))
