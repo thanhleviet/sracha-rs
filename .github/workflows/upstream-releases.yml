@@ -1,0 +1,80 @@
+name: Upstream Release Check
+
+on:
+  schedule:
+    # GitHub cron runs in UTC and does not observe DST. 08:00 UTC lands at
+    # 02:00 America/Denver during MDT (summer) and 01:00 during MST (winter).
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  check:
+    name: Check ${{ matrix.repo }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: [ncbi/sra-tools, ncbi/ncbi-vdb]
+    steps:
+      - name: Check for new release and file issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM: ${{ matrix.repo }}
+        run: |
+          set -euo pipefail
+
+          release_json=$(gh release view --repo "$UPSTREAM" --json tagName,name,url,publishedAt 2>/dev/null || true)
+          if [ -z "$release_json" ]; then
+            echo "No releases found for $UPSTREAM, skipping."
+            exit 0
+          fi
+
+          tag=$(echo "$release_json" | jq -r '.tagName')
+          name=$(echo "$release_json" | jq -r '.name // .tagName')
+          url=$(echo "$release_json" | jq -r '.url')
+          published=$(echo "$release_json" | jq -r '.publishedAt')
+
+          title="Upstream release: $UPSTREAM $tag"
+          echo "Latest release: $title ($published)"
+
+          existing=$(gh issue list \
+            --repo "$GITHUB_REPOSITORY" \
+            --state all \
+            --search "\"$title\" in:title" \
+            --json number \
+            --jq 'length')
+
+          if [ "$existing" -gt 0 ]; then
+            echo "Issue already exists for $tag, nothing to do."
+            exit 0
+          fi
+
+          body=$(cat <<EOF
+          A new release of \`${UPSTREAM}\` was detected by the nightly upstream check.
+
+          - **Release:** [${name}](${url})
+          - **Tag:** \`${tag}\`
+          - **Published:** ${published}
+
+          Review the release notes for VDB/KAR format changes, new column types, or behavioral differences that may affect sracha's parser or parity tests.
+          EOF
+          )
+          # Strip the 10-space YAML indent from each body line.
+          body=$(echo "$body" | sed 's/^          //')
+
+          # Ensure the "upstream" label exists (create is idempotent via --force).
+          gh label create upstream \
+            --repo "$GITHUB_REPOSITORY" \
+            --color ededed \
+            --description "Tracking upstream sra-tools / ncbi-vdb releases" \
+            --force >/dev/null
+
+          gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$title" \
+            --body "$body" \
+            --label upstream
