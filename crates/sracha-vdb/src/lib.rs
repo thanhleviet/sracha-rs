@@ -6,8 +6,10 @@
 
 pub mod alignment;
 pub mod blob;
+pub mod blob_codecs;
 pub mod csra;
 pub mod cursor;
+pub mod dump;
 pub mod encoding;
 pub mod error;
 pub mod inspect;
@@ -16,6 +18,7 @@ pub mod kdb;
 pub mod metadata;
 pub mod reference;
 pub mod restore;
+pub mod row_range;
 
 pub use cursor::VdbCursor;
 pub use error::{Error, Result};
