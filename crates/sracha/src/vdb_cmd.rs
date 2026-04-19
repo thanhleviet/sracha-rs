@@ -37,6 +37,7 @@ pub fn run(cmd: VdbCmd) -> Result<()> {
             exclude,
             rows,
             format,
+            raw,
         } => cmd_dump(
             &file,
             table.as_deref(),
@@ -44,6 +45,7 @@ pub fn run(cmd: VdbCmd) -> Result<()> {
             exclude,
             rows.as_deref(),
             format,
+            raw,
         ),
     }
 }
@@ -365,6 +367,7 @@ fn cmd_dump(
     exclude: Vec<String>,
     rows: Option<&str>,
     format: DumpFormat,
+    raw: bool,
 ) -> Result<()> {
     let mut kar = open_kar(path)?;
     let rows = match rows {
@@ -376,6 +379,7 @@ fn cmd_dump(
         exclude,
         rows,
         format: format.into(),
+        raw,
     };
     let mut runner = dump::DumpRunner::new(&mut kar, path, table, spec)
         .with_context(|| format!("preparing vdb dump for {}", path.display()))?;

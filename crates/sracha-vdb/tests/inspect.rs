@@ -106,6 +106,7 @@ fn srr28588231_dump_json_is_valid_ndjson() {
         exclude: Vec::new(),
         rows: RowRanges::parse("1-5").unwrap(),
         format: DumpFormat::Json,
+        raw: false,
     };
     let buf = dump::dump_to_vec(&mut kar, &path, None, spec).unwrap();
     let text = std::str::from_utf8(&buf).unwrap();
@@ -133,6 +134,7 @@ fn srr28588231_dump_csv_emits_row_per_line() {
         exclude: Vec::new(),
         rows: RowRanges::parse("1-5").unwrap(),
         format: DumpFormat::Csv,
+        raw: false,
     };
     let buf = dump::dump_to_vec(&mut kar, &path, None, spec).unwrap();
     let text = std::str::from_utf8(&buf).unwrap();

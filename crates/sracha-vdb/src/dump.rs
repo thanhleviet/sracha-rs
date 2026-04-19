@@ -1,14 +1,18 @@
 //! `sracha vdb dump` — row-level data dump for SRA SEQUENCE-style columns.
 //!
-//! Phase 2a scope per issue #12: heuristic-typed decode of the columns
-//! that matter for SRA runs (READ / QUALITY / NAME / SPOT_GROUP /
-//! READ_LEN / READ_TYPE / X / Y, plus CMP_READ, ALTREAD, READ_START,
-//! READ_FILTER). Unknown columns render as hex.
+//! Scope per issue #12: heuristic-typed decode of the columns that matter
+//! for SRA runs — READ/CMP_READ, QUALITY/ORIGINAL_QUALITY, NAME/SPOT_NAME/
+//! SPOT_GROUP/LABEL/CS_KEY/NAME_FMT, per-read arrays (READ_LEN/READ_START/
+//! LABEL_LEN/LABEL_START/POSITION, READ_TYPE/READ_FILTER/RD_FILTER),
+//! per-row scalars (PLATFORM/NREADS/SPOT_FILTER, SPOT_ID/TRIM_LEN/
+//! TRIM_START/CLIP_QUALITY_LEFT/CLIP_QUALITY_RIGHT, X/Y). Unknown columns
+//! render as hex, and `DumpSpec::raw` forces hex on every column — useful
+//! for debugging columns the heuristic doesn't recognize.
 //!
 //! Formats (default / csv / tab / json) all go through a single row-by-row
 //! driver that pulls one cell at a time from per-column blob caches. No
-//! schema engine — the heuristic in [`infer_kind`] covers the columns that
-//! real SRA pipelines actually query.
+//! schema engine — see the Phase 2b discussion in issue #12 for why we
+//! stopped short of a real type system.
 
 use std::collections::HashSet;
 use std::io::{Read, Seek, Write};
@@ -34,7 +38,7 @@ use crate::row_range::RowRanges;
 /// How to interpret the raw bytes of one physical column.
 ///
 /// Inferred from the column name alone — the VDB schema engine is out of
-/// scope for Phase 2a. Unknown columns fall back to [`CellKind::HexRaw`].
+/// scope. Unknown columns fall back to [`CellKind::HexRaw`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CellKind {
     /// 2na packed DNA (READ, CMP_READ) — one byte per base after unpacking.
@@ -49,6 +53,10 @@ pub enum CellKind {
     U32Array,
     /// One u8 per element; each row has `reads_per_spot` elements.
     U8Array,
+    /// One u8 per row (PLATFORM, NREADS, SPOT_FILTER).
+    U8Scalar,
+    /// One u32 per row (SPOT_ID, CLIP_QUALITY_LEFT/RIGHT).
+    U32Scalar,
     /// One i32/u32 per row (X, Y coordinates).
     I32Scalar,
     /// Fallback — render raw blob bytes as hex.
@@ -64,8 +72,9 @@ impl CellKind {
             | Self::QualityPhred33
             | Self::AsciiBytes
             | Self::U8Array
+            | Self::U8Scalar
             | Self::HexRaw => 1,
-            Self::U32Array | Self::I32Scalar => 4,
+            Self::U32Array | Self::U32Scalar | Self::I32Scalar => 4,
         }
     }
 }
@@ -83,9 +92,15 @@ pub fn infer_kind(col_name: &str) -> CellKind {
     match col_name {
         "READ" | "CMP_READ" => CellKind::Dna2na,
         "QUALITY" | "ORIGINAL_QUALITY" | "CMP_QUALITY" => CellKind::QualityPhred33,
-        "NAME" | "SPOT_NAME" | "SPOT_GROUP" | "LABEL" => CellKind::AsciiBytes,
-        "READ_LEN" | "READ_START" => CellKind::U32Array,
-        "READ_TYPE" | "READ_FILTER" => CellKind::U8Array,
+        "NAME" | "SPOT_NAME" | "SPOT_GROUP" | "LABEL" | "CS_KEY" | "NAME_FMT" => {
+            CellKind::AsciiBytes
+        }
+        "READ_LEN" | "READ_START" | "LABEL_LEN" | "LABEL_START" | "POSITION" => CellKind::U32Array,
+        "READ_TYPE" | "READ_FILTER" | "RD_FILTER" => CellKind::U8Array,
+        "PLATFORM" | "NREADS" | "SPOT_FILTER" => CellKind::U8Scalar,
+        "SPOT_ID" | "CLIP_QUALITY_LEFT" | "CLIP_QUALITY_RIGHT" | "TRIM_LEN" | "TRIM_START" => {
+            CellKind::U32Scalar
+        }
         "X" | "Y" => CellKind::I32Scalar,
         _ => CellKind::HexRaw,
     }
@@ -118,6 +133,9 @@ pub struct DumpSpec {
     pub rows: RowRanges,
     /// Output format.
     pub format: DumpFormat,
+    /// Skip name-based type inference; render every column as hex bytes.
+    /// Useful for debugging columns that the heuristic doesn't recognize.
+    pub raw: bool,
 }
 
 /// Per-column state held by the runner: the reader plus a one-blob cache of
@@ -174,12 +192,19 @@ impl<R: Read + Seek> DumpRunner<R> {
         for name in &requested {
             let full = format!("{col_base}/{name}");
             match ColumnReader::open(archive, &full, sra_path) {
-                Ok(reader) => cols.push(OpenedColumn {
-                    name: name.clone(),
-                    kind: infer_kind(name),
-                    reader,
-                    cache: None,
-                }),
+                Ok(reader) => {
+                    let kind = if spec.raw {
+                        CellKind::HexRaw
+                    } else {
+                        infer_kind(name)
+                    };
+                    cols.push(OpenedColumn {
+                        name: name.clone(),
+                        kind,
+                        reader,
+                        cache: None,
+                    });
+                }
                 Err(e) => {
                     tracing::warn!("dump: skipping column {name}: {e}");
                 }
@@ -314,8 +339,10 @@ fn materialize_blob(
         CellKind::Dna4naBin => materialize_dna4na_bin(decoded, row_count),
         CellKind::QualityPhred33 => materialize_quality(decoded, row_count),
         CellKind::AsciiBytes => materialize_ascii(decoded, row_count),
-        CellKind::U32Array | CellKind::I32Scalar => materialize_u32(decoded, row_count),
-        CellKind::U8Array => materialize_u8_array(decoded, row_count),
+        CellKind::U32Array | CellKind::U32Scalar | CellKind::I32Scalar => {
+            materialize_u32(decoded, row_count)
+        }
+        CellKind::U8Array | CellKind::U8Scalar => materialize_u8_array(decoded, row_count),
         CellKind::HexRaw => materialize_hex_fallback(decoded, row_count),
     }
 }
@@ -615,6 +642,12 @@ fn write_cell_default<W: Write>(w: &mut W, kind: CellKind, bytes: &[u8]) -> Resu
         CellKind::U8Array => {
             write_u8_array(w, bytes, b'[', b']', b", ")?;
         }
+        CellKind::U32Scalar => {
+            write_u32_scalar(w, bytes)?;
+        }
+        CellKind::U8Scalar => {
+            write_u8_scalar(w, bytes)?;
+        }
         CellKind::I32Scalar => {
             write_i32_scalar(w, bytes)?;
         }
@@ -644,6 +677,12 @@ fn write_cell_delimited<W: Write>(
         CellKind::U8Array => {
             write_u8_array(w, bytes, 0, 0, b";")?;
         }
+        CellKind::U32Scalar => {
+            write_u32_scalar(w, bytes)?;
+        }
+        CellKind::U8Scalar => {
+            write_u8_scalar(w, bytes)?;
+        }
         CellKind::I32Scalar => {
             write_i32_scalar(w, bytes)?;
         }
@@ -668,6 +707,20 @@ fn cell_to_json(kind: CellKind, bytes: &[u8]) -> Value {
             Value::Array(vals)
         }
         CellKind::U8Array => Value::Array(bytes.iter().map(|&b| json!(b)).collect()),
+        CellKind::U32Scalar => {
+            if bytes.len() >= 4 {
+                json!(u32::from_le_bytes(bytes[..4].try_into().unwrap()))
+            } else {
+                Value::Null
+            }
+        }
+        CellKind::U8Scalar => {
+            if bytes.is_empty() {
+                Value::Null
+            } else {
+                json!(bytes[0])
+            }
+        }
         CellKind::I32Scalar => {
             if bytes.len() >= 4 {
                 let v = i32::from_le_bytes(bytes[..4].try_into().unwrap());
@@ -741,6 +794,25 @@ fn write_i32_scalar<W: Write>(w: &mut W, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn write_u32_scalar<W: Write>(w: &mut W, bytes: &[u8]) -> Result<()> {
+    if bytes.len() >= 4 {
+        let v = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        write!(w, "{v}")?;
+    } else {
+        write!(w, "NA")?;
+    }
+    Ok(())
+}
+
+fn write_u8_scalar<W: Write>(w: &mut W, bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() {
+        write!(w, "NA")?;
+    } else {
+        write!(w, "{}", bytes[0])?;
+    }
+    Ok(())
+}
+
 fn write_quoted<W: Write>(w: &mut W, bytes: &[u8], delim: u8) -> Result<()> {
     let needs_quote = bytes.contains(&delim) || bytes.contains(&b'"') || bytes.contains(&b'\n');
     if !needs_quote {
@@ -789,17 +861,30 @@ mod tests {
     fn infer_kind_table_matches_spec() {
         assert_eq!(infer_kind("READ"), CellKind::Dna2na);
         assert_eq!(infer_kind("CMP_READ"), CellKind::Dna2na);
-        // ALTREAD is intentionally HexRaw in Phase 2a — see `infer_kind` doc.
+        // ALTREAD is intentionally HexRaw — see `infer_kind` doc.
         assert_eq!(infer_kind("ALTREAD"), CellKind::HexRaw);
         assert_eq!(infer_kind("QUALITY"), CellKind::QualityPhred33);
         assert_eq!(infer_kind("ORIGINAL_QUALITY"), CellKind::QualityPhred33);
         assert_eq!(infer_kind("NAME"), CellKind::AsciiBytes);
         assert_eq!(infer_kind("SPOT_NAME"), CellKind::AsciiBytes);
         assert_eq!(infer_kind("SPOT_GROUP"), CellKind::AsciiBytes);
+        assert_eq!(infer_kind("CS_KEY"), CellKind::AsciiBytes);
+        assert_eq!(infer_kind("NAME_FMT"), CellKind::AsciiBytes);
         assert_eq!(infer_kind("READ_LEN"), CellKind::U32Array);
         assert_eq!(infer_kind("READ_START"), CellKind::U32Array);
+        assert_eq!(infer_kind("LABEL_LEN"), CellKind::U32Array);
+        assert_eq!(infer_kind("POSITION"), CellKind::U32Array);
         assert_eq!(infer_kind("READ_TYPE"), CellKind::U8Array);
         assert_eq!(infer_kind("READ_FILTER"), CellKind::U8Array);
+        assert_eq!(infer_kind("RD_FILTER"), CellKind::U8Array);
+        assert_eq!(infer_kind("PLATFORM"), CellKind::U8Scalar);
+        assert_eq!(infer_kind("NREADS"), CellKind::U8Scalar);
+        assert_eq!(infer_kind("SPOT_FILTER"), CellKind::U8Scalar);
+        assert_eq!(infer_kind("SPOT_ID"), CellKind::U32Scalar);
+        assert_eq!(infer_kind("CLIP_QUALITY_LEFT"), CellKind::U32Scalar);
+        assert_eq!(infer_kind("CLIP_QUALITY_RIGHT"), CellKind::U32Scalar);
+        assert_eq!(infer_kind("TRIM_LEN"), CellKind::U32Scalar);
+        assert_eq!(infer_kind("TRIM_START"), CellKind::U32Scalar);
         assert_eq!(infer_kind("X"), CellKind::I32Scalar);
         assert_eq!(infer_kind("Y"), CellKind::I32Scalar);
         assert_eq!(infer_kind("PRIMARY_ALIGNMENT_ID"), CellKind::HexRaw);
@@ -811,6 +896,8 @@ mod tests {
         assert_eq!(CellKind::QualityPhred33.elem_bytes(), 1);
         assert_eq!(CellKind::AsciiBytes.elem_bytes(), 1);
         assert_eq!(CellKind::U32Array.elem_bytes(), 4);
+        assert_eq!(CellKind::U32Scalar.elem_bytes(), 4);
+        assert_eq!(CellKind::U8Scalar.elem_bytes(), 1);
         assert_eq!(CellKind::I32Scalar.elem_bytes(), 4);
     }
 
@@ -887,5 +974,32 @@ mod tests {
     fn cell_to_json_hex_encodes_bytes() {
         let v = cell_to_json(CellKind::HexRaw, &[0x00, 0xff, 0xab]);
         assert_eq!(v, json!("00ffab"));
+    }
+
+    #[test]
+    fn cell_to_json_u32_scalar_is_single_number() {
+        let bytes = 123_456u32.to_le_bytes();
+        let v = cell_to_json(CellKind::U32Scalar, &bytes);
+        assert_eq!(v, json!(123_456));
+    }
+
+    #[test]
+    fn cell_to_json_u8_scalar_is_single_number() {
+        let v = cell_to_json(CellKind::U8Scalar, &[7]);
+        assert_eq!(v, json!(7));
+    }
+
+    #[test]
+    fn write_u32_scalar_formats_decimal() {
+        let mut buf = Vec::new();
+        write_u32_scalar(&mut buf, &151u32.to_le_bytes()).unwrap();
+        assert_eq!(buf, b"151");
+    }
+
+    #[test]
+    fn write_u8_scalar_formats_decimal() {
+        let mut buf = Vec::new();
+        write_u8_scalar(&mut buf, &[42]).unwrap();
+        assert_eq!(buf, b"42");
     }
 }

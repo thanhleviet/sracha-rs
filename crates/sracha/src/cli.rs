@@ -161,6 +161,11 @@ pub enum VdbCmd {
         /// Output format
         #[arg(short = 'f', long, default_value = "default")]
         format: DumpFormat,
+        /// Advanced: skip type inference and render every column as hex
+        /// bytes. Useful for debugging columns the heuristic doesn't
+        /// recognize. Hidden from `--help` to keep the common surface small.
+        #[arg(long, hide = true)]
+        raw: bool,
     },
 }
 
