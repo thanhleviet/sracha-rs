@@ -1,9 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (2026-04-19)
 
 ### Added
 
+- **Broader `sracha vdb dump` column coverage**: name-based heuristic
+  picks up per-row scalars (`PLATFORM`, `NREADS`, `SPOT_FILTER`,
+  `SPOT_ID`, `TRIM_LEN`, `TRIM_START`, `CLIP_QUALITY_LEFT/RIGHT`),
+  per-read arrays (`LABEL_LEN`, `LABEL_START`, `POSITION`, `RD_FILTER`),
+  and ASCII templates (`CS_KEY`, `NAME_FMT`) in addition to the
+  existing SEQUENCE columns. New `U8Scalar` / `U32Scalar` cell kinds
+  render scalars as single numbers instead of one-element arrays. A
+  hidden `--raw` flag bypasses type inference and hex-dumps every
+  column — useful for debugging layouts the heuristic doesn't
+  recognize. Closes #12.
 - **Reference-compressed cSRA (aligned SRA) decode**: archives with a
   physical `SEQUENCE/col/CMP_READ` plus sibling `PRIMARY_ALIGNMENT` +
   `REFERENCE` tables are now decoded in pure Rust —
