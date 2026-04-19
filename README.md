@@ -8,7 +8,7 @@ Fast SRA downloader and FASTQ converter, written in pure Rust.
 
 ## Features
 
-- **Fast** -- 4-11x faster than `fasterq-dump` on typical SRA files
+- **Fast** -- 5-13x faster than `fasterq-dump` on typical SRA files
 - **One command** -- download, convert to FASTQ, and compress
 - **Batch input** -- accessions, BioProjects (PRJNA), studies (SRP), or a file via `--accession-list`
 - **gzip or zstd output** -- parallel compression, or plain FASTQ
@@ -50,14 +50,14 @@ sracha validate SRR28588231.sra
 
 ### Local decode (SRA file on disk → FASTQ)
 
-Uncompressed output, 8 CPU cores, measured with
+Uncompressed output, measured with
 [hyperfine](https://github.com/sharkdp/hyperfine).
 
 | File | Size | sracha | fasterq-dump | fastq-dump | Speedup vs fasterq-dump |
 |:---|---:|---:|---:|---:|---:|
-| SRR28588231 | 23 MiB | 0.16 s | 1.85 s | 2.04 s | **11.6x** |
-| SRR2584863 | 288 MiB | 1.29 s | 5.86 s | 12.92 s | **4.5x** |
-| ERR1018173 | 1.94 GiB | 7.90 s | 34.47 s | -- | **4.4x** |
+| SRR28588231 | 23 MiB | 0.14 s | 1.83 s | 1.87 s | **13.3x** |
+| SRR2584863 | 288 MiB | 1.13 s | 5.37 s | 11.41 s | **4.8x** |
+| ERR1018173 | 1.94 GiB | 6.76 s | 32.25 s | -- | **4.8x** |
 
 Compression adds minimal overhead -- sracha produces gzipped FASTQ by default
 with parallel block compression, so the integrated pipeline
@@ -66,21 +66,17 @@ separate gzip step.
 
 ### End-to-end (accession → FASTQ, including download)
 
-Download + decode, 5 runs each from a fresh temp dir. NCBI throughput is
-the dominant factor here, so the local-decode speedup is amortized.
+Download + decode, 5 runs each from a fresh temp dir.
 
-| Accession | Size | `sracha get` | `prefetch + fasterq-dump` | `prefetch + fastq-dump` |
-|:---|---:|---:|---:|---:|
-| SRR28588231 | 23 MiB | 13.54 s | 8.13 s | 8.36 s |
-| SRR2584863 | 288 MiB | 19.26 s | 17.05 s | 21.04 s |
+| Accession | Size | `sracha get` | `prefetch + fasterq-dump` | `prefetch + fastq-dump` | Speedup vs `prefetch + fasterq-dump` |
+|:---|---:|---:|---:|---:|---:|
+| SRR28588231 | 23 MiB | 1.44 s | 4.17 s | 4.27 s | **2.90x** |
+| SRR2584863 | 288 MiB | 8.08 s | 12.55 s | 18.47 s | **1.55x** |
 
-On the medium accession `sracha get` is slightly faster than
-`prefetch + fastq-dump` and trails `prefetch + fasterq-dump` by ~2 s.
-Shared-cluster network variance dominates: `sracha get` std dev was
-±1.8 s (small) and ±2.8 s (medium), while prefetch runs stayed within
-±0.7 s. Best case (min) `sracha get` matches `fasterq-dump` on the
-medium accession. See `validation/bench-results/` for raw hyperfine
-output.
+`sracha get` beats `prefetch + fasterq-dump` end-to-end even with the
+network in the loop, because the parallel chunked downloader overlaps
+with decode and the decode itself is 5x faster. See
+`validation/bench-results/` for raw hyperfine output.
 
 <details>
 <summary>Full hyperfine output</summary>
@@ -89,52 +85,52 @@ output.
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `sracha` | 159.5 ± 16.2 | 139.4 | 198.5 | 1.00 |
-| `fasterq-dump` | 1854.7 ± 60.7 | 1789.3 | 1953.5 | 11.63 ± 1.24 |
-| `fastq-dump` | 2041.2 ± 37.7 | 2002.4 | 2085.0 | 12.80 ± 1.32 |
+| `sracha` | 137.5 ± 5.9 | 127.5 | 148.8 | 1.00 |
+| `fasterq-dump` | 1832.8 ± 23.9 | 1799.1 | 1857.7 | 13.33 ± 0.60 |
+| `fastq-dump` | 1871.7 ± 30.2 | 1840.8 | 1910.6 | 13.62 ± 0.62 |
 
 **SRR2584863 (288 MiB, Illumina paired)**
 
 | Command | Mean [s] | Min [s] | Max [s] | Relative |
 |:---|---:|---:|---:|---:|
-| `sracha` | 1.291 ± 0.042 | 1.264 | 1.339 | 1.00 |
-| `fasterq-dump` | 5.855 ± 0.097 | 5.746 | 5.933 | 4.53 ± 0.16 |
-| `fastq-dump` | 12.915 ± 0.028 | 12.887 | 12.943 | 10.00 ± 0.32 |
+| `sracha` | 1.126 ± 0.091 | 1.059 | 1.230 | 1.00 |
+| `fasterq-dump` | 5.368 ± 0.024 | 5.347 | 5.394 | 4.77 ± 0.39 |
+| `fastq-dump` | 11.410 ± 0.025 | 11.392 | 11.438 | 10.13 ± 0.82 |
 
 **ERR1018173 (1.94 GiB, 15.6M spots, Illumina paired, single run)**
 
 | Command | Time [s] |
 |:---|---:|
-| `sracha` | 7.90 |
-| `fasterq-dump` | 34.47 |
+| `sracha` | 6.76 |
+| `fasterq-dump` | 32.25 |
 
 **sracha gzip overhead (SRR28588231)**
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `sracha (no compression)` | 158.1 ± 13.4 | 138.7 | 187.3 | 1.00 |
-| `sracha (gzip)` | 318.4 ± 7.4 | 309.5 | 331.4 | 2.01 ± 0.18 |
+| `sracha (no compression)` | 131.3 ± 4.1 | 123.6 | 138.2 | 1.00 |
+| `sracha (gzip)` | 189.7 ± 2.8 | 184.7 | 194.2 | 1.44 ± 0.05 |
 
 **End-to-end: SRR28588231 (23 MiB) — accession → FASTQ (5 runs)**
 
 | Command | Mean [s] | Min [s] | Max [s] | Relative |
 |:---|---:|---:|---:|---:|
-| `sracha get` | 13.542 ± 1.757 | 10.401 | 14.378 | 1.67 ± 0.22 |
-| `prefetch + fasterq-dump` | 8.128 ± 0.071 | 8.030 | 8.222 | 1.00 |
-| `prefetch + fastq-dump` | 8.363 ± 0.094 | 8.249 | 8.485 | 1.03 ± 0.01 |
+| `sracha get` | 1.437 ± 0.067 | 1.383 | 1.550 | 1.00 |
+| `prefetch + fasterq-dump` | 4.169 ± 0.034 | 4.125 | 4.209 | 2.90 ± 0.14 |
+| `prefetch + fastq-dump` | 4.270 ± 0.099 | 4.199 | 4.422 | 2.97 ± 0.15 |
 
 **End-to-end: SRR2584863 (288 MiB) — accession → FASTQ (5 runs)**
 
 | Command | Mean [s] | Min [s] | Max [s] | Relative |
 |:---|---:|---:|---:|---:|
-| `sracha get` | 19.264 ± 2.831 | 16.113 | 21.467 | 1.13 ± 0.17 |
-| `prefetch + fasterq-dump` | 17.055 ± 0.663 | 16.541 | 18.125 | 1.00 |
-| `prefetch + fastq-dump` | 21.039 ± 1.953 | 19.687 | 24.491 | 1.23 ± 0.12 |
+| `sracha get` | 8.078 ± 0.154 | 7.906 | 8.277 | 1.00 |
+| `prefetch + fasterq-dump` | 12.547 ± 0.381 | 12.027 | 12.849 | 1.55 ± 0.06 |
+| `prefetch + fastq-dump` | 18.466 ± 0.156 | 18.369 | 18.741 | 2.29 ± 0.05 |
 
 </details>
 
 Benchmarks run with `sracha` v0.3.0, `sra-tools` v3.4.1, on Linux
-(8 CPUs). Install the reference toolkit with `pixi run install-sratools`
+(16 CPUs). Install the reference toolkit with `pixi run install-sratools`
 and reproduce with `validation/benchmark.sh`.
 
 ## Installation
