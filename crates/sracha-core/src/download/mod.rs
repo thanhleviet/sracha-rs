@@ -147,7 +147,7 @@ async fn download_chunk(
     client: &reqwest::Client,
     url: &str,
     chunk: ChunkRange,
-    output_path: &Path,
+    file: &std::sync::Arc<std::fs::File>,
     progress: Option<&indicatif::ProgressBar>,
 ) -> Result<()> {
     let mut last_error = None;
@@ -169,7 +169,7 @@ async fn download_chunk(
             tokio::time::sleep(delay).await;
         }
 
-        match try_download_chunk(client, url, chunk, output_path, progress).await {
+        match try_download_chunk(client, url, chunk, file, progress).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 tracing::warn!(
@@ -192,18 +192,20 @@ async fn download_chunk(
 /// Single attempt to download a chunk.
 ///
 /// Streams hyper's response pieces through a bounded mpsc into a
-/// single `spawn_blocking` writer that uses `pwrite` (one atomic
-/// positioned write per piece) on a synchronous `std::fs::File`. This
-/// pays one `spawn_blocking` per chunk instead of one per 16 KiB
-/// piece, which matters at ~70 MiB/s throughput where the piece-level
-/// write loop was a measurable bottleneck. The channel is bounded at
-/// 4 pieces so backpressure throttles hyper when the disk writer
-/// falls behind.
+/// single `spawn_blocking` writer that uses `pwrite` on a shared
+/// `std::fs::File` (opened once in `download_file`). Pieces are
+/// coalesced into a 1 MiB buffer before each `write_all_at`, which
+/// keeps syscall count near the chunk count instead of the piece
+/// count (hyper emits ~16 KiB pieces, so at 70 MiB/s that's ~4500
+/// syscalls/s without batching). The channel is bounded at 4 pieces
+/// so backpressure throttles hyper when the disk writer falls
+/// behind. Progress ticks are coalesced per 256 KiB to cut atomic
+/// contention on the indicatif counter.
 async fn try_download_chunk(
     client: &reqwest::Client,
     url: &str,
     chunk: ChunkRange,
-    output_path: &Path,
+    file: &std::sync::Arc<std::fs::File>,
     progress: Option<&indicatif::ProgressBar>,
 ) -> Result<()> {
     let range_header = format!("bytes={}-{}", chunk.start, chunk.end);
@@ -213,35 +215,47 @@ async fn try_download_chunk(
         .send()
         .await?;
 
+    // Require 206. A server that ignores Range and returns 200 with the
+    // full body would be pwritten at `chunk.start` and silently corrupt
+    // the output; the tail-length check only catches it afterward.
     let status = response.status();
-    if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+    if status != reqwest::StatusCode::PARTIAL_CONTENT {
         return Err(Error::Download {
             accession: String::new(),
-            message: format!("Range request failed with HTTP {status}"),
+            message: format!("Range request returned HTTP {status} (expected 206)"),
         });
     }
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4);
 
-    let writer_path = output_path.to_path_buf();
+    let writer_file = file.clone();
     let writer_start = chunk.start;
     let writer = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
         use std::os::unix::fs::FileExt;
-        let file = std::fs::OpenOptions::new().write(true).open(&writer_path)?;
+        const WRITE_THRESHOLD: usize = 1 << 20; // 1 MiB
         let mut offset = writer_start;
         let mut total = 0u64;
+        let mut buf: Vec<u8> = Vec::with_capacity(WRITE_THRESHOLD + 64 * 1024);
         while let Some(piece) = rx.blocking_recv() {
-            file.write_all_at(&piece, offset)?;
-            let n = piece.len() as u64;
-            offset += n;
-            total += n;
+            total += piece.len() as u64;
+            buf.extend_from_slice(&piece);
+            if buf.len() >= WRITE_THRESHOLD {
+                writer_file.write_all_at(&buf, offset)?;
+                offset += buf.len() as u64;
+                buf.clear();
+            }
+        }
+        if !buf.is_empty() {
+            writer_file.write_all_at(&buf, offset)?;
         }
         Ok(total)
     });
 
     // Feed the writer. Abort if it returned early (disk error) — dropping
     // `tx` closes the channel so the writer's `blocking_recv` returns None.
+    const PB_TICK_THRESHOLD: u64 = 256 * 1024;
     let mut feed_error: Option<Error> = None;
+    let mut pending_ticks = 0u64;
     while let Some(piece) = response.chunk().await? {
         let n = piece.len() as u64;
         if tx.send(piece).await.is_err() {
@@ -255,10 +269,19 @@ async fn try_download_chunk(
             break;
         }
         if let Some(pb) = progress {
-            pb.inc(n);
+            pending_ticks += n;
+            if pending_ticks >= PB_TICK_THRESHOLD {
+                pb.inc(pending_ticks);
+                pending_ticks = 0;
+            }
         }
     }
     drop(tx);
+    if let Some(pb) = progress
+        && pending_ticks > 0
+    {
+        pb.inc(pending_ticks);
+    }
 
     let bytes_written = writer
         .await
@@ -516,15 +539,29 @@ pub async fn download_file(
         None => crate::http::default_client(),
     };
 
-    // Probe the first URL.
+    // Probe the first URL. When the caller already knows the file size
+    // (always true via SDL's RunInfo), skip the HEAD and assume Range
+    // support — `try_download_chunk` verifies per-chunk by requiring a
+    // 206 response, and a 200 surfaces as a retryable error. NCBI's S3
+    // and HTTPS mirrors reliably honor Range, so on the normal path this
+    // saves one RTT per accession (material for multi-accession batches).
     let url = &urls[0];
-    tracing::debug!("probing URL: {url}");
-    let probe = probe_url(&client, url).await?;
-    tracing::debug!(
-        "probe result: range={}, content_length={:?}",
-        probe.supports_range,
-        probe.content_length
-    );
+    let probe = if expected_size > 0 {
+        tracing::debug!("skipping HEAD; using caller-supplied size {expected_size}");
+        ProbeResult {
+            supports_range: true,
+            content_length: Some(expected_size),
+        }
+    } else {
+        tracing::debug!("probing URL: {url}");
+        let p = probe_url(&client, url).await?;
+        tracing::debug!(
+            "probe result: range={}, content_length={:?}",
+            p.supports_range,
+            p.content_length,
+        );
+        p
+    };
 
     let file_size = probe.content_length.unwrap_or(expected_size);
     if file_size == 0 {
@@ -583,11 +620,12 @@ pub async fn download_file(
                     force_wipe_partial = true;
                 }
 
+                // expected_size + chunk_size matching implies total_chunks
+                // matches — no need to check it separately.
                 if !md5_changed
                     && prev.expected_size == file_size
                     && prev.chunk_size == chunk_size
                     && prev.url == *url
-                    && prev.total_chunks == total_chunks
                 {
                     // Valid progress file — resume from where we left off.
                     let remaining: Vec<(usize, ChunkRange)> = all_chunks
@@ -664,17 +702,42 @@ pub async fn download_file(
                 None
             };
 
-            // Pre-allocate the output file if this is a fresh download.
-            if progress.completed_chunks.is_empty() {
-                let file = tokio::fs::File::create(output_path).await?;
-                file.set_len(file_size).await?;
+            // Ensure the output file exists at exactly `file_size`. Fresh
+            // downloads get a sparse zero-filled file; resumes verify the
+            // partial file and extend/truncate if it drifted (user copied
+            // something in, previous run died mid-preallocate, etc.).
+            {
+                let f = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(output_path)
+                    .await?;
+                if f.metadata().await?.len() != file_size {
+                    f.set_len(file_size).await?;
+                }
             }
-            // If resuming, file already exists at full pre-allocated size.
+
+            // Open one shared sync file handle for pwrite across all chunks.
+            // Pays one `open` + one `spawn_blocking` for the whole download
+            // instead of one per chunk — N opens saved where N = chunk count.
+            let shared_file = {
+                let path = output_path.to_path_buf();
+                tokio::task::spawn_blocking(move || {
+                    std::fs::OpenOptions::new().write(true).open(&path)
+                })
+                .await
+                .map_err(|e| Error::Download {
+                    accession: String::new(),
+                    message: format!("file open task panicked: {e}"),
+                })?
+                .map_err(Error::Io)?
+            };
+            let shared_file = std::sync::Arc::new(shared_file);
 
             let semaphore = std::sync::Arc::new(Semaphore::new(connections));
             let client = std::sync::Arc::new(client);
             let url = std::sync::Arc::new(url.clone());
-            let path = std::sync::Arc::new(output_path.to_path_buf());
 
             // Channel for completed chunk indices (for progress sidecar updates).
             let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
@@ -685,7 +748,7 @@ pub async fn download_file(
                 let sem = semaphore.clone();
                 let cli = client.clone();
                 let u = url.clone();
-                let p = path.clone();
+                let f = shared_file.clone();
                 let pb_clone = pb.clone();
                 let tx = done_tx.clone();
 
@@ -695,7 +758,7 @@ pub async fn download_file(
                         message: format!("semaphore acquire failed: {e}"),
                     })?;
 
-                    download_chunk(&cli, &u, chunk, &p, pb_clone.as_deref()).await?;
+                    download_chunk(&cli, &u, chunk, &f, pb_clone.as_deref()).await?;
 
                     // Notify progress tracker.
                     let _ = tx.send(chunk_idx);
