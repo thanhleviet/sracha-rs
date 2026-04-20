@@ -16,6 +16,14 @@ const LARGE_FILE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 /// Maximum retry attempts per chunk.
 const MAX_RETRIES: u32 = 3;
 
+/// Auto-scale floor for parallel TCP connections on medium+ files.
+/// 24 is the safe sweet spot: benched against 16 and 32 on a head-node
+/// link to S3 us-east-1, results were within noise (cluster-bound), but
+/// on a network with more headroom the extra parallel streams give better
+/// aggregate throughput without triggering S3-side TCP fairness pushback
+/// (a small regression appeared at 64).
+const MEDIUM_FILE_CONNECTIONS: usize = 24;
+
 /// Configuration for parallel chunked downloads.
 pub struct DownloadConfig {
     /// Number of parallel connections (default 8).
@@ -573,9 +581,9 @@ pub async fn download_file(
 
     let use_parallel = probe.supports_range && file_size >= SMALL_FILE;
 
-    // Scale up connections for large files (16 for >256 MiB, user value otherwise).
+    // Scale up connections for medium+ files (see MEDIUM_FILE_CONNECTIONS).
     let connections = if file_size >= MEDIUM_FILE {
-        config.connections.max(16)
+        config.connections.max(MEDIUM_FILE_CONNECTIONS)
     } else {
         config.connections
     };
