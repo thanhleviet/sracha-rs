@@ -42,7 +42,7 @@ where
     }
 }
 
-use cli::{Cli, Command};
+use cli::{Cli, Command, InfoFormat};
 use sracha_core::accession::{self, InputAccession};
 use sracha_core::sdl::{ResolvedAccession, SdlClient};
 use sracha_core::util::format_size;
@@ -738,11 +738,34 @@ async fn main() -> Result<()> {
                 .map(|s| expand_tilde(&s))
                 .partition(|s| std::path::Path::new(s).is_file());
 
-            for p in &paths {
-                print_local_file_info(std::path::Path::new(p));
+            let table_mode = args.format == InfoFormat::Table;
+
+            if table_mode {
+                for p in &paths {
+                    print_local_file_info(std::path::Path::new(p));
+                }
             }
 
+            // In delimited mode, gather local-file rows up front so they
+            // still render even if the remote resolution fails.
+            let local_rows: Vec<LocalInfoRow> = if table_mode {
+                Vec::new()
+            } else {
+                paths
+                    .iter()
+                    .map(|p| LocalInfoRow::from_path(std::path::Path::new(p)))
+                    .collect()
+            };
+
             if accessions.is_empty() {
+                if !table_mode {
+                    let sep = if args.format == InfoFormat::Tsv {
+                        b'\t'
+                    } else {
+                        b','
+                    };
+                    write_info_delimited(&local_rows, &[], sep)?;
+                }
                 return Ok(());
             }
 
@@ -779,6 +802,14 @@ async fn main() -> Result<()> {
                         style::count(run_accessions.len()),
                     ));
                     eprintln!("{} {e}", style::error_label("error:"));
+                    if !table_mode {
+                        let sep = if args.format == InfoFormat::Tsv {
+                            b'\t'
+                        } else {
+                            b','
+                        };
+                        write_info_delimited(&local_rows, &[], sep)?;
+                    }
                     return Ok(());
                 }
             };
@@ -789,20 +820,39 @@ async fn main() -> Result<()> {
 
             let entries: Vec<InfoEntry> = resolved.iter().map(InfoEntry::Ok).collect();
 
-            if entries.len() > 1 {
-                // Project/multi-accession: summary table.
-                print_info_table(&entries);
-            } else if let Some(InfoEntry::Ok(r)) = entries.first() {
-                print_resolved(r);
-            }
-
-            if args.prefer_ena {
-                let accs: Vec<String> = resolved.iter().map(|r| r.accession.clone()).collect();
-                let ena = sracha_core::ena::resolve_ena_many(&http_client, &accs).await;
-                for (acc, r) in &ena {
-                    print_ena_section(acc, r.as_ref());
+            match args.format {
+                InfoFormat::Table => {
+                    if entries.len() > 1 {
+                        // Project/multi-accession: summary table.
+                        print_info_table(&entries);
+                    } else if let Some(InfoEntry::Ok(r)) = entries.first() {
+                        print_resolved(r);
+                    }
+                    if args.prefer_ena {
+                        let accs: Vec<String> =
+                            resolved.iter().map(|r| r.accession.clone()).collect();
+                        let ena = sracha_core::ena::resolve_ena_many(&http_client, &accs).await;
+                        for (acc, r) in &ena {
+                            print_ena_section(acc, r.as_ref());
+                        }
+                    }
+                }
+                InfoFormat::Tsv | InfoFormat::Csv => {
+                    let sep = if args.format == InfoFormat::Tsv {
+                        b'\t'
+                    } else {
+                        b','
+                    };
+                    write_info_delimited(&local_rows, &entries, sep)?;
+                    if args.prefer_ena {
+                        eprintln!(
+                            "{} --prefer-ena file details are only rendered with --format table",
+                            style::label("note:"),
+                        );
+                    }
                 }
             }
+
             Ok(())
         }
         Command::Validate(args) => {
@@ -1569,6 +1619,260 @@ fn print_info_table(entries: &[InfoEntry<'_>]) {
             eprintln!("  {}: {message}", style::header(accession));
         }
     }
+}
+
+/// Fields carried in TSV/CSV rows. The schema is shared across local-file
+/// and remote rows — programs parsing the output can rely on a stable
+/// column order regardless of input kind.
+const INFO_DELIMITED_COLUMNS: &[&str] = &[
+    "accession",
+    "status",
+    "archive_type",
+    "size_bytes",
+    "platform",
+    "layout",
+    "nreads",
+    "read_lengths",
+    "spots",
+    "is_lite",
+    "md5",
+    "source",
+    "url",
+    "error",
+];
+
+/// One row's worth of info about a local `.sra` file, used only in
+/// TSV/CSV mode. Table mode still goes through `print_local_file_info`
+/// which emits the richer VDB inspection block.
+struct LocalInfoRow {
+    accession: String,
+    archive_type: String,
+    size_bytes: u64,
+    path: String,
+}
+
+impl LocalInfoRow {
+    fn from_path(path: &std::path::Path) -> Self {
+        let accession = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let path_display = path
+            .canonicalize()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| path.display().to_string());
+
+        // cSRA detection mirrors `print_local_file_info`: a `.sra.vdbcache`
+        // sidecar (modern split-archive cSRA) or a KAR that looks
+        // decodable only via CsraCursor. Any open failure falls back to
+        // the unknown case so the row still renders.
+        let archive_type = detect_local_archive_type(path);
+
+        Self {
+            accession,
+            archive_type,
+            size_bytes,
+            path: path_display,
+        }
+    }
+}
+
+fn detect_local_archive_type(path: &std::path::Path) -> String {
+    use sracha_core::vdb::kar::KarArchive;
+
+    let Ok(file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let Ok(mut archive) = KarArchive::open(std::io::BufReader::new(file)) else {
+        return String::new();
+    };
+    let vdbcache = sracha_core::vdb::csra::vdbcache_sidecar_path(path);
+    let vdbcache_opt = vdbcache.exists().then_some(vdbcache.as_path());
+    match sracha_core::vdb::csra::looks_like_decodable_csra(path, vdbcache_opt) {
+        Ok(true) => "cSRA".into(),
+        _ => {
+            // A KAR that can't be opened as either VDB or cSRA still deserves
+            // a label; default to "SRA" since that's the dominant case.
+            let _ = &mut archive;
+            "SRA".into()
+        }
+    }
+}
+
+/// Emit TSV or CSV rows to stdout. `sep` is the byte separator
+/// (`b'\t'` for TSV, `b','` for CSV). The schema is fixed —
+/// see [`INFO_DELIMITED_COLUMNS`].
+fn write_info_delimited(
+    locals: &[LocalInfoRow],
+    entries: &[InfoEntry<'_>],
+    sep: u8,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let is_csv = sep == b',';
+
+    write_delimited_row(&mut out, INFO_DELIMITED_COLUMNS, sep, is_csv)?;
+
+    for local in locals {
+        let row = [
+            local.accession.as_str(),
+            "ok",
+            local.archive_type.as_str(),
+            &local.size_bytes.to_string(),
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "local",
+            local.path.as_str(),
+            "",
+        ];
+        write_delimited_row(&mut out, &row, sep, is_csv)?;
+    }
+
+    for entry in entries {
+        match entry {
+            InfoEntry::Ok(r) => {
+                let (layout, nreads, read_lengths, platform, spots) = match &r.run_info {
+                    Some(ri) => {
+                        let layout = match ri.nreads {
+                            1 => "SINGLE".to_string(),
+                            2 => "PAIRED".to_string(),
+                            n => format!("{n}-read"),
+                        };
+                        let read_lengths = ri
+                            .avg_read_len
+                            .iter()
+                            .map(|l| l.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        (
+                            layout,
+                            ri.nreads.to_string(),
+                            read_lengths,
+                            ri.platform.clone().unwrap_or_default(),
+                            ri.spots.map(|s| s.to_string()).unwrap_or_default(),
+                        )
+                    }
+                    None => (
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                    ),
+                };
+                let archive_type = if r.vdbcache_file.is_some() {
+                    "cSRA"
+                } else {
+                    "SRA"
+                };
+                let (source, url) = r
+                    .sra_file
+                    .mirrors
+                    .first()
+                    .map(|m| (m.service.as_str(), m.url.as_str()))
+                    .unwrap_or(("", ""));
+                let size_bytes = r.sra_file.size.to_string();
+                let md5 = r.sra_file.md5.clone().unwrap_or_default();
+                let is_lite = if r.sra_file.is_lite { "true" } else { "false" };
+                let row = [
+                    r.accession.as_str(),
+                    "ok",
+                    archive_type,
+                    size_bytes.as_str(),
+                    platform.as_str(),
+                    layout.as_str(),
+                    nreads.as_str(),
+                    read_lengths.as_str(),
+                    spots.as_str(),
+                    is_lite,
+                    md5.as_str(),
+                    source,
+                    url,
+                    "",
+                ];
+                write_delimited_row(&mut out, &row, sep, is_csv)?;
+            }
+            InfoEntry::Error { accession, message } => {
+                let row = [
+                    accession.as_str(),
+                    "error",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    message.as_str(),
+                ];
+                write_delimited_row(&mut out, &row, sep, is_csv)?;
+            }
+        }
+    }
+
+    out.flush()
+}
+
+fn write_delimited_row<W: std::io::Write>(
+    out: &mut W,
+    fields: &[&str],
+    sep: u8,
+    is_csv: bool,
+) -> std::io::Result<()> {
+    for (i, field) in fields.iter().enumerate() {
+        if i > 0 {
+            out.write_all(&[sep])?;
+        }
+        if is_csv {
+            write_csv_field(out, field)?;
+        } else {
+            // TSV: strip embedded tabs / CR / LF so the record stays on
+            // one line. URLs and SDL service labels never contain them
+            // in practice, but defence in depth is cheap.
+            for ch in field.chars() {
+                if ch == '\t' || ch == '\n' || ch == '\r' {
+                    out.write_all(b" ")?;
+                } else {
+                    let mut buf = [0u8; 4];
+                    out.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
+                }
+            }
+        }
+    }
+    out.write_all(b"\n")
+}
+
+/// RFC 4180 CSV field escape: quote if the field contains `,`, `"`, CR,
+/// or LF; double any embedded quote characters.
+fn write_csv_field<W: std::io::Write>(out: &mut W, field: &str) -> std::io::Result<()> {
+    let needs_quote = field
+        .bytes()
+        .any(|b| b == b',' || b == b'"' || b == b'\r' || b == b'\n');
+    if !needs_quote {
+        return out.write_all(field.as_bytes());
+    }
+    out.write_all(b"\"")?;
+    for b in field.bytes() {
+        if b == b'"' {
+            out.write_all(b"\"\"")?;
+        } else {
+            out.write_all(&[b])?;
+        }
+    }
+    out.write_all(b"\"")
 }
 
 /// Size threshold (in bytes) above which downloads require `--yes` confirmation.

@@ -467,6 +467,22 @@ pub struct InfoArgs {
     /// (URLs, sizes, MD5s) alongside NCBI info.
     #[arg(long)]
     pub prefer_ena: bool,
+
+    /// Output format: `table` (default, human-readable with borders),
+    /// `tsv` (tab-separated), or `csv` (RFC 4180). `tsv`/`csv` emit a
+    /// header row + one record per accession for programmatic use.
+    #[arg(long, value_enum, default_value_t = InfoFormat::Table)]
+    pub format: InfoFormat,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum InfoFormat {
+    /// Human-readable table with borders (default).
+    Table,
+    /// Tab-separated values, header row + one record per accession.
+    Tsv,
+    /// Comma-separated values (RFC 4180), header row + one record per accession.
+    Csv,
 }
 
 #[derive(Args)]
