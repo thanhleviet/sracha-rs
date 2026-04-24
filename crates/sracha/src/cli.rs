@@ -323,6 +323,12 @@ pub struct FastqArgs {
     /// paired-spot violations, truncated reads). Off by default.
     #[arg(long, help_heading = "Advanced")]
     pub strict: bool,
+
+    /// Tolerate NCBI RunInfo reporting more spots than the archive
+    /// actually contains. Emits a warning and keeps going when the
+    /// decoded spot count is short; still fails on decoder overshoot.
+    #[arg(long, help_heading = "Advanced")]
+    pub allow_missing_spots: bool,
 }
 
 #[derive(Args)]
@@ -440,6 +446,12 @@ pub struct GetArgs {
     /// paired-spot violations, truncated reads). Off by default.
     #[arg(long, help_heading = "Advanced")]
     pub strict: bool,
+
+    /// Tolerate NCBI RunInfo reporting more spots than the archive
+    /// actually contains. Emits a warning and keeps going when the
+    /// decoded spot count is short; still fails on decoder overshoot.
+    #[arg(long, help_heading = "Advanced")]
+    pub allow_missing_spots: bool,
 
     /// Keep the downloaded SRA file in the output directory instead of
     /// deleting it after decode. Useful for validation runs that want

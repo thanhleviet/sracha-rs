@@ -289,6 +289,7 @@ fn validate_blob_ranges(
     accession: &str,
     blobs: &[crate::vdb::kdb::BlobLoc],
     expected_spots: Option<u64>,
+    allow_missing_spots: bool,
 ) -> Result<()> {
     if blobs.is_empty() {
         return Ok(());
@@ -321,9 +322,20 @@ fn validate_blob_ranges(
     if let Some(expected) = expected_spots
         && covered != expected
     {
-        return Err(Error::Pipeline(format!(
-            "{accession}: blob ranges cover {covered} rows, RunInfo expects {expected}",
-        )));
+        // Overshoot (covered > expected) still errors — that direction
+        // means the KDB index claims more rows than RunInfo expected,
+        // which is a corruption signature rather than stale metadata.
+        if allow_missing_spots && covered < expected {
+            tracing::warn!(
+                "{accession}: blob ranges cover {covered} rows, RunInfo expects {expected} \
+                 ({missing} missing) — --allow-missing-spots is set, continuing",
+                missing = expected - covered,
+            );
+        } else {
+            return Err(Error::Pipeline(format!(
+                "{accession}: blob ranges cover {covered} rows, RunInfo expects {expected}",
+            )));
+        }
     }
     Ok(())
 }
@@ -375,6 +387,7 @@ fn decode_and_write(
         accession,
         cursor.read_col().blobs(),
         config.run_info.as_ref().and_then(|ri| ri.spots),
+        config.allow_missing_spots,
     )?;
 
     // Load Illumina name format templates from skey index.
@@ -856,14 +869,29 @@ fn decode_and_write(
     if let Some(expected) = config.run_info.as_ref().and_then(|ri| ri.spots)
         && expected != total_spots
     {
-        // Don't rename partials into place if the spot count is wrong —
-        // leave the `.partial` files so the user can inspect them but so
-        // that no tool sees a superficially-complete FASTQ.
-        return Err(Error::SpotCountMismatch {
-            accession: accession.to_string(),
-            expected,
-            actual: total_spots,
-        });
+        // Overshoot (decoded > expected) always errors — that direction
+        // means the decoder produced more rows than the archive should
+        // contain, which points to a decoder bug rather than stale
+        // RunInfo. Only undershoot (decoded < expected) is tolerated via
+        // `allow_missing_spots`, and in that case we proceed through the
+        // normal finalization flow so `.partial` files get promoted to
+        // their final names.
+        if config.allow_missing_spots && total_spots < expected {
+            tracing::warn!(
+                "{accession}: decoded {total_spots} spots, RunInfo expected {expected} \
+                 ({missing} missing) — --allow-missing-spots is set, continuing",
+                missing = expected - total_spots,
+            );
+        } else {
+            // Don't rename partials into place if the spot count is wrong —
+            // leave the `.partial` files so the user can inspect them but so
+            // that no tool sees a superficially-complete FASTQ.
+            return Err(Error::SpotCountMismatch {
+                accession: accession.to_string(),
+                expected,
+                actual: total_spots,
+            });
+        }
     }
 
     // Paired-split invariant: every record routed to Read1 should have a
@@ -1994,20 +2022,20 @@ mod tests {
     #[test]
     fn validate_blob_ranges_accepts_contiguous() {
         let blobs = vec![loc(1, 10), loc(11, 10), loc(21, 5)];
-        assert!(validate_blob_ranges("ACC", &blobs, Some(25)).is_ok());
+        assert!(validate_blob_ranges("ACC", &blobs, Some(25), false).is_ok());
     }
 
     #[test]
     fn validate_blob_ranges_accepts_no_expected() {
         let blobs = vec![loc(1, 10), loc(11, 10)];
-        assert!(validate_blob_ranges("ACC", &blobs, None).is_ok());
+        assert!(validate_blob_ranges("ACC", &blobs, None, false).is_ok());
     }
 
     #[test]
     fn validate_blob_ranges_rejects_gap() {
         // 1..11 then 12..17 leaves row 11 uncovered.
         let blobs = vec![loc(1, 10), loc(12, 5)];
-        let err = validate_blob_ranges("ACC", &blobs, None).unwrap_err();
+        let err = validate_blob_ranges("ACC", &blobs, None, false).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("gap"), "unexpected error: {msg}");
     }
@@ -2015,7 +2043,7 @@ mod tests {
     #[test]
     fn validate_blob_ranges_rejects_overlap() {
         let blobs = vec![loc(1, 10), loc(5, 10)];
-        let err = validate_blob_ranges("ACC", &blobs, None).unwrap_err();
+        let err = validate_blob_ranges("ACC", &blobs, None, false).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("overlap"), "unexpected error: {msg}");
     }
@@ -2023,16 +2051,33 @@ mod tests {
     #[test]
     fn validate_blob_ranges_rejects_runinfo_mismatch() {
         let blobs = vec![loc(1, 10), loc(11, 10)];
-        let err = validate_blob_ranges("ACC", &blobs, Some(100)).unwrap_err();
+        let err = validate_blob_ranges("ACC", &blobs, Some(100), false).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("expects 100"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn validate_blob_ranges_allows_runinfo_undershoot_with_flag() {
+        // 20 rows covered, RunInfo claims 21 — allow_missing_spots tolerates it.
+        let blobs = vec![loc(1, 10), loc(11, 10)];
+        assert!(validate_blob_ranges("ACC", &blobs, Some(21), true).is_ok());
+    }
+
+    #[test]
+    fn validate_blob_ranges_rejects_runinfo_overshoot_even_with_flag() {
+        // 20 rows covered, RunInfo only claims 15 — overshoot still errors
+        // regardless of the flag (indicates a decoder bug, not stale metadata).
+        let blobs = vec![loc(1, 10), loc(11, 10)];
+        let err = validate_blob_ranges("ACC", &blobs, Some(15), true).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("expects 15"), "unexpected error: {msg}");
     }
 
     #[test]
     fn validate_blob_ranges_skips_synthetic_single_blob() {
         // id_range == 0 signals "covers all rows" — treat as synthetic.
         let blobs = vec![loc(1, 0)];
-        assert!(validate_blob_ranges("ACC", &blobs, None).is_ok());
+        assert!(validate_blob_ranges("ACC", &blobs, None, false).is_ok());
     }
 
     // -----------------------------------------------------------------------

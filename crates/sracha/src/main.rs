@@ -323,6 +323,7 @@ async fn main() -> Result<()> {
                     http_client: None,
                     strict: args.strict,
                     keep_sra: false,
+                    allow_missing_spots: args.allow_missing_spots,
                 };
 
                 let stats = sracha_core::pipeline::run_fastq(sra_path, None, &pipeline_config)?;
@@ -512,6 +513,7 @@ async fn main() -> Result<()> {
                     strict: args.strict,
                     http_client: Some(http_client.clone()),
                     keep_sra: args.keep_sra,
+                    allow_missing_spots: args.allow_missing_spots,
                 }
             };
 

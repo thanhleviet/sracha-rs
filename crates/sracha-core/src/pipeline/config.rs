@@ -54,6 +54,13 @@ pub struct PipelineConfig {
     /// decode instead of deleting it. Useful for validation runs that
     /// want to compare against another tool on the same input file.
     pub keep_sra: bool,
+    /// Tolerate NCBI RunInfo reporting more spots than the SRA archive
+    /// actually contains. When `true`, a shortfall (decoded < expected)
+    /// is downgraded from a fatal [`crate::error::Error::SpotCountMismatch`]
+    /// to a `warn!` and the pipeline finalizes normally. An overshoot
+    /// (decoded > expected) still errors — that direction indicates
+    /// a decoder bug, not stale metadata.
+    pub allow_missing_spots: bool,
 }
 
 /// Statistics from a completed pipeline run.
