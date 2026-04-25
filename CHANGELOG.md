@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.3+vdbfix.1 (2026-04-25)
+
+### Fixes
+
+- **Bound blob-decode allocations to 1 GiB** to prevent multi-gigabyte
+  panics when probing SRA-Lite quality blobs. The
+  `decode_quality_encoding` probe in `sracha-vdb` calls `izip_decode`
+  to distinguish iZip-encoded quality columns from deflate-compressed
+  ones. Because iZip's only header check is `src.len() >= 5`,
+  deflate payloads passed the probe with whatever 4 bytes landed at
+  offset 1..5 interpreted as `data_count`, triggering an unbounded
+  `vec![0u8; n * out_bytes]` (observed: 438 MB to 28.5 GB; one
+  corrupted blob requested 281 ZiB). On hosts with limited virtual
+  address space — containers, CI runners, HPC nodes, kernel
+  overcommit caps — this aborted the process before any output was
+  written. The fix introduces `MAX_BLOB_DECODE_BYTES = 1 GiB` and
+  bounds `izip_decode`, `deflate_decompress`, `zlib_decompress`, and
+  `deflate_decompress_ex` so probe failures return
+  `Err(Error::Format)` cleanly and the existing fall-through to
+  `decode_zip_encoding` handles the deflate path. Verified on
+  PRJNA542889: 9 of 10 sampled accessions previously failed under
+  `ulimit -v 4000000`; all 10 now succeed with byte-identical output
+  on the previously-healthy SRR9207839.
+
+### Notes
+
+- Fork-only release. Upstream `rnabioco/sracha-rs` `0.3.3` is
+  byte-identical at the affected lines and remains affected; bug
+  report filed separately.
+
 ## 0.3.1 (2026-04-19)
 
 ### Performance
