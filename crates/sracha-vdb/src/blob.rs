@@ -1340,6 +1340,14 @@ pub fn deflate_decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>> 
         return Ok(Vec::new());
     }
 
+    if expected_size > MAX_BLOB_DECODE_BYTES {
+        return Err(Error::Format(format!(
+            "deflate_decompress: expected_size {expected_size} exceeds per-blob cap {} (input {} bytes)",
+            MAX_BLOB_DECODE_BYTES,
+            data.len(),
+        )));
+    }
+
     let mut decompressor = Decompressor::new();
     let mut out = vec![0u8; expected_size];
     match decompressor.deflate_decompress(data, &mut out) {
@@ -1362,6 +1370,14 @@ pub fn zlib_decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
         return Ok(Vec::new());
     }
 
+    if expected_size > MAX_BLOB_DECODE_BYTES {
+        return Err(Error::Format(format!(
+            "zlib_decompress: expected_size {expected_size} exceeds per-blob cap {} (input {} bytes)",
+            MAX_BLOB_DECODE_BYTES,
+            data.len(),
+        )));
+    }
+
     let mut decompressor = Decompressor::new();
     let mut out = vec![0u8; expected_size];
     match decompressor.zlib_decompress(data, &mut out) {
@@ -1382,6 +1398,14 @@ pub fn zlib_decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
 pub(crate) fn deflate_decompress_ex(data: &[u8], expected_size: usize) -> Result<(Vec<u8>, usize)> {
     if data.is_empty() {
         return Ok((Vec::new(), 0));
+    }
+
+    if expected_size > MAX_BLOB_DECODE_BYTES {
+        return Err(Error::Format(format!(
+            "deflate_decompress_ex: expected_size {expected_size} exceeds per-blob cap {} (input {} bytes)",
+            MAX_BLOB_DECODE_BYTES,
+            data.len(),
+        )));
     }
 
     let decompressor = unsafe { libdeflate_sys::libdeflate_alloc_decompressor() };
@@ -1531,6 +1555,16 @@ fn decode_types(n: usize, src: &[u8]) -> Vec<u8> {
     dst
 }
 
+/// Hard cap on the decoded size of a single blob payload.
+///
+/// Blob headers carry data-derived sizes (`data_count`, `osize`, etc.) that
+/// are read straight from the input bytes. A corrupt or misidentified blob
+/// can therefore claim it expands to gigabytes, causing an unbounded
+/// allocation. We cap individual blob decodes at 1 GiB — far above any
+/// legitimate VDB blob (typically << 16 MiB) but small enough that a
+/// mis-probe fails fast with `Err(Error::Format)` instead of OOM-panicking.
+pub(crate) const MAX_BLOB_DECODE_BYTES: usize = 1 << 30; // 1 GiB
+
 /// Decode izip-compressed integers.
 ///
 /// `data` is the raw izip-encoded byte stream (as found in the blob's column
@@ -1550,13 +1584,36 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
     let _size_type = ((encoded.flags >> 2) & 3) as u32;
 
     let out_bytes = (elem_bits / 8) as usize;
-    let mut output = vec![0u8; n * out_bytes];
+    let total = n.checked_mul(out_bytes).ok_or_else(|| {
+        Error::Format(format!(
+            "izip_decode: data_count {n} * out_bytes {out_bytes} overflows usize"
+        ))
+    })?;
+    if total > MAX_BLOB_DECODE_BYTES {
+        return Err(Error::Format(format!(
+            "izip_decode: claimed output {total} bytes exceeds per-blob cap {} (data_count={n}, elem_bits={elem_bits}, input={} bytes)",
+            MAX_BLOB_DECODE_BYTES,
+            data.len(),
+        )));
+    }
+    let mut output = vec![0u8; total];
 
     match enc_type {
         // Type 1: zlib-compressed, no min offset.
         // Type 3: zlib-compressed with min offset.
         1 | 3 => {
-            let decompressed = zlib_raw_decompress(encoded.simple_data, n * 8)?;
+            let decomp_size = n.checked_mul(8).ok_or_else(|| {
+                Error::Format(format!(
+                    "izip_decode type {enc_type}: data_count {n} * 8 overflows usize"
+                ))
+            })?;
+            if decomp_size > MAX_BLOB_DECODE_BYTES {
+                return Err(Error::Format(format!(
+                    "izip_decode type {enc_type}: decompressed buffer {decomp_size} bytes exceeds per-blob cap {}",
+                    MAX_BLOB_DECODE_BYTES,
+                )));
+            }
+            let decompressed = zlib_raw_decompress(encoded.simple_data, decomp_size)?;
             let elem_size_bits = (decompressed.len() * 8) / n;
             let var = variant_from_elem_bits(elem_size_bits as u32)?;
 
@@ -2394,6 +2451,38 @@ mod tests {
 
         let result = izip_decode(&data, 8, 3).unwrap();
         assert_eq!(result, vec![50, 51, 52]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Bounded-alloc guard tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn izip_decode_rejects_oversized_data_count() {
+        // Craft an iZip header where data_count claims billions of elements.
+        // The probe in decode_quality_encoding triggers exactly this path when
+        // a deflate-compressed quality blob is mis-identified as iZip.
+        let mut payload = vec![0u8; 16];
+        payload[0] = 1; // flags = type 1
+        payload[1..5].copy_from_slice(&u32::MAX.to_le_bytes()); // data_count
+        let err = izip_decode(&payload, 8, 0).expect_err("must reject huge data_count");
+        assert!(matches!(err, Error::Format(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn deflate_decompress_rejects_oversized_expected_size() {
+        let dummy = b"\x78\x9c\x03\x00\x00\x00\x00\x01"; // any non-empty input
+        let err = deflate_decompress(dummy, MAX_BLOB_DECODE_BYTES + 1)
+            .expect_err("must reject oversized expected_size");
+        assert!(matches!(err, Error::Format(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn zlib_decompress_rejects_oversized_expected_size() {
+        let dummy = b"\x78\x9c\x03\x00\x00\x00\x00\x01";
+        let err = zlib_decompress(dummy, MAX_BLOB_DECODE_BYTES + 1)
+            .expect_err("must reject oversized expected_size");
+        assert!(matches!(err, Error::Format(_)), "got {err:?}");
     }
 
     // -----------------------------------------------------------------------
